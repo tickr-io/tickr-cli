@@ -1,0 +1,71 @@
+[package]
+name = "tickr_api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Inherit the workspace's `check-cfg` registration for `cfg(madsim)` so the
+# `#![cfg(not(madsim))]` guards on the integration tests don't trip the
+# unexpected-cfgs lint.
+[lints]
+workspace = true
+
+[dependencies]
+# Internal dependencies. The API serves the Console, reads the conductor's
+# archive tables, and merges live state from the configured coordinator. The
+# API and conductor share PostgreSQL/NATS contracts without a Rust crate edge.
+tickr_proto = { workspace = true }
+tickr_migrations = { workspace = true }
+tickr_ctx = { workspace = true }
+
+# Workspace dependencies — the same externals the conductor's HTTP layer uses.
+async-nats = { workspace = true }
+# Encodes/decodes the protobuf command envelopes the API ships over the bus.
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tracing = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hex = { workspace = true }
+flate2 = { workspace = true }
+# The ctx KV reader streams the bucket's keys() listing.
+futures = { workspace = true }
+opendal = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+testcontainers-modules = { workspace = true }
+tempfile = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(not(madsim))'.dev-dependencies]
+# Integration tests stand up a real conductor command-bus subscriber against
+# the same testcontainers NATS the API publishes to, then assert parity. This
+# is a test-only edge — the API library never depends on the conductor crate.
+tickr_conductor = { workspace = true }
+
+# Conditional dependencies — mirror the conductor's madsim/non-madsim tokio
+# split so the API binary compiles under the workspace's `madsim` feature.
+[target.'cfg(madsim)'.dependencies]
+tokio = { package = "madsim-tokio", version = "0.2", features = ["full"] }
+
+[target.'cfg(not(madsim))'.dependencies]
+tokio = { version = "1", features = ["full", "tracing"] }
+
+[features]
+madsim = []

@@ -1,0 +1,66 @@
+[package]
+name = "tickr_conductor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal dependencies
+tickr_proto = { workspace = true }
+tickr_migrations = { workspace = true }
+tickr_ctx = { workspace = true }
+
+# Workspace dependencies
+async-nats = { workspace = true }
+bincode = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_path = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+slab = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+log = { workspace = true }
+hex = { workspace = true }
+flate2 = { workspace = true }
+opendal = { workspace = true }
+once_cell = { workspace = true }
+async-stream = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+testcontainers-modules = { workspace = true }
+tempfile = { workspace = true }
+# Integration tests stand up a fake coordinator HTTP server (gate-index
+# bootstrap snapshot). The conductor library no longer terminates HTTP, so
+# axum is test-only here.
+axum = { workspace = true }
+
+# Conditional dependencies
+[target.'cfg(madsim)'.dependencies]
+tokio = { package = "madsim-tokio", version = "0.2", features = ["full"] }
+tonic = { version = "0.5", package = "madsim-tonic" }
+
+[target.'cfg(not(madsim))'.dependencies]
+tokio = { version = "1", features = ["full", "tracing"] }
+tonic = { version = "0.12", features = ["transport"] }
+
+[features]
+madsim = []

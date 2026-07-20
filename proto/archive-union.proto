@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+// The union archive-grade projection: the single persisted shape both archive
+// reads reconstruct from — the instance-detail render read and the replay-seed
+// read. One archived shape serves both reads and contains only the published
+// data-plane projection.
+//
+// It **embeds the runnable graph/tasks section** (the replay-grade projection:
+// task specs at run fidelity plus the runnable graph with per-node ground and
+// per-gate runtime overlays) and adds the render metadata every archived
+// instance-detail read consumes: instance identity and lifecycle `state`,
+// transition history, `routing_variables`, applied-patch history, `tags`,
+// trigger provenance, per-version `graph_snapshots` (each carried whole as the
+// runnable-graph proto so the archived removed-structure / ghost overlay renders
+// unchanged), workflow name and version, and the archived task-instance rows.
+//
+// The projection contains only the published data-plane fields. A patch op's
+// `node_id` names a data-plane-visible graph slot.
+//
+// Separate package so the union owns its own field-number space, evolving
+// independently of the runnable and instance families it composes. It reuses
+// both — one wire model of the runnable graph, one wire model of each render
+// view — rather than re-declaring their sub-messages.
+package tickr.archive;
+
+import "runnable-projection.proto";
+import "instance-snapshot.proto";
+
+// The union archive-grade projection of one terminal workflow instance.
+message ArchiveProjection {
+  // The embedded runnable graph/tasks section — task specs at run fidelity plus
+  // the runnable graph with its runtime overlays. The replay read rehydrates a
+  // runnable graph from this; the render read reconstructs the instance graph
+  // from it too.
+  tickr.runnable.RunnableProjection runnable = 1;
+
+  // --- Render metadata the instance-detail archived read consumes ---
+
+  string id = 2;
+  string workflow_id = 3;
+  // Run name — the instance's human-readable primary identity, the detail-page
+  // heading. Always populated (default or supplied).
+  string name = 4;
+  string workflow_name = 5;
+  int64 workflow_version = 6;
+  // WorkflowState rendered verbatim (Rust Debug form), matching the snapshot.
+  string state = 7;
+  optional string scheduled_at = 8;
+  // The instance's full transition history, oldest first. The derived
+  // triggered/started/completed timestamps are re-derived from this at render
+  // time, so they are not stored separately.
+  repeated tickr.instance.StateTransitionView transitions = 9;
+  tickr.instance.TriggerProvenanceView triggered_by = 10;
+  // Merged tag map: author tags plus the `tickr/*` system tags.
+  map<string, string> tags = 11;
+  map<string, tickr.instance.RoutingValueView> routing_variables = 12;
+  // Instance version — bumped once per applied Patch, `0` when never patched.
+  uint32 version = 13;
+  // Append-only provenance for every Patch applied to this instance, oldest
+  // first.
+  repeated tickr.instance.AppliedPatchView applied_patches = 14;
+  // Version → graph-snapshot history: the full graph at each past Instance
+  // version, keyed by version, each carried whole as the runnable-graph proto so
+  // the archived ghost / removed-structure overlay reconstructs unchanged.
+  map<uint32, tickr.runnable.RunnableGraph> graph_snapshots = 15;
+  // The archived task-instance rows, at the fidelity the instance-detail task
+  // list renders (transition history, timestamps, cancel/kill sub-status) — the
+  // full record, not a lossy list row (their workflow/instance ids are carried
+  // on the projection itself).
+  repeated tickr.instance.SnapshotTaskInstance task_instances = 16;
+
+  // Carried-forward HyperNode ids of a replay — the persisted `pre_grounded`
+  // provenance set, grounded in the source run and inherited here with no task
+  // instance minted. Carried explicitly (not as part of the lossy trigger
+  // provenance view) because the render read re-derives the per-node
+  // carried-forward flag and the run-completed count from it, and a carried
+  // node is otherwise indistinguishable from a genuine ghost (both grounded,
+  // both never-minted-here). Empty for a non-replay instance. Sorted for a
+  // deterministic serialized shape.
+  repeated string pre_grounded = 17;
+}
+
+// The compaction egress wire payload sent over the relay for one terminal
+// instance: the archive-grade projection plus an opaque correlation that the
+// data plane echoes verbatim on acknowledgement and never persists.
+message CompactionEnvelope {
+  // The archive-grade projection of the terminal instance.
+  ArchiveProjection projection = 1;
+  // Opaque wire-only correlation. The data plane echoes it on acknowledgement;
+  // it is not archive data and is never persisted.
+  string correlation = 2;
+  // Control-plane-stamped assembly time (RFC3339). Enrichment only; carried into
+  // the run-info row, never re-derived.
+  optional string shipped_at = 3;
+}
+
+// The data plane's acknowledgement that a compaction payload is durably staged.
+// Echoes the opaque correlation; carries no archive data and is never persisted.
+message CompactionAck {
+  string workflow_instance_id = 1;
+  // The envelope's opaque routing correlation, echoed verbatim.
+  string correlation = 2;
+}

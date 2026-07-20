@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+// The published task-coordination contract used to dispatch tasks, report
+// lifecycle events, evaluate hyperedge preconditions, and cancel live attempts.
+// The conductor republishes dispatches onto NATS for executors, while the
+// coordinator consumes lifecycle events and cancellation acknowledgements.
+//
+// Data-plane-visible by construction: every field here is required to execute
+// or coordinate a task. The task-dispatch message contains only the published
+// runtime execution projection.
+//
+// Separate package from `tickr` so the family owns its own field-number space,
+// evolving independently of the relay envelopes; all are generated from proto
+// via tickr_proto. Reuses the `tickr.workflow` family for the one wire model of
+// a routing value and a capture declaration.
+package tickr.task;
+
+import "workflow-definition.proto";
+
+// The internal, non-tenant-visible task lifecycle event the executor and
+// conductor report on. `Delivered`/`Unhealthy` are conductor-produced; the rest
+// are the executor's honest exit observation (`Completed` = process exit 0,
+// `Failed` = exit != 0). It is never a lifecycle verdict; the coordinator owns
+// the workflow lifecycle.
+message TaskEvent {
+  string task_instance_id = 1;
+  string task_id = 2;
+  string workflow_instance_id = 3;
+  string workflow_id = 4;
+  // Set by the executor on events it emits; absent on the conductor's
+  // `Delivered` (no executor has picked the task up yet) and `Unhealthy` (the
+  // executor is gone).
+  optional string executor_id = 5;
+  oneof kind {
+    Delivered delivered = 6;
+    Assigned assigned = 7;
+    Started started = 8;
+    Completed completed = 9;
+    Failed failed = 10;
+    Unhealthy unhealthy = 11;
+  }
+
+  message Delivered {}
+  message Assigned {}
+  message Started {}
+  // The one enriched variant. The executor publishes it bare; the conductor's
+  // completion drain stamps the declared routing variables and, when the task
+  // emitted a self-patch document, the attempt-invariant patch key plus its
+  // author-declared stall TTL.
+  message Completed {
+    map<string, tickr.workflow.RoutingValue> routing_variables = 1;
+    // The self-patch key (UUID string) when the completion carried a raw Patch
+    // document; absent otherwise.
+    optional string self_patch = 2;
+    // The author-declared stall TTL in seconds read off the self-patch
+    // document; meaningful only alongside `self_patch`.
+    optional int64 self_patch_stall_ttl = 3;
+  }
+  message Failed {}
+  message Unhealthy {}
+}
+
+// The dispatch hand-off: the runtime execution projection of a queued task
+// instance plus the correlation ids the executor injects into the task's
+// environment. The conductor republishes the encoded bytes verbatim onto the
+// task-dispatch work queue; the executor decodes it to run the task. Control-
+// plane-internal task-instance fields (state, attempt, replication flags,
+// transition history, failure/cancel bookkeeping) are structurally absent.
+message TaskDispatch {
+  string task_instance_id = 1;
+  string task_id = 2;
+  string workflow_instance_id = 3;
+  string workflow_id = 4;
+  string name = 5;
+  tickr.workflow.TaskType task_type = 6;
+  string nix_expression_path = 7;
+  repeated string nix_args = 8;
+  // DSL-declared context keys the executor surfaces as TICKR_OUTPUTS/INPUTS and
+  // logical secret names (values are never carried by tickr).
+  repeated string outputs = 9;
+  repeated string inputs = 10;
+  repeated string secrets = 11;
+  // Owning tenant, rendered as the hyphenated UUID string.
+  string tenant_id = 12;
+  // Conductor-minted signal id of the wire Signal::Trigger whose dispatch
+  // produced this task, when the parent instance carries one; absent for
+  // cron-fired instances. Routes `from.trigger` reads to `<signal_id>/<name>`.
+  optional string originating_signal_id = 13;
+  // Per-input-name -> gate wakeup signal id, populated for `from.signal` inputs.
+  map<string, string> gate_signal_ids = 14;
+  // Satisfied gate signal ids on every edge incident to this task — the ambient
+  // resolver set. A set by construction (order is never consulted).
+  repeated string gate_signal_ids_ambient = 15;
+}
+
+// Server -> conductor: a hyperedge gate's preconditions, dispatched when the
+// edge's sources ground so the conductor can evaluate its predicate against a
+// later wakeup. Reuses the workflow family's capture declaration.
+message DispatchPrecondition {
+  string workflow_instance_id = 1;
+  string edge_id = 2;
+  string signal_name = 3;
+  optional string predicate = 4;
+  repeated tickr.workflow.CaptureDeclaration captures_spec = 5;
+}
+
+// Server -> conductor: terminal-state cleanup for a previously-dispatched gate
+// (timer fired or a sibling cascade invalidated the edge). Idempotent on a
+// missing entry.
+message CancelPrecondition {
+  string workflow_instance_id = 1;
+  string edge_id = 2;
+}
+
+// Server -> conductor -> executor: kill a cancelled task's in-flight process
+// group. Best-effort — the task's state is already grounded.
+message CancelTaskRequest {
+  string task_instance_id = 1;
+  string task_id = 2;
+  string workflow_instance_id = 3;
+  string workflow_id = 4;
+}
+
+// Executor -> conductor -> server: acknowledgement that a cancel-request was
+// handled. Either outcome confirms the kill — there is no surviving process.
+message CancelTaskAck {
+  string task_instance_id = 1;
+  string workflow_instance_id = 2;
+  KillOutcome outcome = 3;
+}
+
+// What the executor found when it handled a cancel-request.
+enum KillOutcome {
+  // The task was running (or caught as it spawned); its group was torn down.
+  KILL_OUTCOME_KILLED = 0;
+  // No such task was running here — already finished or never picked up.
+  KILL_OUTCOME_NO_SUCH_TASK = 1;
+}

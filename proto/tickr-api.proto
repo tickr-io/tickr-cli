@@ -1,0 +1,352 @@
+syntax = "proto3";
+
+// Command contract between the API component and the conductor. The single
+// subject `tickr.api.commands` names the API<->conductor relationship rather
+// than each verb; the request envelope discriminates the command kind. The
+// package is deliberately separate from `tickr` so neither crate depends on
+// the other for message shape — both generate from this file via tickr_proto.
+//
+// Message-only: there is no gRPC service block. The transport is NATS core
+// request/reply, so the API encodes `ApiCommandRequest` with prost and ships
+// the bytes as a NATS request; the conductor replies with an encoded
+// `ApiCommandResponse`.
+package tickr.api;
+
+// One request from the API to the conductor. Exactly one `body` variant is
+// set; the conductor dispatches on it.
+message ApiCommandRequest {
+  oneof body {
+    RegisterRequest register = 1;
+    TriggerRequest trigger = 2;
+    CancelRequest cancel = 3;
+    WakeupRequest wakeup = 4;
+    PatchRequest patch = 5;
+    ReplayRequest replay = 6;
+    PingRequest ping = 7;
+  }
+}
+
+// One reply from the conductor. `status_code` is the HTTP-equivalent status
+// the conductor decided; the API forwards it verbatim. `payload` is always
+// set to exactly one variant: a per-command typed body for 2xx / 409
+// outcomes, or the shared `ErrorPayload` for pure errors.
+message ApiCommandResponse {
+  uint32 status_code = 1;
+  oneof payload {
+    RegisterPayload register = 2;
+    TriggerPayload trigger = 3;
+    CancelPayload cancel = 4;
+    WakeupPayload wakeup = 5;
+    ErrorPayload error = 6;
+    PatchPayload patch = 7;
+    ReplayPayload replay = 8;
+    PingPayload ping = 9;
+  }
+}
+
+// Shared variant for pure-error replies. Idempotency conflicts are NOT
+// represented here — each command carries a typed `Conflict` outcome at
+// status_code 409 instead, mirroring the conductor's HTTP handlers.
+message ErrorPayload {
+  CommandErrorCode code = 1;
+  string message = 2;
+}
+
+// Closed set of wire error codes. Compile-time exhaustiveness on both sides
+// catches drift. No IDEMPOTENCY_CONFLICT: conflicts are typed payload
+// outcomes, never errors.
+enum CommandErrorCode {
+  COMMAND_ERROR_CODE_UNSPECIFIED = 0;
+  BAD_REQUEST = 1;
+  NOT_FOUND = 2;
+  INTERNAL = 3;
+  UNAVAILABLE = 4;
+  UNSUPPORTED_COMMAND = 5;
+  PARSE_TIMEOUT = 6;
+}
+
+// === Register ===
+
+message RegisterRequest {
+  string nickel_source = 1;
+  // Grouping segment supplied by CI alongside the source (read from a
+  // repo-level convention file). Qualifies the author's slug so the same
+  // slug in two namespaces is two distinct workflows. Absent (empty string)
+  // normalises to `default` before identity derivation.
+  string namespace = 2;
+}
+
+message RegisterPayload {
+  // The closed set of register outcomes. Registration never conflicts under
+  // system-assigned versioning, so there is no Conflict variant.
+  oneof outcome {
+    Inserted inserted = 1;
+    NoOp no_op = 3;
+    Refreshed refreshed = 4;
+    BuildRequeued build_requeued = 5;
+  }
+
+  message Inserted {
+    string workflow_id = 1;
+    // System-assigned integer version this registration minted.
+    int64 workflow_version = 2;
+    uint32 task_count = 3;
+    string message = 4;
+  }
+
+  // The incoming content matched the latest stored version's hash; no storage
+  // mutation. A success (HTTP 200), not a conflict.
+  message NoOp {
+    string workflow_id = 1;
+    int64 workflow_version = 2;
+    string message = 4;
+  }
+
+  // Content matched the latest successfully-built version but a cosmetic field
+  // changed; the latest row's display fields refreshed in place. No bump.
+  message Refreshed {
+    string workflow_id = 1;
+    int64 workflow_version = 2;
+    string message = 4;
+  }
+
+  // Content matched the latest version whose build had failed; that version's
+  // failed task builds were re-enqueued. No bump.
+  message BuildRequeued {
+    string workflow_id = 1;
+    int64 workflow_version = 2;
+    uint32 task_count = 3;
+    string message = 4;
+  }
+}
+
+// === Trigger ===
+
+message TriggerRequest {
+  string workflow_id = 1;
+  // RFC3339 timestamp. Carried as a string rather than
+  // google.protobuf.Timestamp to keep tickr_proto free of a prost-types
+  // dependency; the conductor parses it to a chrono DateTime.
+  optional string scheduled_at = 2;
+  // Opaque JSON the workflow's declared captures extract from.
+  optional bytes inputs = 3;
+  optional string idempotency_key = 4;
+  // Human-readable Run name for the materialized instance. Run metadata, a
+  // sibling of `inputs` — not a task capture, never enters tickr-ctx scope.
+  optional string name = 5;
+}
+
+message TriggerPayload {
+  oneof outcome {
+    Fresh fresh = 1;
+    Deduplicated deduplicated = 2;
+    Conflict conflict = 3;
+  }
+
+  message Fresh {
+    string signal_id = 1;
+    optional string scheduled_at = 2;
+  }
+
+  message Deduplicated {
+    string original_signal_id = 1;
+    optional string scheduled_at = 2;
+  }
+
+  message Conflict {
+    string original_signal_id = 1;
+    string original_input_hash = 2;
+    string your_input_hash = 3;
+  }
+}
+
+// === Cancel ===
+
+message CancelRequest {
+  CancelTarget target = 1;
+  optional string note = 2;
+  optional string idempotency_key = 3;
+}
+
+message CancelTarget {
+  oneof target {
+    Instance instance = 1;
+    ByTag by_tag = 2;
+  }
+
+  message Instance {
+    string workflow_instance_id = 1;
+    optional string node_id = 2;
+  }
+
+  message ByTag {
+    map<string, string> filter = 1;
+  }
+}
+
+message CancelPayload {
+  oneof outcome {
+    Instance instance = 1;
+    ByTag by_tag = 2;
+    Deduplicated deduplicated = 3;
+    Conflict conflict = 4;
+  }
+
+  message Instance {
+    string signal_id = 1;
+  }
+
+  message ByTag {
+    string signal_id = 1;
+    uint32 instances_matched = 2;
+  }
+
+  message Deduplicated {
+    string original_signal_id = 1;
+  }
+
+  message Conflict {
+    string original_signal_id = 1;
+    string original_input_hash = 2;
+    string your_input_hash = 3;
+  }
+}
+
+// === Patch ===
+
+// An externally-submitted Patch targeting one running WorkflowInstance. The
+// conductor evaluates the raw Nickel document (it owns the parser; the server
+// does not speak Nickel), checks the ops are well-formed, mints a `patch_id`,
+// opens the durable patch lifecycle row, and relays to the server — the sole
+// structural authority. The submitter reads the outcome asynchronously off
+// the row; the reply here only acknowledges ingress.
+message PatchRequest {
+  // Target instance. Patches are instance-targeted, never definition-wide.
+  string workflow_instance_id = 1;
+  // Raw Nickel Patch document. Evaluates to `{ ops, reason? }` where `ops`
+  // is the ordered primitive op list.
+  string nickel_source = 2;
+}
+
+message PatchPayload {
+  oneof outcome {
+    Accepted accepted = 1;
+    Rejected rejected = 2;
+  }
+
+  // 202: document valid, lifecycle row open, relay to the server under way
+  // (or queued for re-drive). Poll the row by `patch_id` for the terminal
+  // outcome — the submitter never holds a connection across apply wall-clock.
+  message Accepted {
+    string patch_id = 1;
+  }
+
+  // 409: recorded-and-rejected at ingress — another Patch for the same
+  // instance is still unsettled (one Patch at a time). The request is NOT
+  // dropped: it holds its own lifecycle row, terminally Rejected.
+  message Rejected {
+    string patch_id = 1;
+    string reason = 2;
+  }
+}
+
+// === Wakeup ===
+
+message WakeupRequest {
+  string name = 1;
+  // Opaque JSON the conductor's translator evaluates predicates and captures
+  // against.
+  optional bytes payload = 2;
+  optional string idempotency_key = 3;
+}
+
+message WakeupPayload {
+  oneof outcome {
+    Fresh fresh = 1;
+    Deduplicated deduplicated = 2;
+    Conflict conflict = 3;
+  }
+
+  message Fresh {
+    string signal_id = 1;
+    uint32 matched_workflows = 2;
+    uint32 gates_matched = 3;
+  }
+
+  message Deduplicated {
+    string original_signal_id = 1;
+  }
+
+  message Conflict {
+    string original_signal_id = 1;
+    string original_input_hash = 2;
+    string your_input_hash = 3;
+  }
+}
+
+// === Replay ===
+
+// A replay of a terminal source run from its archive. The conductor mints the
+// carried state (a ReplaySeed) conductor-side from the archive — never from
+// these bytes: this request has no field able to carry seeded state, which is
+// the trust boundary. `resume_from` is the operator's chosen frontier (empty
+// means "every failed HyperNode", resolved conductor-side); `inputs` shadows a
+// declared trigger capture of the pinned version (the expired-credential case).
+// The submitter reads the materialised replay by `replay_instance_id`.
+message ReplayRequest {
+  // The terminal source run to replay.
+  string source_instance_id = 1;
+  // HyperNode ids to resume from. Empty → every Grounded(Failed) HyperNode.
+  repeated string resume_from = 2;
+  // Human-readable Run name for the materialised replay instance.
+  optional string name = 3;
+  optional string idempotency_key = 4;
+  // The inputs shadow: capture-name → JSON-encoded fresh value. Shadows a
+  // declared trigger capture of the pinned version only (undeclared or
+  // task-produced keys typed-reject). Each value is a JSON-encoded string —
+  // the same wire convention as Wakeup captures — so structure round-trips.
+  map<string, string> inputs = 5;
+}
+
+message ReplayPayload {
+  oneof outcome {
+    Accepted accepted = 1;
+    Deduplicated deduplicated = 2;
+    VersionUnresolvable version_unresolvable = 3;
+  }
+
+  // 202: seed minted, lifecycle row open, materialise + release under way (or
+  // queued for re-drive). `doomed` enumerates interior joins that can never
+  // fire (a fan-in whose sibling arm died) — surfaced, not a reject.
+  message Accepted {
+    string replay_instance_id = 1;
+    repeated string doomed = 2;
+  }
+
+  // 200: a collision on (source_instance_id, idempotency_key) — the existing
+  // replay is returned rather than a duplicate minted.
+  message Deduplicated {
+    string replay_instance_id = 1;
+  }
+
+  // 404: the source run's archived blob is absent — nothing to replay. Parked
+  // terminally on its own row. The only unresolvable case (the graph is read
+  // from the archive, not rebuilt from the definition).
+  message VersionUnresolvable {
+    string replay_instance_id = 1;
+  }
+}
+
+// === Ping ===
+
+// A side-effect-free "does the command consumer answer" probe. It is a
+// dedicated variant, NOT a reuse of a read command, precisely so the probe
+// touches no state: the conductor replies with a trivial ack and does nothing
+// else. Powers the health surface's Conductor row, which is honestly a
+// command-plane-responsive check (the command consumer answers) — not a claim
+// that the relay loop is live.
+message PingRequest {}
+
+// The ack: an empty side-effect-free reply (status_code 200) confirming the
+// command consumer answered.
+message PingPayload {}

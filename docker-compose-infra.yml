@@ -1,0 +1,73 @@
+# Local-development infrastructure only. Production deployments must provide
+# independent secrets, authentication/TLS, and private networking.
+services:
+  db:
+    image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
+    environment:
+      POSTGRES_USER: ${TICKR_DEV_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${TICKR_DEV_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: tickr
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TICKR_DEV_POSTGRES_USER:-postgres} -d tickr"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./infra/postgres-data/data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - infra
+
+  nats:
+    image: nats:2.14.3@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - ./docker/nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - ./infra/jetstream-data:/data/jetstream
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - infra
+
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${TICKR_DEV_MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${TICKR_DEV_MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - ./infra/minio-data:/data
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - infra
+
+  createbuckets:
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      - minio
+    entrypoint: >-
+      /bin/sh -c '
+      until mc alias set local http://minio:9000 ${TICKR_DEV_MINIO_ROOT_USER:-minioadmin} ${TICKR_DEV_MINIO_ROOT_PASSWORD:-minioadmin}; do
+        echo "waiting for minio..."; sleep 1;
+      done;
+      mc mb --ignore-existing local/tickr-logs;
+      echo "tickr-logs bucket ready";
+      '
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - infra
+
+networks:
+  infra:

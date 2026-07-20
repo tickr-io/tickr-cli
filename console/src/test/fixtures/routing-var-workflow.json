@@ -1,0 +1,127 @@
+{
+  "captures": [],
+  "id": "00000000-0000-0000-0000-000000001000",
+  "name": "routing-demo",
+  "namespace": "default",
+  "slug": "routing-demo",
+  "status": "Inactive",
+  "tags": {},
+  "task_graph": {
+    "edges": {
+      "00000000-0000-0000-0000-0000000000e0": {
+        "gates": [
+          {
+            "PredicateHolds": {
+              "op": "Eq",
+              "routing_var": "region",
+              "state": "Idle",
+              "timeout": null,
+              "transitions": [],
+              "value": {
+                "String": "eu"
+              }
+            }
+          }
+        ],
+        "id": "00000000-0000-0000-0000-0000000000e0",
+        "kind": "Data",
+        "sources": [
+          "00000000-0000-0000-0000-0000000000a0"
+        ],
+        "targets": [
+          "00000000-0000-0000-0000-0000000000b0"
+        ]
+      }
+    },
+    "end": "00000000-0000-0000-0000-000000000002",
+    "head": [
+      "00000000-0000-0000-0000-000000000001"
+    ],
+    "node_incoming_map": {
+      "00000000-0000-0000-0000-0000000000b0": [
+        "00000000-0000-0000-0000-0000000000a0"
+      ]
+    },
+    "node_outgoing_map": {
+      "00000000-0000-0000-0000-0000000000a0": [
+        "00000000-0000-0000-0000-0000000000b0"
+      ]
+    },
+    "nodes": {
+      "00000000-0000-0000-0000-000000000001": {
+        "ground": {
+          "Grounded": "Success"
+        },
+        "grounded_at": null,
+        "id": "00000000-0000-0000-0000-000000000001",
+        "node_type": "Start"
+      },
+      "00000000-0000-0000-0000-000000000002": {
+        "ground": "Pending",
+        "grounded_at": null,
+        "id": "00000000-0000-0000-0000-000000000002",
+        "node_type": "End"
+      },
+      "00000000-0000-0000-0000-0000000000a0": {
+        "ground": "Pending",
+        "grounded_at": null,
+        "id": "00000000-0000-0000-0000-0000000000a0",
+        "node_type": "Task"
+      },
+      "00000000-0000-0000-0000-0000000000b0": {
+        "ground": "Pending",
+        "grounded_at": null,
+        "id": "00000000-0000-0000-0000-0000000000b0",
+        "node_type": "Task"
+      }
+    },
+    "start": "00000000-0000-0000-0000-000000000001",
+    "tail": "00000000-0000-0000-0000-000000000001"
+  },
+  "tasks": {
+    "00000000-0000-0000-0000-0000000000a0": {
+      "emits": [],
+      "id": "00000000-0000-0000-0000-0000000000a0",
+      "input_sources": null,
+      "inputs": [],
+      "loop_participant": false,
+      "max_attempts": 3,
+      "name": "producer",
+      "nix_args": [],
+      "nix_expression_path": "pkgs#producer",
+      "outputs": [],
+      "routing_vars": [
+        {
+          "name": "region",
+          "var_type": "string"
+        }
+      ],
+      "secrets": [],
+      "task_type": "RegularTask",
+      "timeout_secs": null,
+      "workflow_id": "00000000-0000-0000-0000-000000001000"
+    },
+    "00000000-0000-0000-0000-0000000000b0": {
+      "emits": [],
+      "id": "00000000-0000-0000-0000-0000000000b0",
+      "input_sources": null,
+      "inputs": [],
+      "loop_participant": false,
+      "max_attempts": 3,
+      "name": "consumer",
+      "nix_args": [],
+      "nix_expression_path": "pkgs#consumer",
+      "outputs": [],
+      "routing_vars": [],
+      "secrets": [],
+      "task_type": "RegularTask",
+      "timeout_secs": null,
+      "workflow_id": "00000000-0000-0000-0000-000000001000"
+    }
+  },
+  "tenant_id": "b4e25e3b-c495-551d-8602-f04492011253",
+  "timeout_secs": null,
+  "trigger": "FireNow",
+  "version": 1,
+  "waits_on_signal": null
+}

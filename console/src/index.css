@@ -1,0 +1,309 @@
+/* Canonical tokens (colour + type) live in ./tokens.css — the single source,
+   mirrored into developer-toolkit/ui-ux/tokens/. postcss-import inlines this at
+   the top, before Tailwind's base layer. */
+@import './tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+.sidebar-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 3px;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================================
+   Workflow-detail-page component styles — ported verbatim from the design kit
+   (ui-devkits/ui_kits/app/kit.css), token-driven on the same --* variables.
+   These back the meta grid, run calendar, definition cards, and hypergraph so
+   the surface matches the kit rather than ad-hoc Tailwind.
+   ========================================================================== */
+.mono { font-family: var(--font-mono); }
+.muted { color: hsl(var(--muted-foreground)); }
+
+/* in-page breadcrumb */
+.pgcrumb { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; font-size: 13px; }
+.pgcrumb-seg { display: inline-flex; align-items: center; gap: 2px; }
+.pgcrumb-sep { color: hsl(var(--muted-foreground) / .5); margin: 0 2px; }
+.pgcrumb-link { background: none; border: 0; font-family: inherit; font-size: 13px; color: hsl(var(--muted-foreground)); cursor: pointer; padding: 2px 0; }
+.pgcrumb-link:hover { color: hsl(var(--primary)); text-decoration: underline; }
+.pgcrumb-cur { color: hsl(var(--foreground)); font-weight: 500; }
+
+/* meta grid (header + definition meta) */
+.ov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 1px; background: hsl(var(--border)); border: 1px solid hsl(var(--border)); border-radius: 8px; overflow: hidden; }
+.wf-meta { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 760px) { .wf-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.ov-cell { background: hsl(var(--card)); padding: 14px 16px; }
+.ov-k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
+.ov-v { font-size: 14px; font-weight: 500; }
+
+/* state dots + chips. The per-state hue is no longer a CSS map — the graph and
+   legend derive it inline from the one shared state→token table (so a graph
+   colour can never drift from the badge that reads the same source); only the
+   shape and the running animation live here. */
+.st-dot { width: 9px; height: 9px; border-radius: 9999px; flex: 0 0 auto; background: hsl(var(--muted-foreground)); display: inline-block; }
+.st-dot.pulse { animation: hgpulse 1.6s ease-in-out infinite; }
+.live-tag { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: hsl(var(--info)); background: hsl(var(--info) / .12); padding: 1px 6px; border-radius: 9999px; }
+.drill-chip { font-size: 12px; font-weight: 500; color: hsl(var(--muted-foreground)); background: hsl(var(--muted)); border: 1px solid transparent; border-radius: 9999px; padding: 3px 10px; cursor: pointer; font-family: inherit; flex: 0 0 auto; }
+.drill-chip.active { background: hsl(var(--info) / .12); color: hsl(var(--info)); }
+.drill-row-chev { color: hsl(var(--muted-foreground) / .5); flex: 0 0 auto; }
+
+/* run calendar — one navigable month, co-located with the run list it filters */
+.cal-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; max-width: 320px; }
+.cal-navgroup { display: inline-flex; gap: 4px; }
+.cal-title { font-size: 13px; font-weight: 600; }
+.cal-navbtn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 6px; border: 1px solid hsl(var(--border)); background: transparent; color: hsl(var(--muted-foreground)); cursor: pointer; }
+.cal-navbtn:hover { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
+.cal-mgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; max-width: 320px; }
+.cal-wd { text-align: center; font-size: 11px; font-weight: 500; color: hsl(var(--muted-foreground)); padding-bottom: 2px; }
+.cal-mcell-empty { aspect-ratio: 1; }
+.cal-mcell { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border-radius: 4px; border: 0; padding: 0; font-size: 12px; font-family: inherit; color: hsl(var(--foreground)); background: hsl(var(--muted) / .4); cursor: pointer; }
+.cal-mcell:hover { outline: 1px solid hsl(var(--foreground) / .35); outline-offset: 1px; }
+.cal-mcell.sel { outline: 2px solid hsl(var(--foreground)); outline-offset: 1px; }
+/* Cell tints carry the DC-0009 tier at low opacity so the day number stays
+   legible in both themes; the legend swatches below stay full-strength. */
+.cal-mcell.l-completed { background: hsl(var(--success) / .28); }
+.cal-mcell.l-failed { background: hsl(var(--destructive) / .28); }
+.cal-mcell.l-in_progress { background: hsl(var(--info) / .28); }
+.cal-mcell.l-scheduled { background: hsl(var(--warning) / .28); }
+.cal-mcell.l-none { background: hsl(var(--muted) / .4); color: hsl(var(--muted-foreground)); }
+.cal-sw.l-completed { background: hsl(var(--success)); }
+.cal-sw.l-failed { background: hsl(var(--destructive)); }
+.cal-sw.l-in_progress { background: hsl(var(--info)); }
+.cal-sw.l-scheduled { background: hsl(var(--warning) / .5); }
+.cal-legend { display: flex; gap: 14px; font-size: 12px; color: hsl(var(--muted-foreground)); flex-wrap: wrap; }
+.cal-leg { display: inline-flex; align-items: center; gap: 6px; }
+.cal-sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
+
+/* definition: trigger summary, tags */
+.def-trigger { display: flex; flex-direction: column; gap: 8px; }
+.def-trigger-head { display: flex; align-items: center; gap: 8px; color: hsl(var(--primary)); }
+.def-trigger-kind { font-size: 14px; font-weight: 600; }
+.def-trigger-body { font-size: 14px; }
+.def-caps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.def-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+.tag-chip { display: inline-flex; align-items: center; font-size: 12px; background: hsl(var(--muted)); border-radius: 6px; padding: 3px 9px; color: hsl(var(--foreground)); }
+.tag-k { color: hsl(var(--muted-foreground)); margin-right: 6px; }
+
+/* definition: task cards + io chips */
+.taskdef-list { display: flex; flex-direction: column; gap: 10px; }
+.taskdef { border: 1px solid hsl(var(--border)); border-radius: 8px; padding: 12px 14px; }
+.taskdef-head { display: flex; align-items: center; gap: 10px; }
+.taskdef-type { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 9999px; flex: 0 0 auto; }
+.tt-regular { background: hsl(var(--info) / .12); color: hsl(var(--info)); }
+.tt-sensor { background: hsl(var(--warning) / .14); color: hsl(var(--warning)); }
+.tt-shadow { background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); }
+.taskdef-name { font-size: 14px; font-weight: 600; }
+.taskdef-meta { font-size: 12px; color: hsl(var(--muted-foreground)); margin-left: auto; }
+.taskdef-nix { font-size: 12px; color: hsl(var(--muted-foreground)); margin-top: 7px; word-break: break-all; }
+.taskdef-io { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.io-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 8px; border-radius: 4px; font-family: var(--font-mono); }
+.io-chip svg { flex: 0 0 auto; opacity: .85; }
+.io-in { background: hsl(var(--info) / .1); color: hsl(var(--info)); }
+.io-out { background: hsl(var(--success) / .1); color: hsl(var(--success)); }
+.io-route { background: hsl(var(--primary) / .1); color: hsl(var(--primary)); }
+.io-secret { background: hsl(var(--destructive) / .08); color: hsl(var(--destructive)); }
+.io-emit { background: hsl(var(--warning) / .12); color: hsl(var(--warning)); }
+.pre { max-height: 460px; overflow: auto; border-radius: 6px; background: hsl(var(--muted) / .4); padding: 16px; font-size: 12px; line-height: 1.6; font-family: var(--font-mono); white-space: pre-wrap; margin: 0; }
+.ncl-src { max-height: 460px; }
+.ncl-src code { font-family: var(--font-mono); background: none; padding: 0; }
+.ncl-src .hljs-keyword, .ncl-src .hljs-built_in { color: hsl(var(--primary)); font-weight: 500; }
+.ncl-src .hljs-string { color: hsl(var(--success)); }
+.ncl-src .hljs-comment { color: hsl(var(--muted-foreground)); font-style: italic; }
+.ncl-src .hljs-number, .ncl-src .hljs-literal { color: hsl(var(--info)); }
+.ncl-src .hljs-attr, .ncl-src .hljs-name { color: hsl(var(--foreground)); }
+.ncl-src .hljs-meta, .ncl-src .hljs-symbol { color: hsl(var(--warning)); }
+
+/* hypergraph (static task graph) */
+.hg-scroll { overflow-x: auto; padding-bottom: 4px; }
+.hg-canvas { position: relative; }
+.hg-edges { position: absolute; inset: 0; pointer-events: none; }
+.hg-node { position: absolute; transform: translate(-50%, -50%); background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit; transition: opacity .12s; }
+.hg-node.dim { opacity: .32; }
+.hg-task { display: flex; align-items: center; gap: 9px; width: 178px; height: 54px; padding: 0 12px; border: 1px solid hsl(var(--border)); border-radius: 8px; background: hsl(var(--card)); text-align: left; box-shadow: 0 1px 2px 0 rgb(0 0 0 / .05); transition: box-shadow .12s, border-color .12s, opacity .12s; }
+.hg-task:hover { border-color: hsl(var(--primary) / .5); }
+.hg-task.sel { border-color: hsl(var(--primary)); box-shadow: 0 0 0 2px hsl(var(--primary) / .25); }
+/* Live-instance node fill: hue = the state's own shared token via `--tok` (set
+   inline from STATE_TOKEN, so CSS never re-maps state→colour). A **full-node
+   wash** makes the state glanceable at canvas scale — never a partial extent, a
+   fractional fill reads as a fake progress bar for a categorical state (DC-0004).
+   Running-ness is carried by motion (below), not fill amount. Static definition
+   nodes set no `--tok`/`.hg-fill` and are unaffected. */
+.hg-task { overflow: hidden; }
+.hg-fill { position: absolute; inset: 0; background: hsl(var(--tok) / .17); pointer-events: none; z-index: 0; }
+.hg-task.touched { border-color: hsl(var(--tok) / .5); }
+/* Ghost node — grounded without a run (a loop reap / cancel cascade grounded a
+   never-minted sibling). Keeps its ground-kind hue via `--tok` (DC-0001) but a
+   dashed outline and a hatched (not solid) fill mark it as reaped, so it never
+   reads as a task that actually ran nor as a neutral never-reached node. */
+.hg-task.ghost { border-style: dashed; border-color: hsl(var(--tok) / .6); }
+.hg-task.ghost .hg-fill { background: repeating-linear-gradient(45deg, hsl(var(--tok) / .18) 0 5px, transparent 5px 10px); }
+/* Carried-forward node (replay) — inherited grounded from the source run, never
+   re-run in this replay. It is ALSO a ghost (grounded, never minted here); these
+   rules land after `.ghost` to override its reaped hatch. A solid ring in the
+   ground-kind hue, a plain wash, and a corner ↺ mark it as "inherited, done"
+   rather than "reaped", so an operator tells carried-forward from genuine ghost. */
+.hg-task.carried { border-style: solid; border-color: hsl(var(--tok) / .7); }
+.hg-task.carried .hg-fill { background: hsl(var(--tok) / .14); }
+.hg-task.carried::after { content: "↺"; position: absolute; top: -6px; right: -6px; z-index: 2; font-size: 11px; line-height: 1; color: hsl(var(--tok)); background: hsl(var(--background)); border-radius: 9999px; padding: 0 2px; }
+.hg-task > .hg-dot, .hg-task > .hg-meta { position: relative; z-index: 1; }
+.hg-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 9999px; background: hsl(var(--muted-foreground)); }
+.hg-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.hg-name { font-size: 13.5px; font-weight: 600; color: hsl(var(--foreground)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hg-subline { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.hg-nix { font-size: 12px; color: hsl(var(--muted-foreground)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+.hg-var { display: inline-flex; align-items: center; gap: 3px; font-family: var(--font-mono); font-size: 10px; color: hsl(var(--primary)); background: hsl(var(--primary) / .1); border-radius: 4px; padding: 0 5px; white-space: nowrap; }
+.hg-var svg { flex: 0 0 auto; }
+.hg-jwrap.sel .hg-gate, .hg-jwrap.sel .hg-jdot, .hg-badgewrap.sel .hg-gate { border-color: hsl(var(--primary)); box-shadow: 0 0 0 3px hsl(var(--primary) / .22); }
+.hg-jdot { display: block; width: 20px; height: 20px; border-radius: 9999px; background: hsl(var(--card)); border: 2px solid hsl(var(--muted-foreground) / .85); box-shadow: 0 1px 2px 0 rgb(0 0 0 / .08); position: relative; }
+.hg-jdot::after { content: ""; position: absolute; inset: 0; margin: auto; width: 9px; height: 9px; border-radius: 9999px; background: hsl(var(--muted-foreground)); }
+.hg-gate { display: inline-flex; align-items: center; gap: 6px; height: 28px; max-width: 168px; padding: 0 10px; border-radius: 9999px; background: hsl(var(--card)); border: 1.5px solid hsl(var(--border)); box-shadow: 0 1px 3px 0 rgb(0 0 0 / .12); white-space: nowrap; }
+.hg-gate-label { font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+/* Gate KIND hues (a separate axis from gate state, kept as a CSS map). The live
+   gate STATE hue is derived inline from the shared gate-state→token table, so
+   it is not duplicated here. An idle gate shows only its kind hue. */
+.hg-gate-signal { border-color: hsl(var(--warning) / .7); color: hsl(var(--warning)); }
+.hg-gate-timer { border-color: hsl(var(--primary) / .6); color: hsl(var(--primary)); }
+.hg-gate-predicate { border-color: hsl(var(--primary) / .6); color: hsl(var(--primary)); }
+/* Dispatched gate: all its sources are grounded-success, so the run is parked
+   waiting on it — a loud, kind-independent pulse reads as "stuck at that gate"
+   even when nothing is running. Persistent under the 5s poll, unlike animated
+   edge-flow (cut). */
+.hg-gate-dispatched { animation: hggatepulse 1.4s ease-in-out infinite; }
+.hg-gate svg { flex: 0 0 auto; }
+/* Turn counter riding a loop back-edge arc: same amber as the loop lane it
+   annotates, mono digits — the loop's temporal answer (which turn). */
+.hg-turns { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 9999px; background: hsl(var(--card)); border: 1.5px solid hsl(var(--warning) / .7); color: hsl(var(--warning)); font-family: var(--font-mono); font-size: 11px; box-shadow: 0 1px 3px 0 rgb(0 0 0 / .12); white-space: nowrap; }
+.hg-turns svg { flex: 0 0 auto; }
+/* DC-0018: the ring-center loop-control node — names loop_control, and (live) a
+   turn counter divided off to the right. Reuses the .hg-turns pill grammar. */
+.hg-loopctl .hg-loopctl-var { font-weight: 500; letter-spacing: .01em; }
+.hg-loopctl .hg-loopctl-turns { padding-left: 5px; margin-left: 1px; border-left: 1px solid hsl(var(--warning) / .4); }
+.hg-elapsed { font-family: var(--font-mono); font-size: 10px; color: hsl(var(--info)); }
+/* A finished node's settled time-to-complete: same mono slot as the live elapsed
+   tick, but muted — a historical fact, not the live `info`-hued running timer. */
+.hg-duration { font-family: var(--font-mono); font-size: 10px; color: hsl(var(--muted-foreground)); }
+/* Only a minted node opens a task instance on click; a never-minted node just
+   previews on hover, so it doesn't claim the clickable pointer. */
+.hg-task:not(.hg-navigable) { cursor: default; }
+/* Identity-code overlay chip (graph toggle): a small mono tag carrying the
+   Crockford code an operator reads off to author a patch. A distinct info hue
+   keeps it legible against both task nodes and the muted edges, and it never
+   intercepts pointer events (the node/edge underneath stays clickable). */
+.hg-code { position: absolute; z-index: 3; display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 4px; background: hsl(var(--info) / .14); border: 1px solid hsl(var(--info) / .55); color: hsl(var(--info)); font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: .04em; line-height: 1; white-space: nowrap; pointer-events: none; box-shadow: 0 1px 2px 0 rgb(0 0 0 / .14); transition: opacity .12s; }
+.hg-code.dim { opacity: .32; }
+/* A node's code tags its top-left corner; an edge's code centres on its drawn
+   midpoint. */
+.hg-code-node { transform: translate(-2px, -50%); }
+.hg-code-edge { transform: translate(-50%, -50%); }
+/* The identity-code toggle in the graph header: off reads as a quiet outline
+   control; on lights the same info hue as the code chips it reveals. */
+.hg-codetoggle { display: inline-flex; flex: none; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; border: 1px solid hsl(var(--border)); background: transparent; color: hsl(var(--muted-foreground)); font-family: inherit; font-size: 12px; font-weight: 500; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.hg-codetoggle:hover { background: hsl(var(--muted) / .4); }
+.hg-codetoggle.is-on { border-color: hsl(var(--info) / .6); background: hsl(var(--info) / .12); color: hsl(var(--info)); }
+.hg-codetoggle svg { flex: 0 0 auto; }
+.hg-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 16px; font-size: 12px; color: hsl(var(--muted-foreground)); }
+.hg-leg-item { display: inline-flex; align-items: center; gap: 7px; }
+.hg-leg-mark { flex: 0 0 auto; }
+.hg-leg-task { width: 18px; height: 12px; border-radius: 3px; border: 1px solid hsl(var(--border)); background: hsl(var(--card)); }
+.hg-leg-ctrl { width: 14px; height: 14px; border-radius: 9999px; border: 2px solid hsl(var(--muted-foreground) / .8); }
+.hg-leg-loop { width: 18px; height: 0; border-top: 2px dashed hsl(var(--warning) / .8); }
+.hg-leg-signal { width: 12px; height: 12px; border-radius: 9999px; border: 1.5px solid hsl(var(--warning)); }
+.hg-leg-timer, .hg-leg-predicate { width: 12px; height: 12px; border-radius: 9999px; border: 1.5px solid hsl(var(--primary)); }
+/* Live-graph legend swatches — colour comes inline from the shared tables. */
+.hg-leg-dot { width: 11px; height: 11px; border-radius: 9999px; }
+.hg-leg-gate { width: 12px; height: 12px; border-radius: 9999px; border: 2px solid hsl(var(--muted-foreground)); }
+/* Ghost legend swatch: a hollow dashed ring in the completed-success hue, the
+   most common ground-kind for a reaped node — echoing the node's own dashed,
+   hollow-dotted treatment. */
+.hg-leg-ghost { width: 12px; height: 12px; border-radius: 9999px; border: 2px dashed hsl(var(--success)); }
+/* Carried-forward legend swatch: a solid ring + wash in the success hue (the
+   common carried ground-kind), echoing the carried node's solid, filled ring —
+   distinct from the ghost's dashed hollow ring. */
+.hg-leg-carried { width: 12px; height: 12px; border-radius: 9999px; border: 2px solid hsl(var(--success)); background: hsl(var(--success) / .2); }
+/* Running task: the full-node fill is in motion — an advancing band sweeps the
+   wash. This is the only "running" cue (the honest liveness tell, no fake %);
+   parked/scheduled share the amber hue but stay static — the subline names which. */
+.hg-task.running .hg-fill { overflow: hidden; }
+.hg-task.running .hg-fill::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(100deg, transparent 20%, hsl(var(--tok) / .38) 50%, transparent 80%); transform: translateX(-100%); animation: hgshimmer 1.5s ease-in-out infinite; }
+@keyframes hgpulse { 0%, 100% { box-shadow: 0 0 0 0 hsl(var(--primary) / .5); } 50% { box-shadow: 0 0 0 5px hsl(var(--primary) / 0); } }
+@keyframes hggatepulse { 0%, 100% { box-shadow: 0 0 0 0 hsl(var(--warning) / .55); } 50% { box-shadow: 0 0 0 6px hsl(var(--warning) / 0); } }
+@keyframes hgshimmer { to { transform: translateX(100%); } }
+
+/* Health page: a healthy row's dot pulses a green ring (DC-0013). The pulse
+   colour is --success so it never reads as the primary/info pulse the graph
+   uses; only the healthy hue gets the "alive" cue — amber/red stay static. */
+@keyframes healthpulse { 0%, 100% { box-shadow: 0 0 0 0 hsl(var(--success) / .5); } 50% { box-shadow: 0 0 0 5px hsl(var(--success) / 0); } }
+.health-dot-pulse { animation: healthpulse 1.6s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hg-task.running .hg-fill::after { animation: none; opacity: .45; }
+  .hg-gate-dispatched { animation: none; box-shadow: 0 0 0 3px hsl(var(--warning) / .3); }
+  .health-dot-pulse { animation: none; }
+}
+
+/* Patch-history timeline (evolution navigator): a discrete row of version pills
+   — the pristine baseline, then one per applied patch. Selecting one drives the
+   graph's stored-snapshot render + delta wash and the code tab's focus. */
+.hg-timeline { display: flex; flex-wrap: wrap; align-items: stretch; gap: 4px; margin-bottom: 16px; }
+.hg-tl-seg { display: inline-flex; align-items: center; gap: 4px; }
+.hg-tl-arrow { color: hsl(var(--muted-foreground) / .6); font-size: 13px; user-select: none; }
+.hg-tl-pill { display: inline-flex; flex-direction: column; gap: 2px; align-items: flex-start; min-width: 0; padding: 6px 10px; border: 1px solid hsl(var(--border)); border-radius: 8px; background: hsl(var(--card)); color: hsl(var(--foreground)); font-family: inherit; text-align: left; cursor: pointer; transition: border-color .12s, background .12s, box-shadow .12s; }
+.hg-tl-pill:hover { border-color: hsl(var(--primary) / .5); }
+.hg-tl-pill.is-active { border-color: hsl(var(--primary)); box-shadow: 0 0 0 2px hsl(var(--primary) / .22); }
+.hg-tl-pill.is-pristine { border-style: dashed; }
+.hg-tl-ver { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 12px; font-weight: 600; }
+.hg-tl-ver svg { color: hsl(var(--muted-foreground)); }
+.hg-tl-tip { margin-left: 4px; padding: 0 5px; border-radius: 9999px; background: hsl(var(--success) / .16); color: hsl(var(--success)); font-size: 9px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.hg-tl-op { font-size: 11px; color: hsl(var(--muted-foreground)); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hg-tl-meta { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; }
+.hg-tl-prov { padding: 0 5px; border-radius: 9999px; font-weight: 600; letter-spacing: .02em; }
+.hg-tl-prov.is-self { background: hsl(var(--info) / .16); color: hsl(var(--info)); }
+.hg-tl-prov.is-external { background: hsl(var(--muted) / .5); color: hsl(var(--muted-foreground)); }
+.hg-tl-time { color: hsl(var(--muted-foreground)); font-family: var(--font-mono); }
+
+/* Delta key + wash. A selected version renders its stored snapshot; the change
+   that produced it is painted on top — added structures glow (success hue),
+   removed ones ghost (faint dashed), unchanged stay neutral. */
+.hg-delta-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-bottom: 12px; font-size: 12px; color: hsl(var(--muted-foreground)); }
+.hg-delta-title { font-family: var(--font-mono); font-weight: 600; color: hsl(var(--foreground)); }
+.hg-delta-mark { display: inline-block; width: 14px; height: 0; margin-right: 6px; border-top-width: 2px; vertical-align: middle; }
+.hg-delta-mark.is-added { border-top: 2px solid hsl(var(--success)); }
+.hg-delta-mark.is-ghost { border-top: 2px dashed hsl(var(--muted-foreground) / .6); }
+.hg-delta-mark.is-neutral { border-top: 2px solid hsl(var(--muted-foreground) / .45); }
+/* Added node/junction: a success-hue ring so it reads as "this patch added it"
+   without recolouring the state fill underneath. */
+.hg-task.hg-added { border-color: hsl(var(--success)); box-shadow: 0 0 0 2px hsl(var(--success) / .3); }
+.hg-jwrap.hg-added .hg-jdot { border-color: hsl(var(--success)); box-shadow: 0 0 0 3px hsl(var(--success) / .28); }
+.hg-jwrap.hg-added .hg-gate { border-color: hsl(var(--success)); }
+.hg-edge-added { filter: drop-shadow(0 0 3px hsl(var(--success) / .5)); }
+.hg-edge-ghost { pointer-events: none; }
+
+/* Pristine (v0) not retained: versions are stored from the first patch onward,
+   so the spawn shape has no snapshot to load — an honest note, never a replay. */
+.hg-pristine-note { padding: 24px 16px; border: 1px dashed hsl(var(--border)); border-radius: 8px; background: hsl(var(--muted) / .2); color: hsl(var(--muted-foreground)); font-size: 13px; line-height: 1.5; }

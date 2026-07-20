@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+// The published runnable-fidelity archive projection: the deliberate,
+// replay-grade projection of one workflow instance's runnable graph. The
+// archive projection carries run fidelity so the replay-seed path can
+// rehydrate this proto directly into a runnable graph.
+//
+// It is the workflow-definition shape (task specs with `nix_args`,
+// `loop_participant`, and `input_sources`, and the gate declarations with their
+// capture `from` sources) **plus** the runtime overlays a replay seed
+// reconstructs its graph from: per-node ground kind and grounded-at, per-gate
+// runtime state and its transition history, and the graph head/tail so the
+// rehydrated graph is byte-identical to the source run's.
+//
+// The family is data-plane-visible by construction and contains only the
+// published replay projection.
+//
+// Reuses the `tickr.workflow` family for the definition-shaped parts (there is
+// one wire model of a task and of a gate declaration) and adds only the runtime
+// overlays. Separate package so it owns its own field-number space, evolving
+// independently of the relay envelopes and the command channel.
+package tickr.runnable;
+
+import "workflow-definition.proto";
+
+// The runnable-fidelity projection of one workflow instance's graph plus the
+// task specs its resumed nodes re-execute against.
+message RunnableProjection {
+  // Task specs — each carries its own `id`, so the list is lossless against the
+  // internal id-keyed map. Reuses the one wire model of a task, so `nix_args`,
+  // `loop_participant`, and `input_sources` survive.
+  repeated tickr.workflow.TaskDefinition tasks = 1;
+  // The runnable graph with its runtime overlays.
+  RunnableGraph graph = 2;
+  // The pinned definition version, a birth-time replay fact recorded on the
+  // provenance — not used to reconstruct the graph (the graph is carried whole
+  // above).
+  int64 workflow_version = 3;
+}
+
+// The runnable graph: nodes and first-class hyperedges carrying full runtime
+// state, plus the `head`/`tail` construction bookkeeping the byte-identical
+// seed bar needs (unlike the definition graph, which omits them as derivable).
+// The adjacency caches stay derived — rebuilt from the edge set on rehydration.
+message RunnableGraph {
+  repeated RunnableNode nodes = 1;
+  repeated RunnableEdge edges = 2;
+  // The sentinel node ids the edges reference.
+  string start = 3;
+  string end = 4;
+  // Construction-time chain frontier, carried so rehydration restores it
+  // verbatim rather than re-deriving it.
+  repeated string head = 5;
+  string tail = 6;
+}
+
+// One graph node with its runtime ground overlay. `grounded_at` is absent for a
+// Pending node and for the pre-grounded synthetic boundary node (start), which
+// carries no temporal record by design.
+message RunnableNode {
+  string id = 1;
+  tickr.workflow.NodeType node_type = 2;
+  GroundState ground = 3;
+  // RFC3339 grounding timestamp, present only for a grounded, non-sentinel node.
+  optional string grounded_at = 4;
+}
+
+// A node's lifecycle position, mirroring the aggregate's `GroundState`. Pending
+// is the default (proto3 zero slot), matching the aggregate's default; the
+// three grounded kinds mirror `GroundKind`.
+enum GroundState {
+  GROUND_STATE_PENDING = 0;
+  GROUND_STATE_SUCCESS = 1;
+  GROUND_STATE_FAILED = 2;
+  GROUND_STATE_CANCELLED = 3;
+}
+
+// One hyperedge with its gates carrying runtime state. `sources`/`targets` are
+// graph-slot node ids (a data-plane-visible structural slot, not cluster-node
+// identity).
+message RunnableEdge {
+  string id = 1;
+  repeated string sources = 2;
+  repeated string targets = 3;
+  tickr.workflow.EdgeKind kind = 4;
+  repeated RunnableGate gates = 5;
+}
+
+// One gate: the workflow-definition declaration (subscription / predicate /
+// deadline, including a signal gate's capture `from` sources) plus the runtime
+// overlay a replay seed re-arms from — the live state and its transition
+// history.
+message RunnableGate {
+  tickr.workflow.Gate declaration = 1;
+  GateRuntimeState state = 2;
+  // The gate's transition history, oldest first.
+  repeated GateTransition transitions = 3;
+}
+
+// A gate's runtime state, mirroring the aggregate's `GateState`. Modelled as a
+// oneof so the translation seam matches every variant exhaustively; `Satisfied`
+// carries the wakeup lineage, every other state carries no payload.
+message GateRuntimeState {
+  oneof state {
+    Idle idle = 1;
+    Dispatched dispatched = 2;
+    Satisfied satisfied = 3;
+    Rejected rejected = 4;
+    Cancelled cancelled = 5;
+  }
+
+  // Initial state — not yet dispatched to the conductor.
+  message Idle {}
+  // Dispatched and awaiting the conductor's evaluation outcome.
+  message Dispatched {}
+  // Predicate evaluated true; captures landed keyed by `signal_id`.
+  message Satisfied {
+    // The wakeup signal id that satisfied the gate.
+    string signal_id = 1;
+  }
+  // Conductor returned a negative outcome, or a timeout-fire rejected the gate.
+  message Rejected {}
+  // Gate abandoned because an unrelated cause invalidated its edge.
+  message Cancelled {}
+}
+
+// One recorded gate transition, flattened for the wire: from-state, to-state,
+// and when (RFC3339).
+message GateTransition {
+  GateRuntimeState from = 1;
+  GateRuntimeState to = 2;
+  string at = 3;
+}

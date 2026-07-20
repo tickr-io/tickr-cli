@@ -1,0 +1,106 @@
+{
+  "runnable": {
+    "tasks": [
+      {
+        "id": "053c6c3a-e955-47b3-bfda-16f56ffc4931",
+        "workflow_id": "11111111-1111-1111-1111-111111111111",
+        "name": "fixture-task",
+        "task_type": 0,
+        "nix_expression_path": "x",
+        "nix_args": [],
+        "outputs": [],
+        "inputs": [],
+        "secrets": [],
+        "max_attempts": 3,
+        "input_sources": null,
+        "timeout_secs": null,
+        "emits": [],
+        "routing_vars": [],
+        "loop_participant": false
+      }
+    ],
+    "graph": {
+      "nodes": [
+        {
+          "id": "514a84ce-dd46-4e01-829b-7cc1d8319549",
+          "node_type": 1,
+          "ground": 0,
+          "grounded_at": null
+        },
+        {
+          "id": "1c7762c5-0cb7-4050-b736-9de06e1951db",
+          "node_type": 0,
+          "ground": 1,
+          "grounded_at": null
+        },
+        {
+          "id": "053c6c3a-e955-47b3-bfda-16f56ffc4931",
+          "node_type": 2,
+          "ground": 2,
+          "grounded_at": "2026-07-20T00:01:00+00:00"
+        }
+      ],
+      "edges": [
+        {
+          "id": "b2222222-2222-2222-2222-222222222222",
+          "sources": ["1c7762c5-0cb7-4050-b736-9de06e1951db"],
+          "targets": ["053c6c3a-e955-47b3-bfda-16f56ffc4931"],
+          "kind": 0,
+          "gates": []
+        },
+        {
+          "id": "c2222222-2222-2222-2222-222222222222",
+          "sources": ["053c6c3a-e955-47b3-bfda-16f56ffc4931"],
+          "targets": ["514a84ce-dd46-4e01-829b-7cc1d8319549"],
+          "kind": 0,
+          "gates": []
+        }
+      ],
+      "start": "1c7762c5-0cb7-4050-b736-9de06e1951db",
+      "end": "514a84ce-dd46-4e01-829b-7cc1d8319549",
+      "head": [],
+      "tail": ""
+    },
+    "workflow_version": 0
+  },
+  "id": "22222222-2222-2222-2222-222222222222",
+  "workflow_id": "11111111-1111-1111-1111-111111111111",
+  "name": "secondary-archive-fixture",
+  "workflow_name": "",
+  "workflow_version": 0,
+  "state": "Failed",
+  "scheduled_at": "2026-07-20T00:00:00+00:00",
+  "transitions": [],
+  "triggered_by": {
+    "kind": "Cron",
+    "signal_id": null,
+    "name": null
+  },
+  "tags": {
+    "tickr/triggered_at": "2026-07-20T00:00:00+00:00",
+    "tickr/trigger_source": "cron",
+    "tickr/workflow_id": "11111111-1111-1111-1111-111111111111",
+    "tickr/workflow_name": ""
+  },
+  "routing_variables": {},
+  "version": 0,
+  "applied_patches": [],
+  "graph_snapshots": {},
+  "task_instances": [
+    {
+      "id": "44444444-4444-4444-4444-444444444444",
+      "task_id": "053c6c3a-e955-47b3-bfda-16f56ffc4931",
+      "name": "fixture-task",
+      "task_type": "RegularTask",
+      "state": "Failed",
+      "executor_id": null,
+      "attempt": 0,
+      "started_at": null,
+      "completed_at": null,
+      "cancel_reason": null,
+      "kill_confirmation": null,
+      "transitions": []
+    }
+  ],
+  "pre_grounded": []
+}

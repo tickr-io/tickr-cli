@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# tickr-cli pre-commit — enforce repository-local policy, secret, and generated
+# contract gates without requiring a sibling workspace checkout.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+just check
+gitleaks dir . --no-banner --redact --exit-code 1
+(
+  cd console
+  npm run check-openapi
+  npm run check-api
+)

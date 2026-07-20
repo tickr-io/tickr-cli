@@ -1,0 +1,341 @@
+syntax = "proto3";
+
+// The published Instance snapshot contract: the deliberate wire projection of
+// one workflow instance the instance detail page renders from a single
+// response — enriched instance facts, the tasks definition map, every minted
+// task instance, the instance hypergraph with per-gate state, and the
+// accumulated routing variables.
+//
+// Separate package from `tickr` so the snapshot family owns its own
+// field-number space, evolving independently of the relay envelopes and the
+// command channel; all are generated from proto via tickr_proto. The messages
+// mirror the flat render shape one-for-one (states, kinds, and grounds are
+// carried as their rendered string tokens, not enums) so the serialized JSON is
+// identical across the live and archived read paths by construction.
+package tickr.instance;
+
+// The instance snapshot — see the file header. `storage` names which store
+// answered (`live` / `archived`); everything else is identical across the two
+// read paths.
+message InstanceSnapshot {
+  string id = 1;
+  string workflow_id = 2;
+  // Run name — the instance's human-readable primary identity, the detail-page
+  // heading. Always populated (default or supplied), so no client fallback.
+  string name = 3;
+  string workflow_name = 4;
+  int64 workflow_version = 5;
+  // WorkflowState rendered verbatim (Rust Debug form).
+  string state = 6;
+  optional string scheduled_at = 7;
+  // Derived from the transition history (transition into `Triggered`).
+  optional string triggered_at = 8;
+  // Derived from the transition history (transition into `InProgress`).
+  optional string started_at = 9;
+  // Derived from the transition history (transition into a terminal state).
+  optional string completed_at = 10;
+  // The instance's full transition history, oldest first.
+  repeated StateTransitionView transitions = 11;
+  TriggerProvenanceView triggered_by = 12;
+  // Merged tag map: author tags plus the `tickr/*` system tags. The full map
+  // ships because ByTag addressing matches against the merged map.
+  map<string, string> tags = 13;
+  // `live` / `archived` — the Storage indicator.
+  string storage = 14;
+  // Number of task definitions in the workflow shape (not just minted).
+  uint64 task_count = 15;
+  // Task nodes that actually ran to a successful completion.
+  uint64 completed_tasks = 16;
+  repeated SnapshotTaskDef tasks = 17;
+  repeated SnapshotTaskInstance task_instances = 18;
+  SnapshotGraph graph = 19;
+  map<string, RoutingValueView> routing_variables = 20;
+  // Instance version — bumped once per applied Patch, `0` when never patched.
+  uint32 version = 21;
+  // Append-only provenance for every Patch applied to this instance's live
+  // graph, oldest first.
+  repeated AppliedPatchView applied_patches = 22;
+  // Version → graph-snapshot history: the full graph at each past Instance
+  // version, keyed by version.
+  map<uint32, SnapshotGraph> version_snapshots = 23;
+}
+
+// One recorded transition, flattened for the wire: state names verbatim (Rust
+// Debug form), timestamp RFC3339.
+message StateTransitionView {
+  string from = 1;
+  string to = 2;
+  string at = 3;
+}
+
+// Trigger provenance, flattened for the wire: `kind` is the variant name
+// verbatim (`Cron` / `Manual` / `External` / `Wakeup` / `Replay`), `signal_id`
+// the conductor-minted correlation id for the signal-borne kinds, `name` the
+// wakeup's signal name. `source_instance` / `resume_from` are populated only for
+// the `Replay` kind.
+message TriggerProvenanceView {
+  string kind = 1;
+  optional string signal_id = 2;
+  optional string name = 3;
+  IdentityRef source_instance = 4;
+  repeated IdentityRef resume_from = 5;
+}
+
+// A structure's identity as the UI renders it: the full UUID (`id`,
+// authoritative) plus its short identity code (`code`, for display).
+message IdentityRef {
+  string id = 1;
+  string code = 2;
+}
+
+// One task definition as the Tasks tab renders it.
+message SnapshotTaskDef {
+  string id = 1;
+  string name = 2;
+  // TaskType rendered as its variant name (`RegularTask` / `SensorTask` /
+  // `ShadowTask`).
+  string task_type = 3;
+  uint32 max_attempts = 4;
+  optional uint64 timeout_secs = 5;
+  string nix_expression_path = 6;
+  repeated TaskInputView inputs = 7;
+  repeated string outputs = 8;
+  repeated string secrets = 9;
+  repeated RoutingVarDeclView routing_vars = 10;
+  repeated TaskEmitView emits = 11;
+}
+
+// One declared input with its source binding. `source` is absent for bare-name
+// inputs (run-scoped resolution, the ambient default).
+message TaskInputView {
+  string name = 1;
+  InputSourceView source = 2;
+}
+
+// Flattened `InputSource`: `kind` is `task` / `trigger` / `signal`.
+message InputSourceView {
+  string kind = 1;
+  optional string task = 2;
+  optional string signal_name = 3;
+  optional string gate_edge_id = 4;
+}
+
+// One declared routing variable: name plus the optional declared type tag.
+message RoutingVarDeclView {
+  string name = 1;
+  optional string var_type = 2;
+}
+
+// One author-declared signal emit. `kind` is `on_success` / `on_failure`.
+message TaskEmitView {
+  string kind = 1;
+  string signal_name = 2;
+  optional string from_routing_var = 3;
+}
+
+// One minted task instance — the same field set the task-instance list endpoint
+// serves.
+message SnapshotTaskInstance {
+  string id = 1;
+  string task_id = 2;
+  string name = 3;
+  string task_type = 4;
+  string state = 5;
+  optional string executor_id = 6;
+  uint32 attempt = 7;
+  optional string started_at = 8;
+  optional string completed_at = 9;
+  // Why this instance was cancelled, when `state == "Cancelled"`.
+  optional string cancel_reason = 10;
+  // Kill-confirmation sub-status, distinct from `state`.
+  optional string kill_confirmation = 11;
+  repeated StateTransitionView transitions = 12;
+}
+
+// The instance hypergraph. `start` / `end` identify the synthetic boundary
+// nodes so consumers can drop them from task-shaped renderings.
+message SnapshotGraph {
+  string start = 1;
+  string end = 2;
+  repeated SnapshotNode nodes = 3;
+  repeated SnapshotEdge edges = 4;
+}
+
+// The task-visible graph stored at the reserved `tickr_graph` ctx key. It
+// reuses the snapshot graph view so materialization and patch-apply egress
+// publish one JSON shape: graph topology, identity codes, node ground state,
+// and gate declarations, state, and history.
+message CtxGraphProjection {
+  // The workflow-instance version. A newly materialized graph is version 0.
+  uint32 version = 1;
+  SnapshotGraph graph = 2;
+}
+
+// One hypergraph node. `kind` is `start` / `end` / `task`; `ground` is
+// `pending` / `success` / `failed` / `cancelled`.
+message SnapshotNode {
+  // Short, human-legible identity code — the Crockford base32 projection of
+  // `id`.
+  string code = 1;
+  string id = 2;
+  string kind = 3;
+  string ground = 4;
+  optional string grounded_at = 5;
+  // A ghost node — a task node that grounded without a task instance ever
+  // running.
+  bool ghost = 6;
+  // A carried-forward HyperNode of a replay — grounded in the source run and
+  // inherited here with no task instance minted.
+  bool pre_grounded = 7;
+}
+
+// One hyperedge with its gates.
+message SnapshotEdge {
+  string code = 1;
+  string id = 2;
+  repeated string sources = 3;
+  repeated string targets = 4;
+  // Author-declared edge role (`control` / `data` / `loop`).
+  string kind = 5;
+  repeated GateView gates = 6;
+}
+
+// One gate on a hyperedge: its kind, declared condition fields, and live state.
+// Only the fields for the gate's own kind are populated.
+message GateView {
+  // `signal` / `predicate` / `timer`.
+  string kind = 1;
+  // `Idle` / `Dispatched` / `Satisfied` / `Rejected` / `Cancelled`.
+  string state = 2;
+  // Satisfied lineage: the wakeup signal id that satisfied the gate.
+  optional string signal_id = 3;
+  optional string signal_name = 4;
+  optional string predicate = 5;
+  // Capture names declared on a signal gate.
+  repeated string captures = 6;
+  optional string routing_var = 7;
+  // Comparison operator as its symbol (`==`, `!=`, `<`, `<=`, `>`, `>=`).
+  optional string op = 8;
+  RoutingValueView value = 9;
+  // Declared timeout for signal/predicate gates, seconds.
+  optional uint64 timeout_secs = 10;
+  // Declared duration for timer gates, seconds.
+  optional uint64 duration_secs = 11;
+  // The gate's transition history, oldest first.
+  repeated StateTransitionView transitions = 12;
+}
+
+// A typed routing-variable value: `kind` is the value's type tag
+// (`string` / `int` / `bool` / `bytes`), and `value` renders as the bare JSON
+// scalar (bytes as lowercase hex). The oneof carries the typed value for the
+// binary encode/decode; serde renders it untagged so the JSON is the bare
+// scalar the UI already consumes.
+message RoutingValueView {
+  string kind = 1;
+  oneof value {
+    string string_value = 2;
+    int64 int_value = 3;
+    bool bool_value = 4;
+    // Lowercase-hex rendering of the raw bytes.
+    string bytes_value = 5;
+  }
+}
+
+// A provenance entry rendered for the UI: which version this Patch produced,
+// why, when, and the op diff that is version N's divergence from N-1.
+message AppliedPatchView {
+  string patch_key = 1;
+  // The version in effect before this Patch; `version` is what it produced.
+  uint32 prior_version = 2;
+  uint32 version = 3;
+  optional string reason = 4;
+  // `self` / `external` — self/external authorship.
+  string provenance = 5;
+  string applied_at = 6;
+  repeated PatchOpView ops = 7;
+  // The composite-patch minted map: each minted node's scope path
+  // (`/`-joined handles from the operation's scope-tree root to the leaf) →
+  // its minted node UUID. Attributes a patched-in node to the handle that
+  // authored it. Empty for a primitive-op patch. Carried so the archive is a
+  // lossless record of patch provenance the graph alone cannot reconstruct
+  // (the scope-path keys live only here, not in the runnable graph).
+  map<string, string> minted_map = 8;
+}
+
+// One op of an applied Patch, flattened for rendering: the discriminant plus
+// the ids the UI attributes topology to.
+message PatchOpView {
+  // `AddNode` | `AddEdge` | `RemoveNode` | `RemoveEdge`.
+  string op = 1;
+  optional string node_id = 2;
+  optional string edge_id = 3;
+  repeated string sources = 4;
+  repeated string targets = 5;
+}
+
+// The archive-grade projection: the deliberate allowlist projection of a
+// **terminal** workflow instance, persisted to the tenant's own store. It is
+// the InstanceSnapshot's content mold minus the read-time `storage` indicator —
+// the identity, lifecycle state and transition history, minted task instances,
+// the tasks definition map, the instance hypergraph with per-gate state,
+// routing variables, tags, trigger provenance, and applied-patch history.
+//
+// This is the published type the archive read path rehydrates from tenant
+// Postgres. The instance-detail response stamps this projection with
+// `storage: archived`; archive detail, replay seed, and patch-history reads all
+// consume this same shape.
+message ArchivedInstance {
+  string id = 1;
+  string workflow_id = 2;
+  string name = 3;
+  string workflow_name = 4;
+  int64 workflow_version = 5;
+  string state = 6;
+  optional string scheduled_at = 7;
+  optional string triggered_at = 8;
+  optional string started_at = 9;
+  optional string completed_at = 10;
+  repeated StateTransitionView transitions = 11;
+  TriggerProvenanceView triggered_by = 12;
+  map<string, string> tags = 13;
+  uint64 task_count = 14;
+  uint64 completed_tasks = 15;
+  repeated SnapshotTaskDef tasks = 16;
+  repeated SnapshotTaskInstance task_instances = 17;
+  SnapshotGraph graph = 18;
+  map<string, RoutingValueView> routing_variables = 19;
+  uint32 version = 20;
+  repeated AppliedPatchView applied_patches = 21;
+  map<uint32, SnapshotGraph> version_snapshots = 22;
+}
+
+// The slim archive read row for the instances list — the fields the list view
+// projects per terminal run without paying for the full instance projection.
+// `task_count` is the minted task-instance count on the instance itself (all
+// terminal, so completed == count for the list).
+message ArchivedInstanceRow {
+  string id = 1;
+  string workflow_id = 2;
+  int64 workflow_version = 3;
+  string name = 4;
+  string state = 5;
+  optional string scheduled_at = 6;
+  uint64 task_count = 7;
+}
+
+// One archived task instance, projected for the per-instance task list. Carries
+// the workflow/instance ids the list row exposes (the InstanceSnapshot's
+// embedded task instances omit them, being nested under the instance).
+message ArchivedTaskInstance {
+  string id = 1;
+  string task_id = 2;
+  string workflow_instance_id = 3;
+  string workflow_id = 4;
+  string name = 5;
+  // TaskType rendered as its variant name (`RegularTask` / `SensorTask` /
+  // `ShadowTask`), matching the serde form the response DTO carries.
+  string task_type = 6;
+  string state = 7;
+  optional string executor_id = 8;
+  uint32 attempt = 9;
+}

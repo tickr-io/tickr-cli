@@ -1,0 +1,48 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "OpenDAL 0.57 pins quick-xml 0.39; endpoint is operator-controlled object storage. Reassess by 2026-10-20." },
+  { id = "RUSTSEC-2026-0195", reason = "OpenDAL 0.57 pins quick-xml 0.39; endpoint is operator-controlled object storage. Reassess by 2026-10-20." },
+  { id = "RUSTSEC-2025-0111", reason = "Dev-only testcontainers dependency with no fixed release; never present in production artifacts. Reassess by 2026-10-20." },
+  { id = "RUSTSEC-2025-0141", reason = "Bincode 1 wire compatibility is still required for persisted internal payloads; replacement needs a versioned migration. Reassess by 2026-10-20." },
+  { id = "RUSTSEC-2024-0436", reason = "Transitive through pinned utoipa-axum; no vulnerability is reported and replacement is controlled upstream. Reassess by 2026-10-20." },
+  { id = "RUSTSEC-2025-0134", reason = "Dev-only testcontainers dependency; never present in production artifacts. Reassess by 2026-10-20." },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+# Workspace-inherited dependencies appear as wildcard requirements to cargo-deny;
+# Cargo.lock and `--locked` checks freeze the application resolution.
+wildcards = "allow"
+highlight = "simplest-path"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

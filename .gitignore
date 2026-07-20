@@ -1,0 +1,66 @@
+/target
+nix-store/
+# Ignore JSON by default (scratch workflow payloads, local data dumps), but
+# keep real project config under version control.
+*.json
+!console/package.json
+!console/package-lock.json
+!console/components.json
+!console/tsconfig.json
+!console/tsconfig.app.json
+!console/tsconfig.node.json
+!third_party/npm-attribution.json
+!console/src/test/fixtures/routing-var-workflow.json
+!src/conductor/tests/fixtures/terminal_union_instance.json
+!src/conductor/tests/fixtures/secondary_union_instance.json
+infra/
+tickrdb/
+todos/
+result
+benchmark-results/
+.claude
+CLAUDE.md
+
+# Generated agent and Python runtime artifacts
+.pi-subagents/
+__pycache__/
+
+# Node.js / npm
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Console build output
+console/dist
+console/dist-ssr
+console/*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Overmind
+.overmind.sock
+logs/
+
+# Environment files and local credentials
+.env
+.env.*
+!.env.example
+.tokensave
+*.key
+*.pem
+*.p12
+*.pfx
+.gitleaks-report*
+.trivy*

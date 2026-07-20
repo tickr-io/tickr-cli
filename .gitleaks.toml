@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignored build output and local runtime state"
+paths = [
+  '''(^|/)(target|node_modules|dist|infra|logs|\.pi-subagents)(/|$)''',
+]

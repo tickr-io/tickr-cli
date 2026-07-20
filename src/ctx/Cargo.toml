@@ -1,0 +1,31 @@
+[package]
+name = "tickr_ctx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tickr-ctx"
+path = "src/main.rs"
+
+[dependencies]
+tickr_proto = { workspace = true }
+
+async-nats = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+futures-util = { workspace = true }
+tokio = { version = "1", features = ["full"] }

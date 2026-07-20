@@ -1,0 +1,314 @@
+syntax = "proto3";
+
+// The published workflow-definition contract: the data-plane-visible model of
+// a registered workflow. It carries the workflow, its tasks, the task graph
+// (nodes, edges, and gate declarations), captures, the trigger declaration,
+// and per-task routing declarations — every construct the DSL can author
+// today, representable without loss across the relay contract.
+//
+// The family is data-plane-visible by construction: the data plane authors
+// these shapes and the parser produces them directly.
+//
+// Separate package from `tickr` so the definition family owns its own
+// field-number space, evolving independently of the relay envelopes and the
+// command channel; all are generated from proto via tickr_proto.
+package tickr.workflow;
+
+// A workflow definition — the aggregate root. `id` folds tenant, namespace,
+// and slug one-way via the shared identity derivation, so the tenant is
+// carried explicitly rather than reversed out. `version` is the conductor-
+// assigned monotonic definition version (the server is version-naive and keys
+// only on `id`).
+message WorkflowDefinition {
+  string id = 1;
+  // Owning tenant, rendered as the hyphenated UUID string.
+  string tenant_id = 2;
+  // Grouping segment; the other half of the `namespace.slug` identity seed.
+  string namespace = 3;
+  // Author-written immutable handle; the other half of the identity seed.
+  string slug = 4;
+  string name = 5;
+  // Conductor-assigned monotonic version. `0` is the unassigned sentinel;
+  // real registered versions are `>= 1`.
+  int64 version = 6;
+  // The task set. Each task carries its own `id`, so the list is lossless
+  // against the internal id-keyed map.
+  repeated TaskDefinition tasks = 7;
+  TaskGraph task_graph = 8;
+  Trigger trigger = 9;
+  WorkflowStatus status = 10;
+  // Workflow-level trigger captures (the less-specific layer; a trigger's own
+  // captures win on key collision).
+  repeated CaptureDeclaration captures = 11;
+  // Per-workflow timeout budget in seconds. Absent = no timeout.
+  optional uint64 timeout_secs = 12;
+  // Operator-meaningful labels copied onto every materialized instance.
+  map<string, string> tags = 13;
+}
+
+// Activation status. Inactive is the constructed default, so it takes the
+// proto3 zero slot.
+enum WorkflowStatus {
+  WORKFLOW_STATUS_INACTIVE = 0;
+  WORKFLOW_STATUS_ACTIVE = 1;
+}
+
+// One task in a workflow definition.
+message TaskDefinition {
+  string id = 1;
+  string workflow_id = 2;
+  string name = 3;
+  TaskType task_type = 4;
+  string nix_expression_path = 5;
+  repeated string nix_args = 6;
+  // Context keys this task publishes (`tickr-ctx capture`).
+  repeated string outputs = 7;
+  // Context keys this task consumes (`tickr-ctx get`).
+  repeated string inputs = 8;
+  // Logical secret names this task needs; values are never carried by tickr.
+  repeated string secrets = 9;
+  // Retry budget: attempts allowed before the node grounds Failed.
+  uint32 max_attempts = 10;
+  // Per-input source-namespace information. Absent = bare-name inputs (today's
+  // run-scoped default). Present = the structured opt-in: one slot per input,
+  // each slot itself optionally sourced.
+  InputSourceList input_sources = 11;
+  // Per-task timeout budget in seconds. Absent = no timeout.
+  optional uint64 timeout_secs = 12;
+  // Author-declared `mkSignalEmit` / `mkSignalEmitOnFailure` producers.
+  repeated TaskSignalEmit emits = 13;
+  // Author-declared `mkRoutingVar` entries this task produces.
+  repeated RoutingVarDecl routing_vars = 14;
+  // True when this task is a source of a `kind = loop` edge.
+  bool loop_participant = 15;
+}
+
+// The kind of a task. RegularTask is the default (executor-dispatched), so it
+// takes the zero slot. SensorTask is dispatched (polling); ShadowTask is
+// externally asserted and never dispatched.
+enum TaskType {
+  TASK_TYPE_REGULAR = 0;
+  TASK_TYPE_SENSOR = 1;
+  TASK_TYPE_SHADOW = 2;
+}
+
+// The run-scoped namespace an input resolves against at runtime.
+message InputSource {
+  oneof source {
+    // Reads the named upstream task's output (run-scoped `<run_id>/<name>`).
+    Task task = 1;
+    // Reads the triggering signal's payload (signal-scoped).
+    Trigger trigger = 2;
+    // Reads a satisfied gate's captured value, identified by the gate's
+    // graph-slot edge id plus the declared signal name.
+    Signal signal = 3;
+  }
+
+  message Task {
+    string name = 1;
+  }
+
+  message Trigger {}
+
+  message Signal {
+    string signal_name = 1;
+    // Graph-slot edge id of the gating edge — a data-plane-visible structural
+    // slot, not non-tenant provenance.
+    string gate_edge_id = 2;
+  }
+}
+
+// A per-input source slot: present when that input was declared structured,
+// absent for a bare-name slot. Wrapping keeps the "some slots bare, some
+// sourced" distinction the internal `Vec<Option<InputSource>>` carries.
+message OptionalInputSource {
+  InputSource source = 1;
+}
+
+// The structured per-input source vector: one slot per declared input. Its
+// presence (as an optional field on the task) is itself meaningful — absent
+// means "no input was declared structured", present means the opt-in vector.
+message InputSourceList {
+  repeated OptionalInputSource sources = 1;
+}
+
+// Author-declared `mkRoutingVar` on a task: the name it produces at
+// completion, with an optional declared type tag.
+message RoutingVarDecl {
+  string name = 1;
+  optional string var_type = 2;
+}
+
+// Producer-side signal emission declared on a task.
+message TaskSignalEmit {
+  oneof emit {
+    OnSuccess on_success = 1;
+    OnFailure on_failure = 2;
+  }
+
+  // Fires on Grounded(Success); payload comes from the named routing variable
+  // declared on the same task.
+  message OnSuccess {
+    string signal_name = 1;
+    string from_routing_var = 2;
+  }
+
+  // Fires on Grounded(Failure); payload is the auto-populated failure context.
+  message OnFailure {
+    string signal_name = 1;
+  }
+}
+
+// The task graph: nodes plus first-class hyperedges. The adjacency caches and
+// the `head`/`tail` construction bookkeeping the internal graph keeps are
+// derivable from this topology and so are not on the wire. `start` and `end`
+// are the sentinel node ids the edges reference.
+message TaskGraph {
+  repeated GraphNode nodes = 1;
+  repeated Edge edges = 2;
+  string start = 3;
+  string end = 4;
+}
+
+// A node slot in the graph. Task nodes key on their task's id; Start and End
+// are the sentinel slots.
+message GraphNode {
+  string id = 1;
+  NodeType node_type = 2;
+}
+
+enum NodeType {
+  NODE_TYPE_START = 0;
+  NODE_TYPE_END = 1;
+  NODE_TYPE_TASK = 2;
+}
+
+// A first-class hyperedge. Fires when every source is Grounded(Success) AND
+// every gate is Satisfied. `sources`/`targets` are graph-slot node ids.
+message Edge {
+  string id = 1;
+  repeated string sources = 2;
+  repeated string targets = 3;
+  EdgeKind kind = 4;
+  // Author-declared preconditions, AND-folded with the source-grounding rule.
+  // Empty for non-gated edges.
+  repeated Gate gates = 5;
+}
+
+// The author-declared role of an edge. Control is the default plain dependency
+// edge; Data is a gated forward edge; Loop is a park-firing back-edge.
+enum EdgeKind {
+  EDGE_KIND_CONTROL = 0;
+  EDGE_KIND_DATA = 1;
+  EDGE_KIND_LOOP = 2;
+}
+
+// A gate declaration — a per-edge precondition beyond source grounding. This
+// is the definition shape: the declared subscription/predicate/deadline only.
+// Per-instance runtime state (dispatch/satisfaction and its transition
+// history) is instance-family, not definition, and is absent here.
+message Gate {
+  oneof kind {
+    SignalReceived signal_received = 1;
+    PredicateHolds predicate_holds = 2;
+    TimerElapsed timer_elapsed = 3;
+  }
+
+  // External-signal-driven: an optional JSONPath predicate over the wakeup
+  // payload matching `signal_name`, extracting the declared captures.
+  message SignalReceived {
+    string signal_name = 1;
+    optional string predicate = 2;
+    repeated CaptureDeclaration captures_spec = 3;
+    // Optional expiry deadline. Absent means the gate does not expire.
+    Duration timeout = 4;
+  }
+
+  // Routing-variable-driven, evaluated server-side against the instance's
+  // routing variables.
+  message PredicateHolds {
+    string routing_var = 1;
+    ComparisonOp op = 2;
+    RoutingValue value = 3;
+    Duration timeout = 4;
+  }
+
+  // Pure wall-clock timer, counting from source grounding. The duration is the
+  // gate's core mechanism, so it is required rather than optional.
+  message TimerElapsed {
+    Duration duration = 1;
+  }
+}
+
+// A closed scalar routing value — non-nested, no floats (NaN breaks Eq/Hash).
+message RoutingValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    bool bool_value = 3;
+    bytes bytes_value = 4;
+  }
+}
+
+// The comparison algebra a PredicateHolds gate evaluates.
+enum ComparisonOp {
+  COMPARISON_OP_EQ = 0;
+  COMPARISON_OP_NOT_EQ = 1;
+  COMPARISON_OP_LT = 2;
+  COMPARISON_OP_LE = 3;
+  COMPARISON_OP_GT = 4;
+  COMPARISON_OP_GE = 5;
+}
+
+// A wall-clock duration mirroring the internal `std::time::Duration`
+// (whole seconds plus sub-second nanoseconds), carried as its own message
+// rather than google.protobuf.Duration to keep the seconds field unsigned and
+// avoid a prost-types dependency.
+message Duration {
+  uint64 secs = 1;
+  uint32 nanos = 2;
+}
+
+// One named capture slot declared on a workflow or a trigger.
+message CaptureDeclaration {
+  string name = 1;
+  CaptureSource from = 2;
+}
+
+// Where a capture's value comes from. Today only the Trigger variant — a
+// JSONPath against the triggering signal's payload — is structurally
+// meaningful.
+message CaptureSource {
+  oneof source {
+    Trigger trigger = 1;
+  }
+
+  message Trigger {
+    string jsonpath = 1;
+  }
+}
+
+// How a workflow gets triggered.
+message Trigger {
+  oneof kind {
+    // Fires on the schedule the cron expression produces.
+    string cron = 1;
+    // Fires only on explicit operator/external invocation — no schedule.
+    FireNow fire_now = 2;
+    // Fires when a named signal matching the author's predicate arrives.
+    WaitsOnSignalConfig waits_on_signal = 3;
+  }
+
+  message FireNow {}
+}
+
+// Declarative configuration for a waits-on-signal trigger.
+message WaitsOnSignalConfig {
+  // Logical event name the workflow subscribes to.
+  string signal_name = 1;
+  // Optional JSONPath filter over the wakeup payload. Absent = fire on every
+  // matching wakeup.
+  optional string predicate = 2;
+  // Per-trigger captures (the more-specific layer over workflow captures).
+  repeated CaptureDeclaration captures = 3;
+}

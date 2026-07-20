@@ -1,0 +1,267 @@
+syntax = "proto3";
+
+// The published runtime-graph-patching contract: the data-plane-authored patch
+// envelope and the server's terminal outcome. A Patch is an ordered,
+// all-or-nothing sequence of primitive graph operations (plus an optional
+// un-lowered composite operation) targeting one running workflow instance. The
+// conductor authors these messages; the server translates them into its
+// internal patch aggregate at its relay boundary and never leaks that aggregate
+// back outward.
+//
+// Operations that carry node content — a task-bearing AddNode, or a composite
+// operation whose leaves ride task-bearing AddNodes — reuse the
+// workflow-definition family messages (`tickr.workflow.TaskDefinition`,
+// `tickr.workflow.Gate`, `tickr.workflow.EdgeKind`) rather than modelling a
+// task or a node a second time. There is exactly one wire model of a task.
+//
+// Node/edge references to *existing* structures are plain strings: either a
+// short identity code the author read off the exposed ctx graph, or a full UUID
+// (the unambiguous form a freshly-minted node carries before it is exposed).
+// The server resolves them against the live graph at apply — advisory read,
+// authoritative apply — so no structural resolution happens on the wire.
+package tickr.patch;
+
+import "workflow-definition.proto";
+
+// The conductor -> server patch envelope: one document-validated Patch targeting
+// one running instance. Rides the relay stream prost-encoded under the
+// PATCH_WORKFLOW_INSTANCE entity type. Build-then-apply: the conductor has
+// already built every added task before this envelope is sent, so the server
+// re-validates and applies back-to-back in one pass.
+message PatchEnvelope {
+  // Target instance — Patches are instance-targeted, never definition-wide.
+  string workflow_instance_id = 1;
+  // Stable logical identity of the Patch (UUIDv5(instance, author key)),
+  // minted by ingress. The dedup key on both sides of the wire.
+  string patch_key = 2;
+  // The ordered primitive op list. Still addresses existing structures by
+  // identity code or full UUID; the server resolves against the live graph.
+  repeated AddressedPatchOp ops = 3;
+  // Free-form why-string the submitter attached, recorded in provenance.
+  optional string reason = 4;
+  // Self/external authorship, stamped at ingress.
+  PatchProvenance provenance = 5;
+  // The un-lowered composite operation, when the Patch is one (e.g. an insert).
+  // Absent for a plain primitive-op patch whose edges the author composed
+  // directly. Carried alongside — never instead of — `ops`.
+  optional PatchOperation operation = 6;
+}
+
+// Self/external authorship of a Patch. External is the constructed default, so
+// it takes the proto3 zero slot (matching the aggregate's default).
+enum PatchProvenance {
+  PATCH_PROVENANCE_EXTERNAL = 0;
+  PATCH_PROVENANCE_SELF_EMITTED = 1;
+}
+
+// One primitive graph op, addressing existing structures by identity code or
+// UUID. The kernel is exactly four ops; higher-level reshaping compiles down to
+// sequences of these.
+message AddressedPatchOp {
+  oneof op {
+    AddNode add_node = 1;
+    AddEdge add_edge = 2;
+    RemoveNode remove_node = 3;
+    RemoveEdge remove_edge = 4;
+  }
+
+  // Splice in a fresh Pending task node under a freshly-minted node id. The
+  // node id — not the task's logical name — is the identity the collision check
+  // keys on. `task` carries the full spec for a node the system never built
+  // (build-at-patch), reusing the workflow-definition task message; absent for
+  // a node whose spec the instance already holds. `node_id` is a full UUID
+  // (a spliced node is always freshly minted, never code-addressed).
+  message AddNode {
+    string node_id = 1;
+    optional tickr.workflow.TaskDefinition task = 2;
+  }
+
+  // Add a hyperedge. `sources`/`targets` are identity-code-or-UUID references.
+  // `gates` reuse the workflow-definition gate message; an authored gate must
+  // be in the fresh (Idle) declaration state — the contract carries only the
+  // declaration, so a pre-satisfied gate is unrepresentable on the wire.
+  message AddEdge {
+    repeated string sources = 1;
+    repeated string targets = 2;
+    tickr.workflow.EdgeKind kind = 3;
+    repeated tickr.workflow.Gate gates = 4;
+  }
+
+  // Remove a Pending node with no minted task instance.
+  message RemoveNode {
+    string node_id = 1;
+  }
+
+  // Remove an edge, guarded server-side by the fired-anchor predicate.
+  message RemoveEdge {
+    string edge_id = 1;
+  }
+}
+
+// A composite Patch operation the server lowers against its authoritative live
+// graph, distinct from the primitive `ops` list. Where a primitive op says
+// exactly which edges to add/remove, an operation names the *intent* (e.g.
+// "insert a task after an anchor") and the server discovers the affected edges.
+message PatchOperation {
+  oneof kind {
+    Insert insert = 1;
+    Chain chain = 2;
+    Fork fork = 3;
+    Expand expand = 4;
+    Swap swap = 5;
+    Branch branch = 6;
+    Loop loop = 7;
+    Cut cut = 8;
+    Prune prune = 9;
+    Trim trim = 10;
+    Truncate truncate = 11;
+  }
+
+  // Interpose a single task after `anchor`. `node_id` is the id minted for the
+  // inserted task at build-at-patch ingress — the same id its accompanying
+  // task-bearing AddNode carries.
+  message Insert {
+    string anchor = 1;
+    string node_id = 2;
+  }
+
+  // Interpose a sequence of one or more tasks after `anchor` (the shipped
+  // insert is its single-step case). `steps` is a scope-tree; each leaf's task
+  // rides the primitive `ops` as a task-bearing AddNode under the same minted
+  // id its step carries.
+  message Chain {
+    string anchor = 1;
+    repeated ChainStep steps = 2;
+    // Optional per-edge relay spec for a Data-edge anchor.
+    optional ChainRelay relay = 3;
+  }
+
+  // Fan `anchor` into N parallel arms that rejoin at a barrier (fork-join).
+  // Each arm is a top-level `ChainStep`.
+  message Fork {
+    string anchor = 1;
+    repeated ChainStep arms = 2;
+  }
+
+  // Sugar over Fork: one arm per element of a map, lowered to the same shape.
+  message Expand {
+    string anchor = 1;
+    repeated ChainStep arms = 2;
+  }
+
+  // Substitute a Pending, un-minted node `target` with a replacement in place.
+  // `node_id` is the replacement's minted id (its task rides `ops`).
+  message Swap {
+    string target = 1;
+    string node_id = 2;
+  }
+
+  // Fan `anchor` into N gated arms that rejoin at a selection join. Each arm
+  // carries a selecting gate on its feeder edge.
+  message Branch {
+    string anchor = 1;
+    repeated BranchArm arms = 2;
+  }
+
+  // Cyclify a simple path into a Loop body. `path` is the ordered node list
+  // head->...->tail; the server cyclifies it against the live graph.
+  message Loop {
+    repeated string path = 1;
+  }
+
+  // Remove a Pending mid-path node and bridge flow across the gap.
+  message Cut {
+    string target = 1;
+  }
+
+  // Drop one arm of a live fork/branch fan-out, narrowing the join. `arm` names
+  // the arm's head.
+  message Prune {
+    string arm = 1;
+  }
+
+  // Remove the bounded leading run of Pending nodes up to `anchor`.
+  message Trim {
+    string anchor = 1;
+  }
+
+  // Remove the tail downstream of `anchor`, reconnecting anchor -> End.
+  message Truncate {
+    string anchor = 1;
+  }
+}
+
+// A per-edge relay spec attached to a Chain whose anchor sources a gated
+// `kind=Data` edge.
+message ChainRelay {
+  // The gated Data edge to relay across (identity code or full UUID).
+  string edge = 1;
+  // The routing variable the PredicateHolds gate keys on.
+  string var = 2;
+}
+
+// One arm of a Branch: a selecting gate plus the arm's chain step. The gate
+// rides the arm's feeder edge and decides whether the arm runs.
+message BranchArm {
+  tickr.workflow.Gate gate = 1;
+  ChainStep arm = 2;
+}
+
+// One step of a Chain: a scope-local placeholder `handle` plus the node it
+// contributes. The handle is unique within its scope.
+message ChainStep {
+  string handle = 1;
+  StepNode node = 2;
+}
+
+// What a ChainStep contributes: a leaf task minted at build-at-patch, or a
+// nested sub-chain forming a child scope.
+message StepNode {
+  oneof node {
+    Task task = 1;
+    Nested nested = 2;
+  }
+
+  // A leaf task, minted at build-at-patch under `node_id` — the same id its
+  // accompanying task-bearing AddNode carries.
+  message Task {
+    string node_id = 1;
+  }
+
+  // A nested sub-chain forming a child scope.
+  message Nested {
+    repeated ChainStep steps = 1;
+  }
+}
+
+// The server -> conductor terminal outcome of a relayed Patch. Rides the relay
+// stream prost-encoded under the PATCH_OUTCOME entity type. The conductor
+// correlates it onto the patch lifecycle row keyed by `patch_key`; a row that
+// already settled absorbs a duplicate silently.
+message PatchOutcome {
+  string workflow_instance_id = 1;
+  string patch_key = 2;
+  PatchOutcomeKind outcome = 3;
+  // On a successful apply, the reshaped `CtxGraphProjection` JSON string, so
+  // the conductor can re-mirror `tickr_graph`. Absent on every
+  // non-applying outcome.
+  optional string reshaped_graph_json = 4;
+}
+
+// The closed set of terminal Patch outcomes the wire carries.
+message PatchOutcomeKind {
+  oneof kind {
+    Applied applied = 1;
+    Rejected rejected = 2;
+  }
+
+  // Apply succeeded; `version` is the Instance version the apply produced.
+  message Applied {
+    uint32 version = 1;
+  }
+
+  // Apply refused; `reason` is the human-readable cause.
+  message Rejected {
+    string reason = 1;
+  }
+}

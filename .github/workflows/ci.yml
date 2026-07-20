@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  TICKR_TENANT_SLUG: ci
+  TICKR_NATS_URL: nats://127.0.0.1:4222
+  TICKR_CONDUCTOR_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/tickr
+  TICKR_COORDINATOR_HTTP_URL: http://127.0.0.1:8000
+  TICKR_COORDINATOR_RELAY_URL: http://127.0.0.1:9095
+  TICKR_LOG_STORAGE_ENDPOINT: http://127.0.0.1:9000
+  TICKR_LOG_STORAGE_BUCKET: tickr-logs
+  TICKR_LOG_STORAGE_ACCESS_KEY_ID: ci
+  TICKR_LOG_STORAGE_SECRET_ACCESS_KEY: ci-only-not-a-production-secret
+  TICKR_LOG_STORAGE_REGION: us-east-1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          curl --fail --silent --show-error --location \
+            https://github.com/tweag/nickel/releases/download/1.16.0/nickel-x86_64-linux \
+            --output /tmp/nickel
+          echo "05d926d6cfdd3743731a65c08a558c2ae5edd55759f3cee57f5096acb2595816  /tmp/nickel" | sha256sum --check
+          sudo install -m 0755 /tmp/nickel /usr/local/bin/nickel
+          cargo install just --version 1.50.0 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Static policy, dependency, license, and secret checks
+        run: just security
+      - name: Build and boundary checks
+        run: just check
+      - name: Rust tests with mandatory Docker integration coverage
+        run: just test
+
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install Console dependencies
+        working-directory: console
+        run: npm ci
+      - name: Verify and test Console
+        working-directory: console
+        run: |
+          npm audit --package-lock-only --audit-level=low
+          npm run check-openapi
+          npm run check-api
+          npm run lint
+          npm test -- --run
+          npm run build

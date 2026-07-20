@@ -1,0 +1,112 @@
+/* Canonical design tokens — colour (shadcn HSL triplets: light `:root` + `.dark`)
+   and type (IBM Plex, self-hosted @font-face). This is the SINGLE SOURCE for
+   tickr's tokens: imported by index.css here, and mirrored (generated + gated,
+   never hand-edited) into developer-toolkit/ui-ux/tokens/tokens.css so the design
+   contracts render exactly what ships. Change a token here, then regenerate the
+   mirror — `node developer-toolkit/ui-ux/tokens/sync.mjs generate`. */
+
+/* Self-hosted brand fonts — IBM Plex Sans + Mono. woff2 served from /public/fonts
+   so the production app stays offline-capable (no CDN). Official files from
+   github.com/IBM/plex (OFL); see public/fonts/LICENSE.txt. */
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/IBMPlexSans-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/IBMPlexSans-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 600; font-display: swap; src: url('/fonts/IBMPlexSans-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 700; font-display: swap; src: url('/fonts/IBMPlexSans-Bold.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/IBMPlexMono-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('/fonts/IBMPlexMono-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url('/fonts/IBMPlexMono-SemiBold.woff2') format('woff2'); }
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 224 71% 4%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 71% 4%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 71% 4%;
+
+    /* Tickr Teal — the one brand accent (teal-500 #14b8a6). Reserved for
+       brand/affordance only (nav, links, focus ring); never a status color. */
+    --primary: 173 80% 40%;
+    --primary-foreground: 210 20% 98%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 220 9% 46%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 96%;
+    --accent-foreground: 224 71% 4%;
+
+    /* Status semantics (DC-0001): completed=success, in-progress=info,
+       scheduled=warning, failed/killed=destructive. These are status hues —
+       distinct from --primary, which is brand only. */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 20% 98%;
+    --success: 142 76% 36%;
+    --success-foreground: 210 20% 98%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 210 20% 98%;
+    --info: 217 91% 60%;
+    --info-foreground: 210 20% 98%;
+
+    /* Event-log-local lifecycle hues — NOT status tokens. The event log owns
+       its category key-space, so its two quiet-lifecycle buckets carry their
+       own hues rather than borrowing a status colour: workflow-level = violet,
+       task-level = cyan (kept clear of brand teal `--primary` and in-progress
+       `--info` blue). Only the event log resolves these; no other status
+       surface does. */
+    --event-workflow: 262 83% 58%;
+    --event-task: 198 90% 45%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 173 80% 40%;
+
+    --radius: 0.5rem;
+    --sidebar-width: 16rem;
+    --sidebar-width-collapsed: 4rem;
+
+    /* Brand typeface: IBM Plex Sans + Mono. System stacks remain as fallback;
+       numerals lean on tabular-nums wherever times, counts, and IDs appear. */
+    --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system,
+      BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco,
+      Consolas, 'Liberation Mono', 'Courier New', monospace;
+  }
+
+  .dark {
+    --background: 224 71% 4%;
+    --foreground: 210 20% 98%;
+    --card: 222 47% 11%;
+    --card-foreground: 210 20% 98%;
+    --popover: 222 47% 11%;
+    --popover-foreground: 210 20% 98%;
+
+    --primary: 172 72% 46%;
+    --primary-foreground: 210 20% 98%;
+
+    --secondary: 215 28% 17%;
+    --secondary-foreground: 210 20% 98%;
+    --muted: 215 28% 17%;
+    --muted-foreground: 218 11% 65%;
+    --accent: 215 28% 17%;
+    --accent-foreground: 210 20% 98%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 20% 98%;
+    --success: 142 76% 36%;
+    --success-foreground: 210 20% 98%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 210 20% 98%;
+    --info: 213 94% 68%;
+    --info-foreground: 210 20% 98%;
+
+    /* Event-log-local lifecycle hues (dark) — see :root note above. */
+    --event-workflow: 263 90% 74%;
+    --event-task: 195 92% 60%;
+
+    --border: 215 28% 17%;
+    --input: 215 28% 17%;
+    --ring: 172 72% 46%;
+  }
+}

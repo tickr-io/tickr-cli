@@ -1,0 +1,431 @@
+//! Task-log dispatcher. Resolves a task's logs from whichever store currently
+//! holds them: MinIO (archived — gzipped blob written by the compaction
+//! drain's log-upload step) or the Log staging stream (live — raw batches
+//! the executor published).
+//!
+//! Order: try MinIO first, then the stream, then 404. The two stores are
+//! mutually exclusive at steady state because the compaction drain writes
+//! the gzip blob and then purges the task's log subject — so probing MinIO
+//! first lands on the first call for any past-run browse (the dominant UI
+//! traffic pattern), at the cost of one extra stat against a
+//! not-yet-existing key for the live case.
+//!
+//! Returns decompressed bytes regardless of source so the HTTP handler can
+//! shape a single response type that the UI consumes uniformly.
+
+use async_nats::jetstream::{self, consumer, consumer::pull};
+use async_nats::Client as NatsClient;
+use flate2::read::GzDecoder;
+use opendal::Operator;
+use std::io::Read;
+use std::time::Duration;
+use thiserror::Error;
+use uuid::Uuid;
+
+// The bucket name is applied to the `opendal::Operator` at construction time
+// (in `start_http_server`), so this constant is unreferenced here — kept so the
+// copy stays diff-identical to the conductor's module during the overlap window.
+#[allow(dead_code)]
+const MINIO_BUCKET: &str = "tickr-logs";
+
+/// JetStream stream staging task-log batches until compaction archives
+/// them. Mirrors the executor's publisher and the conductor's log-upload
+/// step — the three must agree on stream name and subject shape.
+const LOG_STREAM_NAME: &str = "tickr_task_logs";
+
+/// End-of-stream marker headers. Mirrors the executor's publisher and the
+/// conductor's log-upload step.
+const MARKER_HEADER: &str = "Tickr-Log-Marker";
+const MARKER_EXIT_STATUS_HEADER: &str = "Tickr-Exit-Status";
+const MARKER_EXIT_REASON_HEADER: &str = "Tickr-Exit-Reason";
+
+/// The End-of-stream marker, however it was found — message headers on the
+/// live stream, or the archived `.exit.json` sidecar. Shape mirrors the
+/// conductor's sidecar writer.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EndOfStreamMarker {
+    pub exit_status: i64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A task's resolved logs: the raw content plus the End-of-stream marker if
+/// the stream was terminated cleanly. `marker: None` on a terminal task is
+/// the abnormal-end signal (executor died without closing the stream).
+#[derive(Debug)]
+pub struct TaskLogs {
+    pub content: Vec<u8>,
+    pub marker: Option<EndOfStreamMarker>,
+}
+
+/// One staged log batch with its stream sequence — the Log cursor unit. The
+/// sequence is JetStream's, so a client polling `after_seq` can never see a
+/// batch twice or miss one.
+#[derive(Debug)]
+pub struct LogBatch {
+    pub seq: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// A page of staged batches plus the marker if it was within the read range.
+#[derive(Debug)]
+pub struct LogBatchPage {
+    pub batches: Vec<LogBatch>,
+    pub marker: Option<EndOfStreamMarker>,
+    /// Tail reads only: batches exist on the subject before the first one
+    /// returned — drives the "load earlier" affordance.
+    pub has_earlier: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum LogsError {
+    /// No logs in either store. UI surfaces as 404.
+    #[error("logs not found for task")]
+    NotFound,
+    /// MinIO returned an unexpected error (not "key absent"). Likely
+    /// infrastructure trouble; HTTP layer maps to 5xx.
+    #[error("MinIO error: {0}")]
+    Minio(String),
+    /// NATS JetStream / KV access failure. HTTP layer maps to 5xx.
+    #[error("NATS error: {0}")]
+    Nats(String),
+    /// MinIO returned a gzip blob that did not decompress cleanly. Indicates
+    /// log corruption at the storage layer; HTTP layer maps to 5xx.
+    #[error("gzip decode error: {0}")]
+    GzipDecode(String),
+}
+
+/// Constructs the canonical MinIO object key for a task's gzipped log blob.
+/// Mirrors the path `log_uploader` writes to so the two stay in sync.
+pub fn minio_object_key(
+    workflow_id: Uuid,
+    workflow_instance_id: Uuid,
+    task_instance_id: Uuid,
+) -> String {
+    format!(
+        "task_logs/{}/{}/{}.gz",
+        workflow_id, workflow_instance_id, task_instance_id
+    )
+}
+
+/// Constructs the Log staging stream subject the executor publishes a task
+/// instance's batches to. Mirrors the executor's `log_subject`.
+pub fn log_subject(
+    workflow_id: Uuid,
+    workflow_instance_id: Uuid,
+    task_instance_id: Uuid,
+) -> String {
+    format!(
+        "logs.{}.{}.{}",
+        workflow_id, workflow_instance_id, task_instance_id
+    )
+}
+
+/// Sidecar object key the conductor's log-upload step writes the archived
+/// End-of-stream marker to. Mirrors `exit_sidecar_path` there.
+pub fn exit_sidecar_key(
+    workflow_id: Uuid,
+    workflow_instance_id: Uuid,
+    task_instance_id: Uuid,
+) -> String {
+    format!(
+        "task_logs/{}/{}/{}.exit.json",
+        workflow_id, workflow_instance_id, task_instance_id
+    )
+}
+
+/// Extract the marker from a stream message's headers, if the message is one.
+fn marker_from_headers(headers: Option<&async_nats::HeaderMap>) -> Option<EndOfStreamMarker> {
+    let headers = headers?;
+    headers.get(MARKER_HEADER)?;
+    let exit_status = headers
+        .get(MARKER_EXIT_STATUS_HEADER)
+        .and_then(|v| v.as_str().parse::<i64>().ok())
+        .unwrap_or(-1);
+    let reason = headers
+        .get(MARKER_EXIT_REASON_HEADER)
+        .map(|v| v.as_str().to_string());
+    Some(EndOfStreamMarker {
+        exit_status,
+        reason,
+    })
+}
+
+/// Dispatcher with both store handles injected. Construction-time injection
+/// lets the integration tests swap in testcontainer-backed clients without
+/// reaching through globals.
+#[derive(Clone)]
+pub struct LogsResolver {
+    minio: Operator,
+    nats: NatsClient,
+}
+
+impl LogsResolver {
+    pub fn new(minio: Operator, nats: NatsClient) -> Self {
+        Self { minio, nats }
+    }
+
+    /// Tries MinIO; on `NotFound`, falls through to the Log staging stream;
+    /// on both empty, returns `LogsError::NotFound`. Returns decompressed
+    /// log content plus the End-of-stream marker if the stream was closed
+    /// cleanly — identically sourced from message headers (live) or the
+    /// archived sidecar (MinIO), so callers never see two marker shapes.
+    pub async fn fetch_task_logs(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+    ) -> Result<TaskLogs, LogsError> {
+        // 1. MinIO probe at the deterministic path.
+        let key = minio_object_key(workflow_id, workflow_instance_id, task_instance_id);
+        match self.minio.read(&key).await {
+            Ok(gzipped) => {
+                let content = decode_gzip(&gzipped.to_vec())?;
+                let marker = self
+                    .read_exit_sidecar(workflow_id, workflow_instance_id, task_instance_id)
+                    .await?;
+                return Ok(TaskLogs { content, marker });
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                // No blob. A task may have archived a marker without ever
+                // logging a line — probe the sidecar before falling through
+                // so such tasks don't read as "no logs anywhere".
+                if let Some(marker) = self
+                    .read_exit_sidecar(workflow_id, workflow_instance_id, task_instance_id)
+                    .await?
+                {
+                    return Ok(TaskLogs {
+                        content: Vec::new(),
+                        marker: Some(marker),
+                    });
+                }
+            }
+            Err(e) => {
+                return Err(LogsError::Minio(format!("read {}: {}", key, e)));
+            }
+        }
+
+        // 2. Stream fallback — replay everything on the task's subject.
+        let (batches, marker) = read_stream_page(
+            &self.nats,
+            workflow_id,
+            workflow_instance_id,
+            task_instance_id,
+            None,
+        )
+        .await?;
+        if batches.is_empty() && marker.is_none() {
+            return Err(LogsError::NotFound);
+        }
+        Ok(TaskLogs {
+            content: batches.into_iter().flat_map(|b| b.bytes).collect(),
+            marker,
+        })
+    }
+
+    /// Incremental read — the Log cursor. Returns only batches with a stream
+    /// sequence strictly greater than `after_seq`, plus the marker if it lies
+    /// past the cursor (it is published last, so the poll that crosses it is
+    /// the tail's natural end). Serves from the stream only: a terminal task
+    /// whose subject was already archived returns an empty page, and the
+    /// client's no-cursor fetch takes over.
+    pub async fn fetch_batches_after(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+        after_seq: u64,
+    ) -> Result<LogBatchPage, LogsError> {
+        let (batches, marker) = read_stream_page(
+            &self.nats,
+            workflow_id,
+            workflow_instance_id,
+            task_instance_id,
+            Some(after_seq.saturating_add(1)),
+        )
+        .await?;
+        Ok(LogBatchPage {
+            batches,
+            marker,
+            has_earlier: false,
+        })
+    }
+
+    /// Tail read — the constant-size first paint. Returns the last `tail`
+    /// batches (those before `before_seq` when paging backwards via "load
+    /// earlier") and whether earlier batches exist. The marker reports the
+    /// whole subject's state regardless of trimming.
+    pub async fn fetch_tail(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+        tail: usize,
+        before_seq: Option<u64>,
+    ) -> Result<LogBatchPage, LogsError> {
+        let (mut batches, marker) = read_stream_page(
+            &self.nats,
+            workflow_id,
+            workflow_instance_id,
+            task_instance_id,
+            None,
+        )
+        .await?;
+        if let Some(before) = before_seq {
+            batches.retain(|b| b.seq < before);
+        }
+        let has_earlier = batches.len() > tail;
+        if has_earlier {
+            let drop = batches.len() - tail;
+            batches.drain(..drop);
+        }
+        Ok(LogBatchPage {
+            batches,
+            marker,
+            has_earlier,
+        })
+    }
+
+    /// Read the archived End-of-stream sidecar, mapping "absent" to `None`.
+    async fn read_exit_sidecar(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+    ) -> Result<Option<EndOfStreamMarker>, LogsError> {
+        let key = exit_sidecar_key(workflow_id, workflow_instance_id, task_instance_id);
+        match self.minio.read(&key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes.to_vec())
+                .map(Some)
+                .map_err(|e| LogsError::Minio(format!("malformed sidecar {}: {}", key, e))),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LogsError::Minio(format!("read {}: {}", key, e))),
+        }
+    }
+}
+
+fn decode_gzip(bytes: &[u8]) -> Result<Vec<u8>, LogsError> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| LogsError::GzipDecode(e.to_string()))?;
+    Ok(out)
+}
+
+async fn read_stream_page(
+    nats: &NatsClient,
+    workflow_id: Uuid,
+    workflow_instance_id: Uuid,
+    task_instance_id: Uuid,
+    start_sequence: Option<u64>,
+) -> Result<(Vec<LogBatch>, Option<EndOfStreamMarker>), LogsError> {
+    let js = jetstream::new(nats.clone());
+    let stream = match js.get_stream(LOG_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(_) => {
+            // The stream is created lazily by the first executor to boot. If
+            // it doesn't exist yet, there are no live logs anywhere —
+            // equivalent to "not found".
+            return Ok((Vec::new(), None));
+        }
+    };
+
+    let subject = log_subject(workflow_id, workflow_instance_id, task_instance_id);
+
+    // Ephemeral pull consumer filtered to this task's subject; replay from
+    // the first batch, or from a cursor's next sequence. Mirrors the read
+    // pattern in the conductor's log-upload step.
+    let deliver_policy = match start_sequence {
+        Some(seq) => consumer::DeliverPolicy::ByStartSequence {
+            start_sequence: seq,
+        },
+        None => consumer::DeliverPolicy::All,
+    };
+    let consumer = stream
+        .create_consumer(pull::Config {
+            filter_subject: subject.clone(),
+            deliver_policy,
+            ack_policy: consumer::AckPolicy::None,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| LogsError::Nats(format!("create consumer for {}: {}", subject, e)))?;
+
+    let mut batches: Vec<LogBatch> = Vec::new();
+    let mut marker: Option<EndOfStreamMarker> = None;
+    loop {
+        let mut fetched = consumer
+            .fetch()
+            .max_messages(500)
+            .expires(Duration::from_millis(500))
+            .messages()
+            .await
+            .map_err(|e| LogsError::Nats(format!("fetch on {}: {}", subject, e)))?;
+
+        let mut got = 0usize;
+        while let Some(msg) = futures::StreamExt::next(&mut fetched).await {
+            let msg = msg.map_err(|e| LogsError::Nats(format!("message on {}: {}", subject, e)))?;
+            // The marker is structured metadata, never log text.
+            if let Some(m) = marker_from_headers(msg.headers.as_ref()) {
+                marker = Some(m);
+            } else {
+                let seq = msg
+                    .info()
+                    .map_err(|e| LogsError::Nats(format!("message info on {}: {}", subject, e)))?
+                    .stream_sequence;
+                batches.push(LogBatch {
+                    seq,
+                    bytes: msg.payload.to_vec(),
+                });
+            }
+            got += 1;
+        }
+        if got < 500 {
+            break;
+        }
+    }
+    Ok((batches, marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minio_key_matches_log_uploader_layout() {
+        let wf = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let wi = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+        let ti = Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap();
+        assert_eq!(
+            minio_object_key(wf, wi, ti),
+            "task_logs/11111111-2222-3333-4444-555555555555/66666666-7777-8888-9999-aaaaaaaaaaaa/bbbbbbbb-cccc-dddd-eeee-ffffffffffff.gz"
+        );
+    }
+
+    #[test]
+    fn log_subject_matches_staging_layout() {
+        let wf = Uuid::nil();
+        let wi = Uuid::nil();
+        let ti = Uuid::nil();
+        assert_eq!(
+            log_subject(wf, wi, ti),
+            "logs.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn gzip_round_trip_yields_original_bytes() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let plain = b"hello logs\nline two\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        let gz = encoder.finish().unwrap();
+
+        let decoded = decode_gzip(&gz).expect("gzip round-trip");
+        assert_eq!(decoded, plain);
+    }
+}

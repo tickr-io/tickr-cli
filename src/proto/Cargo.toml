@@ -1,0 +1,42 @@
+[package]
+name = "tickr_proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace dependencies
+anyhow = { workspace = true }
+chrono = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+# Conditional dependencies
+[target.'cfg(madsim)'.dependencies]
+tonic = { version = "0.5", package = "madsim-tonic" }
+
+[target.'cfg(not(madsim))'.dependencies]
+tonic = { version = "0.12", features = ["transport"] }
+
+[target.'cfg(madsim)'.build-dependencies]
+tonic-build = { version = "0.5", package = "madsim-tonic-build" }
+
+[target.'cfg(not(madsim))'.build-dependencies]
+tonic-build = { version = "0.12" }
+
+[dev-dependencies]
+# The component-liveness value's JSON round-trip test (the value is stored as
+# JSON in the KV bucket the health endpoint reads).
+serde_json = { workspace = true }
+
+[features]
+madsim = []

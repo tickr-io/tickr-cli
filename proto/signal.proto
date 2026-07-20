@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+// The published Signal-family contract for conductor-authored live-run control.
+// A `Signal` is the envelope sent to a coordinator to affect live runs:
+// `Cancel` halts a running instance or node, `Trigger` schedules a one-off
+// instance, `Wakeup` carries an external event toward live gates, and `Resume`
+// lifts a stalled replay. `GateOutcome` carries a gate-predicate result;
+// `SignalApplied` records a signal's materialized impact.
+//
+// The `Trigger.replay` seed's runnable graph and task specs reuse the
+// `tickr.runnable` and `tickr.workflow` families — one wire model of a runnable
+// graph and of a task, no third representation. Separate package so the family
+// owns its own field-number space, evolving independently of the relay
+// envelopes; all are generated from proto via tickr_proto.
+package tickr.signal;
+
+import "runnable-projection.proto";
+import "workflow-definition.proto";
+
+// The wire envelope. `signal_id` is conductor-minted on every ingress and is the
+// cross-boundary correlation id; `idempotency_key` is the producer-supplied
+// dedup key consumed by the conductor's idempotency cache. Modelled as a oneof
+// so the translation seam matches every variant exhaustively.
+message Signal {
+  string signal_id = 1;
+  optional string idempotency_key = 2;
+  oneof variant {
+    Cancel cancel = 3;
+    Wakeup wakeup = 4;
+    Trigger trigger = 5;
+    Resume resume = 6;
+  }
+}
+
+// Halt a running instance or a single node within it.
+message Cancel {
+  Target target = 1;
+  CancelReason reason = 2;
+  optional string note = 3;
+}
+
+// Carry an external event toward a live instance's gates.
+message Wakeup {
+  string name = 1;
+  Target target = 2;
+  // Captured values extracted conductor-side via JSONPath; each value is a
+  // JSON-encoded string so structure survives without a typed value on the wire.
+  map<string, string> captures = 3;
+}
+
+// Schedule a one-off instance. Its `replay` seed, when present, carries the
+// source run's runnable graph and task specs for a replay/resume.
+message Trigger {
+  string workflow_id = 1;
+  // RFC3339 fire time; absent means "fire now" (the dispatcher substitutes the
+  // current tick before computing the deterministic instance id).
+  optional string scheduled_at = 2;
+  TriggerSource source = 3;
+  // Optional run display name supplied by whoever triggered the run.
+  optional string name = 4;
+  // Conductor-minted replay seed; present only when `source` is `Replay`.
+  optional ReplaySeed replay = 5;
+}
+
+// Lift the birth-time Stall on a re-hydrated replay so the resumed frontier runs.
+message Resume {
+  string workflow_instance_id = 1;
+}
+
+// Addressing scheme for Cancel and Wakeup. `Instance` names a specific live run
+// (optionally narrowed to a graph slot); `ByTag` is fan-out against the merged
+// tag set of every live instance.
+message Target {
+  oneof addressing {
+    Instance instance = 1;
+    ByTag by_tag = 2;
+  }
+
+  message Instance {
+    string workflow_instance_id = 1;
+    // Absent addresses the whole instance; present narrows to a single graph
+    // slot (a data-plane-visible structural slot, never non-tenant provenance).
+    optional string node_id = 2;
+  }
+  message ByTag {
+    map<string, string> filter = 1;
+  }
+}
+
+// Provenance of a Cancel. Modelled as a oneof so the translation seam matches
+// every variant exhaustively.
+message CancelReason {
+  oneof reason {
+    Timeout timeout = 1;
+    UserRequested user_requested = 2;
+    External external = 3;
+  }
+
+  message Timeout {}
+  message UserRequested {
+    optional string actor = 1;
+  }
+  message External {
+    string source = 1;
+  }
+}
+
+// Origin attribution for a Trigger. Modelled as a oneof so the translation seam
+// matches every variant exhaustively; `Manual` is the default origin.
+message TriggerSource {
+  oneof source {
+    Manual manual = 1;
+    External external = 2;
+    Wakeup wakeup = 3;
+    Replay replay = 4;
+  }
+
+  // Operator- or UI-driven HTTP trigger.
+  message Manual {}
+  // Third-party publisher via the external-signals NATS subject.
+  message External {
+    string subject = 1;
+  }
+  // Conductor-synthesized trigger from a waits-on-signal subscription match.
+  message Wakeup {
+    string name = 1;
+  }
+  // Conductor-minted trigger re-running a terminal source run from its archive.
+  message Replay {
+    string source_instance_id = 1;
+    // The HyperNodes the operator chose to resume from; empty means "every
+    // failed HyperNode" (resolved conductor-side).
+    repeated string resume_from = 2;
+  }
+}
+
+// The self-contained carrier of a replay's seeded state, minted conductor-side
+// from the source run's archive. Its runnable graph and task specs reuse the
+// `tickr.runnable` and `tickr.workflow` families rather than re-modeling them —
+// one wire model of a runnable graph and of a task.
+message ReplaySeed {
+  // The deterministic replay instance id, `UUIDv5(source_instance_id,
+  // signal_id)`, computed conductor-side at ingress.
+  string replay_instance_id = 1;
+  // Archived HyperNodes seeded `Grounded` at materialisation. Empty for the
+  // bare tracer.
+  repeated string pre_grounded = 2;
+  // The source run's archived final runnable graph, read verbatim from the
+  // archive. Absent (None) on the bare tracer (empty seed): the server then
+  // falls back to the definition graph.
+  optional tickr.runnable.RunnableGraph seeded_graph = 3;
+  // Archived task specs the replay re-executes its resumed HyperNodes against.
+  // Each carries its own `id`, so the list is lossless against the internal
+  // id-keyed map. Empty for the bare tracer.
+  repeated tickr.workflow.TaskDefinition seeded_tasks = 4;
+  // The pinned definition version, a birth-time identity/display fact — not
+  // used to reconstruct the graph (the graph is carried whole above).
+  int64 workflow_version = 5;
+}
+
+// Conductor -> server: a positive gate-predicate outcome. The server's handler
+// transitions the addressed gate `Dispatched -> Satisfied { signal_id }`.
+// Carries no operational values — captures land in tickr-ctx scope keyed by
+// `signal_id`; the envelope is an addressing pair plus the lineage pointer.
+message GateOutcome {
+  string workflow_instance_id = 1;
+  string edge_id = 2;
+  string signal_id = 3;
+}
+
+// Server -> conductor: relay-back recording the materialized impact of a signal
+// after the dispatcher resolves it. Today it covers ByTag-cancel fan-out — the
+// count of live instances the filter matched.
+message SignalApplied {
+  string signal_id = 1;
+  uint32 matched_count = 2;
+}

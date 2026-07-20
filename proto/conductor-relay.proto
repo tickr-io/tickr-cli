@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package tickr;
+
+// Public conductor-to-coordinator relay envelope. Payloads are encoded using
+// their separately published proto families; this message only carries the
+// stable discriminator and addressing metadata.
+message ConductorRelayMessage {
+  EntityType entity_type = 1;
+  bytes payload = 2;
+  optional string tenant_id = 3;
+}
+
+// Stable public relay discriminator. Removed values are reserved permanently;
+// numbers must never be reused.
+enum EntityType {
+  TASK_QUEUE_ITEM = 0;
+  TASK_EVENT = 1;
+  TASK_LOG = 2;
+  SUBMIT_WORKFLOW = 3;
+  reserved 4;
+  reserved "WORKFLOW_BUILD_UPDATE";
+  reserved 5, 6;
+  reserved "QUERY_REQUEST", "QUERY_RESPONSE";
+  COMPACTION = 7;
+  COMPACTION_ACK = 8;
+  SIGNAL = 9;
+  SIGNAL_APPLIED = 10;
+  DISPATCH_PRECONDITION = 11;
+  GATE_OUTCOME = 12;
+  CANCEL_PRECONDITION = 13;
+  PATCH_WORKFLOW_INSTANCE = 14;
+  PATCH_OUTCOME = 15;
+  CANCEL_TASK = 16;
+  CANCEL_TASK_ACK = 17;
+}
+
+// The public bidirectional conductor/coordinator stream. Its package,
+// service, and method names are wire-routing compatibility constraints.
+service ConductorRelayService {
+  rpc StreamConductorRelay(stream ConductorRelayMessage) returns (stream ConductorRelayMessage);
+}

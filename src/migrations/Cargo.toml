@@ -1,0 +1,20 @@
+[package]
+name = "tickr_migrations"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+testcontainers-modules = { workspace = true }
+anyhow = { workspace = true }

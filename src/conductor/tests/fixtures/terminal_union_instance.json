@@ -1,0 +1,137 @@
+{
+  "applied_patches": [],
+  "graph_snapshots": {},
+  "id": "d28a9712-0c59-484f-9d60-e094c5a50fca",
+  "name": "archive-fixture-d28a9712-0c59-484f-9d60-e094c5a50fca",
+  "pre_grounded": [],
+  "routing_variables": {},
+  "runnable": {
+    "graph": {
+      "edges": [],
+      "end": "a385ce86-d7a9-4ca6-8604-1da2dd925796",
+      "head": [
+        "dbd5d830-4c09-4d6b-8153-ae686ea474a8"
+      ],
+      "nodes": [
+        {
+          "ground": 0,
+          "grounded_at": null,
+          "id": "a385ce86-d7a9-4ca6-8604-1da2dd925796",
+          "node_type": 1
+        },
+        {
+          "ground": 1,
+          "grounded_at": null,
+          "id": "dbd5d830-4c09-4d6b-8153-ae686ea474a8",
+          "node_type": 0
+        },
+        {
+          "ground": 1,
+          "grounded_at": "2026-07-19T10:22:12.059770+00:00",
+          "id": "00286e02-4825-4c4c-9ce6-b583ecd52320",
+          "node_type": 2
+        }
+      ],
+      "start": "dbd5d830-4c09-4d6b-8153-ae686ea474a8",
+      "tail": "dbd5d830-4c09-4d6b-8153-ae686ea474a8"
+    },
+    "tasks": [
+      {
+        "emits": [],
+        "id": "00286e02-4825-4c4c-9ce6-b583ecd52320",
+        "input_sources": null,
+        "inputs": [],
+        "loop_participant": false,
+        "max_attempts": 3,
+        "name": "extract",
+        "nix_args": [],
+        "nix_expression_path": "/nix/extract",
+        "outputs": [],
+        "routing_vars": [],
+        "secrets": [],
+        "task_type": 0,
+        "timeout_secs": null,
+        "workflow_id": "b1b97d2d-63dd-4627-adf7-4bb1a937d36d"
+      }
+    ],
+    "workflow_version": 12
+  },
+  "scheduled_at": "2026-07-19T10:22:12.060158+00:00",
+  "state": "Completed",
+  "tags": {
+    "team": "data"
+  },
+  "task_instances": [
+    {
+      "attempt": 0,
+      "cancel_reason": null,
+      "completed_at": "2026-07-19T10:22:20.060626+00:00",
+      "executor_id": null,
+      "id": "79b0a9eb-b541-47e7-a10e-d9c0dbd83d9e",
+      "kill_confirmation": null,
+      "name": "extract",
+      "started_at": "2026-07-19T10:22:15.060626+00:00",
+      "state": "Completed",
+      "task_id": "00286e02-4825-4c4c-9ce6-b583ecd52320",
+      "task_type": "RegularTask",
+      "transitions": [
+        {
+          "at": "2026-07-19T10:22:12.060626+00:00",
+          "from": "Pending",
+          "to": "Queued"
+        },
+        {
+          "at": "2026-07-19T10:22:13.060626+00:00",
+          "from": "Queued",
+          "to": "Delivered"
+        },
+        {
+          "at": "2026-07-19T10:22:14.060626+00:00",
+          "from": "Delivered",
+          "to": "Assigned"
+        },
+        {
+          "at": "2026-07-19T10:22:15.060626+00:00",
+          "from": "Assigned",
+          "to": "Running"
+        },
+        {
+          "at": "2026-07-19T10:22:20.060626+00:00",
+          "from": "Running",
+          "to": "Completed"
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "at": "2026-07-19T10:22:12.060205+00:00",
+      "from": "PendingSchedule",
+      "to": "Scheduled"
+    },
+    {
+      "at": "2026-07-19T10:22:13.060205+00:00",
+      "from": "Scheduled",
+      "to": "Triggered"
+    },
+    {
+      "at": "2026-07-19T10:22:14.060205+00:00",
+      "from": "Triggered",
+      "to": "InProgress"
+    },
+    {
+      "at": "2026-07-19T10:22:42.060205+00:00",
+      "from": "InProgress",
+      "to": "Completed"
+    }
+  ],
+  "triggered_by": {
+    "kind": "Manual",
+    "name": null,
+    "signal_id": "f6b17cfa-e0c6-4560-a0bc-8491757cbbed"
+  },
+  "version": 0,
+  "workflow_id": "b1b97d2d-63dd-4627-adf7-4bb1a937d36d",
+  "workflow_name": "snapshot-wf",
+  "workflow_version": 12
+}
