@@ -1,6 +1,6 @@
 //! Lifecycle wiring around the `SubscriptionIndex`. The pure index
 //! lives in `subscription_index`; this module owns the process-wide
-//! singleton instance and the integration with Postgres + the
+//! singleton instance and the integration with the selected repository +
 //! registration / build-completion call sites.
 //!
 //! The index is in-memory only; the authoritative source is the
@@ -9,16 +9,14 @@
 //! - `apply_workflow_state(workflow)` — invoked when the build pipeline's
 //!   finalizer flips a workflow to `Ready`. Looks at the workflow's
 //!   `trigger_on` config and either registers or unregisters.
-//! - `rebuild_from_postgres(pool)` — invoked on conductor startup.
-//!   Scans the `workflows` table for rows with
-//!   `status IN ('Ready', 'Submitted')` AND a `waits-on-signal`
-//!   trigger config, repopulating the index from scratch.
+//! - `rebuild_from_repository(repositories)` — invoked on conductor startup.
+//!   Reads the latest live definition rows and repopulates the index.
 //! - `signal_subscription_index()` — process-wide accessor that the
 //!   HTTP / NATS translators reach for to read the index hot-path.
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
-use sqlx::PgPool;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::workflow as wf;
 
 use crate::captures_merge;
@@ -73,34 +71,14 @@ pub fn apply_workflow_state(workflow: &wf::WorkflowDefinition) -> Result<()> {
 /// rebuilding. (A row with a malformed predicate is itself a bug in
 /// the conductor's earlier registration validation, so this path is
 /// belt-and-suspenders against state drift.)
-pub async fn rebuild_from_postgres(pool: &PgPool) -> Result<usize> {
-    // Resolve the latest live (`Ready`/`Submitted`) row per id — the same
-    // version the server runs — not merely *a* live row. A re-registered slug
-    // keeps one immutable row per version, so several live rows can coexist for
-    // one id; `register` is keyed by workflow_id and replaces, so without this
-    // `DISTINCT ON` an arbitrary live row's declarations would win. Mirrors the
-    // read path's `latest_live` CTE and the trigger surface's
-    // `load_live_workflow_definition` resolver.
-    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT DISTINCT ON (id) definition FROM workflows \
-         WHERE status IN ('Ready', 'Submitted') \
-         ORDER BY id, inserted_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
+pub async fn rebuild_from_repository(repositories: &WriterRepositoryBundle) -> Result<usize> {
+    let workflows = repositories
+        .live_workflow_definitions()
+        .await
+        .map_err(anyhow::Error::new)?;
 
     let mut registered = 0usize;
-    for (definition,) in rows {
-        let workflow = match crate::definition_store::proto_from_stored_definition(definition) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "subscription_index rebuild: skipping malformed workflow row: {}",
-                    e
-                );
-                continue;
-            }
-        };
+    for workflow in workflows {
         if !matches!(
             workflow
                 .trigger

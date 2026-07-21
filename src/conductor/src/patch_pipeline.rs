@@ -1,4 +1,4 @@
-//! Conductor patch pipeline (Postgres).
+//! Conductor Patch pipeline.
 //!
 //! Brings an externally-submitted Patch in over the command bus and through
 //! to the server's apply path. The conductor owns the *document*: it
@@ -52,11 +52,18 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::patch_repository::{
+    PatchIngressInput as RepositoryPatchIngressInput,
+    PatchIngressOutcome as RepositoryPatchIngressOutcome, PatchOutcomeCorrelation,
+    PatchOutcomeInput, PatchRedriveCandidate, PatchTaskBuildResult, PatchTaskSpecification,
+    PatchTerminalOutcome,
+};
+pub use tickr_migrations::patch_repository::{PatchProvenance, PatchSourceFormat};
 use tickr_proto::patch as pp;
 use tickr_proto::workflow as wf;
 use tokio_util::sync::CancellationToken;
@@ -65,45 +72,6 @@ use uuid::Uuid;
 use crate::build_pipeline::{BuildExecutor, BuildOutcome, TaskBuildJob};
 use crate::parser::builder::project_gate_proto;
 use crate::parser::types::{ParsedGate, ParsedInputBinding, ParsedTask};
-
-/// Self/external authorship of a patch. `self` is stamped when a self-patch is
-/// emitted through the reserved ctx output; `external` when a patch arrives on
-/// the command bus. The wire form is `tickr.patch.PatchProvenance`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PatchProvenance {
-    #[serde(rename = "self")]
-    SelfEmitted,
-    #[default]
-    #[serde(rename = "external")]
-    External,
-}
-
-impl PatchProvenance {
-    /// The persisted wire/render token: `"self"` or `"external"`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PatchProvenance::SelfEmitted => "self",
-            PatchProvenance::External => "external",
-        }
-    }
-
-    /// Parse a persisted token back to the discriminant; any non-`"self"`
-    /// value (including a legacy row's) is `External`.
-    pub fn from_wire(s: &str) -> Self {
-        match s {
-            "self" => PatchProvenance::SelfEmitted,
-            _ => PatchProvenance::External,
-        }
-    }
-
-    /// The published proto discriminant this authorship rides on the wire.
-    fn to_proto(self) -> i32 {
-        match self {
-            PatchProvenance::External => pp::PatchProvenance::External as i32,
-            PatchProvenance::SelfEmitted => pp::PatchProvenance::SelfEmitted as i32,
-        }
-    }
-}
 
 /// Reject a chain whose `steps` name the same `handle` twice **within one
 /// scope** (a step list). The same string may recur in a sibling scope — the
@@ -185,9 +153,8 @@ impl AddressedPatchOpExt for pp::AddressedPatchOp {
     }
 }
 
-/// Lifecycle states of a patch row. TEXT in Postgres (matching the
-/// `workflows.status` precedent); the CHECK constraint in the migration is
-/// the schema-side tripwire.
+/// Repository lifecycle states. Logical schema constraints enforce the same
+/// canonical strings on every SQL implementation.
 pub const STATUS_VALIDATING: &str = "Validating";
 pub const STATUS_BUILDING: &str = "Building";
 pub const STATUS_SUBMITTED: &str = "Submitted";
@@ -208,36 +175,6 @@ pub const REDRIVE_MIN_AGE: Duration = Duration::from_secs(10);
 /// computes the same `patch_key` and lands on the same lifecycle row.
 pub fn patch_key(workflow_instance_id: Uuid, patch_id: Uuid) -> Uuid {
     Uuid::new_v5(&workflow_instance_id, patch_id.as_bytes())
-}
-
-/// Which language a retained authored source is written in, so a reader renders
-/// it correctly: `Nickel` for an external author's document (and a self-patch
-/// authored as Nickel), `Json` for a self-patch emitted as an already-evaluated
-/// JSON document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatchSourceFormat {
-    Nickel,
-    Json,
-}
-
-impl PatchSourceFormat {
-    /// The persisted discriminant (matches the `source_format` CHECK).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PatchSourceFormat::Nickel => "nickel",
-            PatchSourceFormat::Json => "json",
-        }
-    }
-
-    /// Reconstruct from the persisted discriminant. An unrecognized value (only
-    /// reachable via a hand-edited row) falls back to `Json` — the evaluated
-    /// form is always JSON, so a JSON reader is the safe default.
-    pub fn from_db(s: &str) -> Self {
-        match s {
-            "nickel" => PatchSourceFormat::Nickel,
-            _ => PatchSourceFormat::Json,
-        }
-    }
 }
 
 /// The verbatim authored Patch source, retained keyed by patch so the reading
@@ -727,7 +664,7 @@ pub enum PatchError {
     #[error("invalid Patch document: {0}")]
     Parse(String),
     #[error("patch persistence failed: {0}")]
-    Persist(#[from] sqlx::Error),
+    Persist(#[from] tickr_migrations::backend::RepositoryError),
 }
 
 /// Evaluate a raw Nickel Patch document and check it is well-formed. This is
@@ -1264,21 +1201,6 @@ impl PatchRelaySender for DefaultPatchRelaySender {
     }
 }
 
-/// The column tuple every row read projects — one shape for the ingress
-/// replay read, the pollable read, and the re-drive scan.
-type PatchRowTuple = (
-    Uuid,
-    Uuid,
-    Uuid,
-    String,
-    serde_json::Value,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    String,
-    Option<serde_json::Value>,
-);
-
 /// One patch lifecycle row, as read back for replay / re-drive.
 #[derive(Debug, Clone)]
 pub struct PatchRow {
@@ -1306,6 +1228,21 @@ impl PatchRow {
             self.status.as_str(),
             STATUS_APPLIED | STATUS_REJECTED | STATUS_BUILD_FAILED
         )
+    }
+}
+
+fn row_from_repository(row: tickr_migrations::patch_repository::PatchLifecycleRow) -> PatchRow {
+    PatchRow {
+        patch_key: row.patch_key,
+        patch_id: row.patch_id,
+        workflow_instance_id: row.workflow_instance_id,
+        status: row.status.as_str().to_owned(),
+        ops: serde_json::to_value(row.ops).expect("published Patch operations serialize"),
+        reason: row.reason,
+        outcome: row.outcome,
+        applied_version: row.applied_version,
+        provenance: row.provenance,
+        operation: row.operation,
     }
 }
 
@@ -1355,8 +1292,6 @@ pub enum PatchIngress {
     Replayed { row: PatchRow },
 }
 
-const REJECT_IN_PROGRESS: &str = "rejected: patch already in progress for this instance";
-
 /// Ingress one Patch request: dedup by `patch_key`, enforce
 /// one-Patch-at-a-time, persist the row, then relay and flip
 /// `Validating → Submitted`. The row commit happens *before* the relay
@@ -1367,7 +1302,7 @@ const REJECT_IN_PROGRESS: &str = "rejected: patch already in progress for this i
 /// redelivered internal request can carry the same identity into the same
 /// row; a fresh external submit always mints fresh.
 pub async fn process_patch(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     sender: &dyn PatchRelaySender,
     workflow_instance_id: Uuid,
     patch_id: Uuid,
@@ -1375,138 +1310,65 @@ pub async fn process_patch(
     provenance: PatchProvenance,
 ) -> Result<PatchIngress, PatchError> {
     let key = patch_key(workflow_instance_id, patch_id);
-    let ops_json = serde_json::to_value(&parsed.ops)
-        .map_err(|e| PatchError::Parse(format!("ops failed to serialize: {e}")))?;
-    // The un-lowered operation is persisted alongside the ops so a re-driven or
-    // build-finalized validate+apply envelope carries the same intent the
-    // server needs to lower the edge rewrite. `None` for a primitive-op patch.
-    let operation_json = parsed
-        .operation
-        .as_ref()
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| PatchError::Parse(format!("operation failed to serialize: {e}")))?;
-
-    let mut tx = pool.begin().await?;
-
-    // Dedup: a key that already holds a row replays it, whatever its state.
-    if let Some(row) = fetch_row_for_update(&mut tx, key).await? {
-        tx.commit().await?;
-        return Ok(PatchIngress::Replayed { row });
-    }
-
-    // One Patch at a time: any unsettled sibling row for the same instance
-    // rejects this request — recorded on its own row, never dropped.
-    let sibling_unsettled: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1 FROM workflow_patches
-             WHERE workflow_instance_id = $1
-               AND status IN ('Validating', 'Building', 'Submitted'))",
-    )
-    .bind(workflow_instance_id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // Build-at-patch: a task-bearing `AddNode` opens the row at `Building`
-    // instead of `Validating` — the per-task builds must succeed before the
-    // apply envelope ships.
     let new_tasks: Vec<(Uuid, wf::TaskDefinition)> = parsed
         .new_tasks()
         .into_iter()
-        .map(|(id, t)| (id, t.clone()))
+        .map(|(id, task)| (id, task.clone()))
+        .collect();
+    let task_specifications = new_tasks
+        .iter()
+        .map(|(task_id, task)| PatchTaskSpecification {
+            task_id: *task_id,
+            routing_vars: &task.routing_vars,
+        })
         .collect();
 
-    let (status, outcome) = if sibling_unsettled {
-        (STATUS_REJECTED, Some(REJECT_IN_PROGRESS))
-    } else if new_tasks.is_empty() {
-        (STATUS_VALIDATING, None)
-    } else {
-        (STATUS_BUILDING, None)
-    };
-
-    sqlx::query(
-        "INSERT INTO workflow_patches
-            (patch_key, patch_id, workflow_instance_id, status, ops, reason, outcome,
-             provenance, source, source_format, operation)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(key)
-    .bind(patch_id)
-    .bind(workflow_instance_id)
-    .bind(status)
-    .bind(&ops_json)
-    .bind(&parsed.reason)
-    .bind(outcome)
-    .bind(provenance.as_str())
-    // The authored source is retained verbatim on the same row as the ops and
-    // (later) the applied version, so a reader joins source ↔ effect by patch.
-    .bind(&parsed.source.text)
-    .bind(parsed.source.format.as_str())
-    .bind(&operation_json)
-    .execute(&mut *tx)
-    .await?;
-
-    if !sibling_unsettled {
-        for (task_id, task) in &new_tasks {
-            // Patch-keyed per-task build row: the finalizer's last-one-out
-            // conditional UPDATE checks these, exactly like registration's
-            // `workflow_task_builds`.
-            sqlx::query(
-                "INSERT INTO workflow_patch_task_builds (patch_key, task_id, status)
-                 VALUES ($1, $2, 'pending')",
-            )
-            .bind(key)
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-            // Unified task-spec store write — patch ingress is the
-            // "patch-apply" writer: the spec must be readable by the time the
-            // patched-in task first completes, and a row for a Patch that
-            // never applies is inert (the task never runs, so enrichment
-            // never looks it up).
-            let routing_vars = serde_json::to_value(&task.routing_vars)
-                .map_err(|e| PatchError::Parse(format!("routing_vars failed to serialize: {e}")))?;
-            sqlx::query(
-                "INSERT INTO task_specs (task_id, routing_vars)
-                 VALUES ($1, $2)
-                 ON CONFLICT (task_id) DO NOTHING",
-            )
-            .bind(task_id)
-            .bind(&routing_vars)
-            .execute(&mut *tx)
-            .await?;
-        }
-    }
-    tx.commit().await?;
-
-    if sibling_unsettled {
-        return Ok(PatchIngress::RejectedInProgress {
-            patch_id,
+    let ingress = repositories
+        .ingress_patch(RepositoryPatchIngressInput {
             patch_key: key,
-            reason: REJECT_IN_PROGRESS.to_string(),
-        });
+            patch_id,
+            workflow_instance_id,
+            ops: &parsed.ops,
+            operation: parsed.operation.as_ref(),
+            reason: parsed.reason.as_deref(),
+            provenance,
+            source: &parsed.source.text,
+            source_format: parsed.source.format,
+            tasks: task_specifications,
+        })
+        .await?;
+
+    match ingress {
+        RepositoryPatchIngressOutcome::Existing { row } => {
+            return Ok(PatchIngress::Replayed {
+                row: row_from_repository(row),
+            });
+        }
+        RepositoryPatchIngressOutcome::RejectedInProgress { reason } => {
+            return Ok(PatchIngress::RejectedInProgress {
+                patch_id,
+                patch_key: key,
+                reason,
+            });
+        }
+        RepositoryPatchIngressOutcome::Accepted { .. } => {}
     }
 
     if new_tasks.is_empty() {
-        // No build window: relay the single validate+apply envelope after
-        // commit. A failed send is not an error to the submitter: the durable
-        // Validating row re-drives on backoff until settlement.
         let envelope = pp::PatchEnvelope {
             workflow_instance_id: workflow_instance_id.to_string(),
             patch_key: key.to_string(),
             ops: parsed.ops,
             reason: parsed.reason,
             provenance: provenance.to_proto(),
-            // A primitive-op patch has no composite operation; an `insert`
-            // always introduces a task and so never takes this no-build path.
             operation: parsed.operation,
         };
         match sender.send(&envelope).await {
             Ok(()) => {
-                flip_to_submitted(pool, key).await?;
+                repositories.mark_patch_submitted(key).await?;
             }
-            Err(e) => {
-                eprintln!("patch relay send failed for {key} (will re-drive): {e}");
+            Err(error) => {
+                eprintln!("patch relay send failed for {key} (will re-drive): {error}");
             }
         }
         return Ok(PatchIngress::Accepted {
@@ -1516,19 +1378,13 @@ pub async fn process_patch(
         });
     }
 
-    // Build-then-apply: nothing is armed on the instance during the build
-    // window (a slow build can never pin the run — story 24). Just hand the
-    // per-task jobs back for publish-after-commit; the single validate+apply
-    // envelope ships only from the last-one-out finalizer, on build success. A
-    // self-patch's Stall is the server's completion-time arm, released by that
-    // apply or by the author-declared stall-TTL backstop.
     let build_jobs = new_tasks
-        .iter()
+        .into_iter()
         .map(|(task_id, task)| PatchTaskBuildJob {
             patch_key: key,
             workflow_instance_id,
-            task_id: *task_id,
-            nix_expression_path: task.nix_expression_path.clone(),
+            task_id,
+            nix_expression_path: task.nix_expression_path,
         })
         .collect();
     Ok(PatchIngress::Accepted {
@@ -1559,128 +1415,51 @@ pub async fn publish_patch_build_jobs(
     Ok(())
 }
 
-/// Result of one patch-build finalizer pass — the patch-keyed mirror of the
-/// registration finalizer's outcome, so tests can tell "this worker turned
-/// off the lights" from "another already did".
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PatchBuildFinalize {
-    /// Every per-task row is `success`: the row flipped `Building →
-    /// Submitted` and the single validate+apply envelope shipped.
-    FlippedToSubmitted,
-    /// A build failed: the row flipped `Building → BuildFailed` (terminal) and
-    /// the Patch settled **conductor-internally** — no envelope is sent (the
-    /// build-then-apply protocol never armed a Stall for the build window). A
-    /// self-patch's completion-time Stall, if any, releases via the server's
-    /// author-declared stall-TTL backstop; the built artifacts are orphaned.
-    FlippedToBuildFailed,
-    /// The row was no longer `Building`, or other tasks are still pending.
-    AlreadyTerminalOrNotReady,
-}
+/// Typed result of one atomic patch-build settlement operation.
+///
+/// Only `Submitted` carries an apply-publication intent; every losing outcome
+/// is side-effect-free at the caller.
+pub use tickr_migrations::patch_repository::PatchBuildSettlementOutcome;
+pub type PatchBuildFinalize = PatchBuildSettlementOutcome;
 
-/// Commit a per-task patch build outcome onto its row.
-pub async fn record_patch_task_outcome(
-    pool: &PgPool,
+/// Atomically records one per-Task result and evaluates the aggregate Patch
+/// lifecycle. The repository commits the winning `Submitted` transition before
+/// returning its apply-publication intent. Only that winner sends the envelope;
+/// a failed send leaves the durable `Submitted` row for re-drive.
+pub async fn finalize_patch_after_build(
+    repositories: &WriterRepositoryBundle,
+    sender: &dyn PatchRelaySender,
     patch_key: Uuid,
     task_id: Uuid,
     outcome: &BuildOutcome,
-) -> Result<(), sqlx::Error> {
-    let (status, error) = match outcome {
-        BuildOutcome::Success => ("success", None),
-        BuildOutcome::Failure { error } => ("failure", Some(error.as_str())),
-    };
-    sqlx::query(
-        "UPDATE workflow_patch_task_builds
-            SET status = $3, error = $4, built_at = now()
-          WHERE patch_key = $1 AND task_id = $2",
-    )
-    .bind(patch_key)
-    .bind(task_id)
-    .bind(status)
-    .bind(error)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Last-one-out finalizer for patch-keyed builds. On `Failure` the patch row
-/// short-circuits `Building → BuildFailed` (conditional UPDATE — terminal
-/// states never transition again) and the Patch settles **conductor-internally
-/// — no envelope**: build-then-apply never armed a Stall for the build window,
-/// so there is nothing to release (a self-patch's completion-time Stall, if
-/// any, is released by the server's author-declared stall-TTL backstop). On
-/// `Success` the row flips `Building → Submitted` only when every per-task row
-/// is `success` (the conditional UPDATE is the lock: concurrent finalizers
-/// race it, at most one wins) and the winner ships the single validate+apply
-/// envelope rebuilt from the row's persisted ops. A lost send is recovered by
-/// the re-drive loop (the row sits non-terminal at `Submitted`).
-pub async fn finalize_patch_after_build(
-    pool: &PgPool,
-    sender: &dyn PatchRelaySender,
-    patch_key: Uuid,
-    outcome: &BuildOutcome,
 ) -> Result<PatchBuildFinalize> {
-    match outcome {
-        BuildOutcome::Failure { error } => {
-            let res = sqlx::query(
-                "UPDATE workflow_patches
-                    SET status = 'BuildFailed', outcome = $2, updated_at = now()
-                  WHERE patch_key = $1 AND status = 'Building'",
-            )
-            .bind(patch_key)
-            .bind(format!("build failed: {error}"))
-            .execute(pool)
-            .await?;
-            if res.rows_affected() != 1 {
-                return Ok(PatchBuildFinalize::AlreadyTerminalOrNotReady);
-            }
-            // Settled conductor-internally: no envelope to the server. Nothing
-            // was armed for the build window, so nothing needs releasing.
-            Ok(PatchBuildFinalize::FlippedToBuildFailed)
-        }
-        BuildOutcome::Success => {
-            let res = sqlx::query(
-                "UPDATE workflow_patches p
-                    SET status = 'Submitted', updated_at = now()
-                  WHERE p.patch_key = $1 AND p.status = 'Building'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM workflow_patch_task_builds b
-                         WHERE b.patch_key = p.patch_key
-                           AND b.status <> 'success')",
-            )
-            .bind(patch_key)
-            .execute(pool)
-            .await?;
-            if res.rows_affected() != 1 {
-                return Ok(PatchBuildFinalize::AlreadyTerminalOrNotReady);
-            }
-            let Some(row) = fetch_row(pool, patch_key).await? else {
-                return Ok(PatchBuildFinalize::FlippedToSubmitted);
-            };
-            match envelope_from_row(&row) {
-                Some(envelope) => {
-                    if let Err(e) = sender.send(&envelope).await {
-                        eprintln!(
-                            "patch validate+apply relay send failed for {patch_key} \
-                             (will re-drive): {e}"
-                        );
-                    }
-                }
-                None => eprintln!(
-                    "patch finalizer: ops for {patch_key} failed to deserialize; \
-                     row left at Submitted for operator attention"
-                ),
-            }
-            Ok(PatchBuildFinalize::FlippedToSubmitted)
+    let result = match outcome {
+        BuildOutcome::Success => PatchTaskBuildResult::Success,
+        BuildOutcome::Failure { error } => PatchTaskBuildResult::Failure { error },
+    };
+    let settlement = repositories
+        .settle_patch_task_build(patch_key, task_id, result)
+        .await?;
+
+    if let PatchBuildFinalize::Submitted(row) = &settlement {
+        let envelope = envelope_from_repository_row(row);
+        if let Err(error) = sender.send(&envelope).await {
+            eprintln!(
+                "patch validate+apply relay send failed for {patch_key} \
+                 (will re-drive): {error}"
+            );
         }
     }
+
+    Ok(settlement)
 }
 
 /// One patch-build job: build via the injected executor (the same
 /// `BuildExecutor` seam registration uses — a `TaskBuildJob` shell carries
 /// the patch identity in `workflow_id` purely for the executor's logs),
-/// record the per-task outcome, run the finalizer.
+/// settle the per-task result, and run the aggregate finalizer.
 async fn process_patch_build_job(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     executor: &dyn BuildExecutor,
     sender: &dyn PatchRelaySender,
     msg: async_nats::Message,
@@ -1696,20 +1475,15 @@ async fn process_patch_build_job(
         workflow_id: job.patch_key,
         workflow_version: 0,
         task_id: job.task_id,
-        nix_expression_path: job.nix_expression_path.clone(),
+        nix_expression_path: job.nix_expression_path,
     };
     let outcome = executor.build(&build_input).await;
-    if let Err(e) = record_patch_task_outcome(pool, job.patch_key, job.task_id, &outcome).await {
+    if let Err(error) =
+        finalize_patch_after_build(repositories, sender, job.patch_key, job.task_id, &outcome).await
+    {
         eprintln!(
-            "patch build worker: failed to record outcome for {}/{}: {e}",
+            "patch build worker: settlement failed for {}/{}: {error}",
             job.patch_key, job.task_id
-        );
-        return;
-    }
-    if let Err(e) = finalize_patch_after_build(pool, sender, job.patch_key, &outcome).await {
-        eprintln!(
-            "patch build worker: finalizer pass failed for {}: {e}",
-            job.patch_key
         );
     }
 }
@@ -1719,7 +1493,7 @@ async fn process_patch_build_job(
 /// the cancellation token fires.
 pub async fn start_patch_build_worker(
     nats: async_nats::Client,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     executor: Arc<dyn BuildExecutor>,
     sender: Arc<dyn PatchRelaySender>,
     cancel: CancellationToken,
@@ -1739,7 +1513,7 @@ pub async fn start_patch_build_worker(
                 break;
             }
             Some(msg) = sub.next() => {
-                process_patch_build_job(&pg_pool, executor.as_ref(), sender.as_ref(), msg).await;
+                process_patch_build_job(&repositories, executor.as_ref(), sender.as_ref(), msg).await;
             }
             else => {
                 println!("Patch build queue subscription ended.");
@@ -1750,22 +1524,19 @@ pub async fn start_patch_build_worker(
     Ok(())
 }
 
-/// Rebuild the single validate+apply relay envelope for a persisted row.
-/// `None` when the persisted ops no longer deserialize — an integrity fault
-/// the caller logs loudly (the row stays for operator attention rather than
-/// silently vanishing).
-fn envelope_from_row(row: &PatchRow) -> Option<pp::PatchEnvelope> {
-    let ops: Vec<pp::AddressedPatchOp> = serde_json::from_value(row.ops.clone()).ok()?;
-    Some(pp::PatchEnvelope {
+/// Rebuild the single validate+apply relay envelope for a decoded repository
+/// row.
+fn envelope_from_repository_row(
+    row: &tickr_migrations::patch_repository::PatchLifecycleRow,
+) -> pp::PatchEnvelope {
+    pp::PatchEnvelope {
         workflow_instance_id: row.workflow_instance_id.to_string(),
         patch_key: row.patch_key.to_string(),
-        ops,
+        ops: row.ops.clone(),
         reason: row.reason.clone(),
         provenance: row.provenance.to_proto(),
-        // The un-lowered operation the server lowers at apply — carried on the
-        // finalizer's envelope and on any re-drive of it.
         operation: row.operation.clone(),
-    })
+    }
 }
 
 /// Correlate a server `PatchOutcome` envelope onto its lifecycle row. The
@@ -1781,52 +1552,45 @@ pub enum OutcomeCorrelation {
 }
 
 pub async fn correlate_outcome(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     outcome: &pp::PatchOutcome,
-) -> Result<OutcomeCorrelation, sqlx::Error> {
-    // The published outcome addresses its patch by string key; an unparseable
-    // key names no row this conductor ingressed, so it is absorbed like an
-    // unknown key rather than faulting.
+) -> Result<OutcomeCorrelation, tickr_migrations::backend::RepositoryError> {
     let patch_key = match Uuid::parse_str(&outcome.patch_key) {
-        Ok(k) => k,
+        Ok(key) => key,
         Err(_) => return Ok(OutcomeCorrelation::Absorbed),
     };
-    let kind = match outcome.outcome.as_ref().and_then(|o| o.kind.as_ref()) {
-        Some(k) => k,
+    let workflow_instance_id = match Uuid::parse_str(&outcome.workflow_instance_id) {
+        Ok(id) => id,
+        Err(_) => return Ok(OutcomeCorrelation::Absorbed),
+    };
+    let terminal_outcome = match outcome
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.kind.as_ref())
+    {
+        Some(pp::patch_outcome_kind::Kind::Applied(applied)) => PatchTerminalOutcome::Applied {
+            version: i64::from(applied.version),
+        },
+        Some(pp::patch_outcome_kind::Kind::Rejected(rejected)) => PatchTerminalOutcome::Rejected {
+            reason: &rejected.reason,
+        },
         None => return Ok(OutcomeCorrelation::Absorbed),
     };
-    let result = match kind {
-        pp::patch_outcome_kind::Kind::Applied(a) => {
-            sqlx::query(
-                "UPDATE workflow_patches
-                    SET status = 'Applied', outcome = 'applied',
-                        applied_version = $2, updated_at = now()
-                  WHERE patch_key = $1
-                    AND status IN ('Validating', 'Building', 'Submitted')",
-            )
-            .bind(patch_key)
-            .bind(a.version as i64)
-            .execute(pool)
+    Ok(
+        match repositories
+            .correlate_patch_outcome(PatchOutcomeInput {
+                patch_key,
+                workflow_instance_id,
+                outcome: terminal_outcome,
+            })
             .await?
-        }
-        pp::patch_outcome_kind::Kind::Rejected(r) => {
-            sqlx::query(
-                "UPDATE workflow_patches
-                    SET status = 'Rejected', outcome = $2, updated_at = now()
-                  WHERE patch_key = $1
-                    AND status IN ('Validating', 'Building', 'Submitted')",
-            )
-            .bind(patch_key)
-            .bind(&r.reason)
-            .execute(pool)
-            .await?
-        }
-    };
-    if result.rows_affected() == 1 {
-        Ok(OutcomeCorrelation::Settled)
-    } else {
-        Ok(OutcomeCorrelation::Absorbed)
-    }
+        {
+            PatchOutcomeCorrelation::Won => OutcomeCorrelation::Settled,
+            PatchOutcomeCorrelation::AlreadySettled(_)
+            | PatchOutcomeCorrelation::Absent
+            | PatchOutcomeCorrelation::Conflicted => OutcomeCorrelation::Absorbed,
+        },
+    )
 }
 
 /// One re-drive pass: re-send every unsettled `Validating` / `Submitted` row
@@ -1841,32 +1605,32 @@ pub async fn correlate_outcome(
 /// and the server's apply-time re-validation + redelivery dedup make a resend
 /// idempotent.
 pub async fn redrive_unsettled(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     sender: &dyn PatchRelaySender,
     min_age: Duration,
-) -> Result<usize, sqlx::Error> {
-    let rows: Vec<PatchRow> = fetch_unsettled_older_than(pool, min_age).await?;
+) -> Result<usize, tickr_migrations::backend::RepositoryError> {
+    let rows = repositories.unsettled_patches_older_than(min_age).await?;
     let mut sent = 0usize;
-    for row in rows {
-        let Some(envelope) = envelope_from_row(&row) else {
-            // Persisted ops that no longer deserialize are an integrity
-            // fault, not a transient — loud log, skip (the row stays for
-            // operator attention rather than silently vanishing).
-            eprintln!(
-                "patch re-drive: ops for {} failed to deserialize",
-                row.patch_key
-            );
-            continue;
+    for candidate in rows {
+        let row = match candidate {
+            PatchRedriveCandidate::Ready(row) => row,
+            PatchRedriveCandidate::Corrupt { identity, error } => {
+                eprintln!(
+                    "patch re-drive: stored operation for {identity} is corrupt and was skipped: {error}"
+                );
+                continue;
+            }
         };
+        let envelope = envelope_from_repository_row(&row);
         match sender.send(&envelope).await {
             Ok(()) => {
-                flip_to_submitted(pool, row.patch_key).await?;
+                repositories.mark_patch_submitted(row.patch_key).await?;
                 sent += 1;
             }
-            Err(e) => {
+            Err(error) => {
                 eprintln!(
                     "patch re-drive send failed for {} (will retry): {}",
-                    row.patch_key, e
+                    row.patch_key, error
                 );
             }
         }
@@ -1877,7 +1641,7 @@ pub async fn redrive_unsettled(
 /// The steady-state re-drive loop: every `REDRIVE_INTERVAL`, re-send
 /// unsettled rows older than `REDRIVE_MIN_AGE` until shutdown.
 pub async fn run_patch_redrive(
-    pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     sender: Arc<dyn PatchRelaySender>,
     cancel: CancellationToken,
 ) {
@@ -1888,7 +1652,7 @@ pub async fn run_patch_redrive(
                 return;
             }
             _ = tokio::time::sleep(REDRIVE_INTERVAL) => {
-                match redrive_unsettled(&pool, sender.as_ref(), REDRIVE_MIN_AGE).await {
+                match redrive_unsettled(&repositories, sender.as_ref(), REDRIVE_MIN_AGE).await {
                     Ok(0) => {}
                     Ok(n) => println!("patch re-drive: re-sent {n} unsettled patch(es)"),
                     Err(e) => eprintln!("patch re-drive pass failed: {e}"),
@@ -1896,111 +1660,6 @@ pub async fn run_patch_redrive(
             }
         }
     }
-}
-
-/// Read one row by key, for replay decisions. `FOR UPDATE` inside the ingress
-/// transaction so two concurrent ingresses of the same key serialize.
-async fn fetch_row_for_update(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    key: Uuid,
-) -> Result<Option<PatchRow>, sqlx::Error> {
-    let row = sqlx::query_as::<_, PatchRowTuple>(
-        "SELECT patch_key, patch_id, workflow_instance_id, status, ops, reason, outcome, applied_version, provenance, operation
-           FROM workflow_patches WHERE patch_key = $1 FOR UPDATE",
-    )
-    .bind(key)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(row.map(row_from_tuple))
-}
-
-/// Read one row by key without locking — the pollable submitter surface and
-/// the test-side assertion read.
-pub async fn fetch_row(pool: &PgPool, key: Uuid) -> Result<Option<PatchRow>, sqlx::Error> {
-    let row = sqlx::query_as::<_, PatchRowTuple>(
-        "SELECT patch_key, patch_id, workflow_instance_id, status, ops, reason, outcome, applied_version, provenance, operation
-           FROM workflow_patches WHERE patch_key = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(row_from_tuple))
-}
-
-/// Read a Patch's retained authored source by `patch_key` — the conductor-side
-/// read path for the reading surface. `None` when the key is unknown or the row
-/// predates source retention (its `source` is NULL). The retained form is
-/// exactly what was submitted (Nickel or JSON), never a re-encoding of the
-/// lowered ops; a reader joins it to the server's applied-patch record by
-/// patch/version, since the same row carries `applied_version`.
-pub async fn fetch_patch_source(
-    pool: &PgPool,
-    patch_key: Uuid,
-) -> Result<Option<PatchSource>, sqlx::Error> {
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT source, source_format FROM workflow_patches WHERE patch_key = $1")
-            .bind(patch_key)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(text, format)| match (text, format) {
-        (Some(text), Some(format)) => Some(PatchSource {
-            text,
-            format: PatchSourceFormat::from_db(&format),
-        }),
-        _ => None,
-    }))
-}
-
-async fn fetch_unsettled_older_than(
-    pool: &PgPool,
-    min_age: Duration,
-) -> Result<Vec<PatchRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, PatchRowTuple>(
-        // `Building` excluded: builds settle through the finalizer, and
-        // re-driving them would re-arm the Stall on a loop (see
-        // `redrive_unsettled`).
-        "SELECT patch_key, patch_id, workflow_instance_id, status, ops, reason, outcome, applied_version, provenance, operation
-           FROM workflow_patches
-          WHERE status IN ('Validating', 'Submitted')
-            AND updated_at < now() - make_interval(secs => $1)
-          ORDER BY created_at",
-    )
-    .bind(min_age.as_secs_f64())
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(row_from_tuple).collect())
-}
-
-fn row_from_tuple(t: PatchRowTuple) -> PatchRow {
-    PatchRow {
-        patch_key: t.0,
-        patch_id: t.1,
-        workflow_instance_id: t.2,
-        status: t.3,
-        ops: t.4,
-        reason: t.5,
-        outcome: t.6,
-        applied_version: t.7,
-        provenance: PatchProvenance::from_wire(&t.8),
-        // A NULL / undeserializable `operation` reads as `None` — a primitive-op
-        // patch, the common case; only an `insert` populates it.
-        operation: t.9.and_then(|v| serde_json::from_value(v).ok()),
-    }
-}
-
-/// `Validating → Submitted` after a successful relay send; also the re-drive
-/// touch for an already-`Submitted` row (bumps the backoff anchor).
-async fn flip_to_submitted(pool: &PgPool, key: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE workflow_patches
-            SET status = 'Submitted', updated_at = now()
-          WHERE patch_key = $1
-            AND status IN ('Validating', 'Submitted')",
-    )
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2810,17 +2469,9 @@ mod tests {
         );
     }
 
-    /// The persisted discriminant round-trips, and an unrecognized value falls
-    /// back to `Json` (the safe reader default).
     #[test]
-    fn source_format_discriminant_round_trips() {
+    fn source_format_discriminants_are_stable() {
         assert_eq!(PatchSourceFormat::Nickel.as_str(), "nickel");
         assert_eq!(PatchSourceFormat::Json.as_str(), "json");
-        assert_eq!(
-            PatchSourceFormat::from_db("nickel"),
-            PatchSourceFormat::Nickel
-        );
-        assert_eq!(PatchSourceFormat::from_db("json"), PatchSourceFormat::Json);
-        assert_eq!(PatchSourceFormat::from_db("???"), PatchSourceFormat::Json);
     }
 }

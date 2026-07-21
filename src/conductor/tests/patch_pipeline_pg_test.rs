@@ -23,9 +23,8 @@ use anyhow::Result;
 use sqlx::PgPool;
 use std::time::Duration;
 use tickr_conductor::patch_pipeline::{
-    correlate_outcome, fetch_patch_source, fetch_row, patch_key, process_patch, redrive_unsettled,
-    OutcomeCorrelation, ParsedPatch, PatchIngress, PatchProvenance, PatchRelaySender, PatchSource,
-    PatchSourceFormat,
+    correlate_outcome, patch_key, process_patch, redrive_unsettled, OutcomeCorrelation,
+    ParsedPatch, PatchIngress, PatchProvenance, PatchRelaySender, PatchSource, PatchSourceFormat,
 };
 use tickr_proto::patch as pp;
 use tokio::sync::Mutex;
@@ -33,6 +32,14 @@ use uuid::Uuid;
 
 async fn start_pg() -> Option<(common::DbGuard, sqlx::PgPool)> {
     common::test_db().await
+}
+
+fn repository(pool: &PgPool) -> tickr_migrations::backend::WriterRepositoryBundle {
+    tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone())
+}
+
+fn read_repository(pool: &PgPool) -> tickr_migrations::backend::ReadOnlyRepositoryBundle {
+    tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone())
 }
 
 /// Build a published `Applied` outcome for the given instance/patch.
@@ -136,7 +143,7 @@ async fn ingress_opens_row_relays_and_applied_outcome_correlates() {
     let ops = sample_ops();
 
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -169,7 +176,10 @@ async fn ingress_opens_row_relays_and_applied_outcome_correlates() {
 
     // Lifecycle: relay succeeded, so the row sits at Submitted awaiting the
     // outcome (no build step — this slice's patches introduce no new tasks).
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Submitted");
     assert_eq!(row.patch_id, patch_id);
     assert_eq!(row.workflow_instance_id, wi);
@@ -177,10 +187,15 @@ async fn ingress_opens_row_relays_and_applied_outcome_correlates() {
     // The server's Applied outcome settles the row.
     let outcome = applied_outcome(wi, key, 1);
     assert_eq!(
-        correlate_outcome(&pool, &outcome).await.expect("correlate"),
+        correlate_outcome(&repository(&pool), &outcome)
+            .await
+            .expect("correlate"),
         OutcomeCorrelation::Settled
     );
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Applied");
     assert_eq!(row.applied_version, Some(1));
     assert_eq!(row.outcome.as_deref(), Some("applied"));
@@ -209,7 +224,7 @@ async fn accepted_patch_retains_verbatim_source_and_read_path_returns_it() {
     document.source = PatchSource::nickel(authored);
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -220,10 +235,13 @@ async fn accepted_patch_retains_verbatim_source_and_read_path_returns_it() {
     .expect("ingress");
 
     // Read path: the retained source comes back verbatim, tagged Nickel.
-    let source = fetch_patch_source(&pool, key)
+    let source = read_repository(&pool)
+        .patch_source(patch_id)
         .await
         .expect("read source")
-        .expect("source retained for an accepted patch");
+        .expect("source retained for an accepted patch")
+        .source
+        .expect("source fields retained together");
     assert_eq!(source.text, authored, "retained exactly what was submitted");
     assert_eq!(source.format, PatchSourceFormat::Nickel);
 
@@ -231,15 +249,23 @@ async fn accepted_patch_retains_verbatim_source_and_read_path_returns_it() {
     // on the same row — a reader joins authored source ↔ applied version.
     let outcome = applied_outcome(wi, key, 7);
     assert_eq!(
-        correlate_outcome(&pool, &outcome).await.expect("correlate"),
+        correlate_outcome(&repository(&pool), &outcome)
+            .await
+            .expect("correlate"),
         OutcomeCorrelation::Settled
     );
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.applied_version, Some(7));
-    let source = fetch_patch_source(&pool, key)
+    let source = read_repository(&pool)
+        .patch_source(patch_id)
         .await
         .expect("read source")
-        .expect("source still retained after apply");
+        .expect("source still retained after apply")
+        .source
+        .expect("source fields retained together");
     assert_eq!(source.text, authored);
 }
 
@@ -250,8 +276,9 @@ async fn unknown_patch_has_no_retained_source() {
     let Some((_container, pool)) = start_pg().await else {
         return;
     };
-    let missing = patch_key(Uuid::new_v4(), Uuid::new_v4());
-    assert!(fetch_patch_source(&pool, missing)
+    let missing = Uuid::new_v4();
+    assert!(read_repository(&pool)
+        .patch_source(missing)
         .await
         .expect("read source")
         .is_none());
@@ -270,7 +297,7 @@ async fn rejected_outcome_correlates_with_reason() {
     let key = patch_key(wi, patch_id);
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -282,10 +309,15 @@ async fn rejected_outcome_correlates_with_reason() {
 
     let outcome = rejected_outcome(wi, key, "instance not stalled (late apply)");
     assert_eq!(
-        correlate_outcome(&pool, &outcome).await.expect("correlate"),
+        correlate_outcome(&repository(&pool), &outcome)
+            .await
+            .expect("correlate"),
         OutcomeCorrelation::Settled
     );
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Rejected");
     assert_eq!(
         row.outcome.as_deref(),
@@ -309,7 +341,7 @@ async fn redelivered_patch_replays_terminal_outcome_without_re_relay() {
     let document = parsed(sample_ops());
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -318,14 +350,14 @@ async fn redelivered_patch_replays_terminal_outcome_without_re_relay() {
     )
     .await
     .expect("first ingress");
-    correlate_outcome(&pool, &applied_outcome(wi, key, 1))
+    correlate_outcome(&repository(&pool), &applied_outcome(wi, key, 1))
         .await
         .expect("settle");
     assert_eq!(sender.sent().await.len(), 1);
 
     // Redelivery: same patch_id computes the same patch_key.
     let replay = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -362,7 +394,7 @@ async fn concurrent_patch_is_rejected_and_recorded_on_its_own_row() {
 
     let first_id = Uuid::new_v4();
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         first_id,
@@ -376,7 +408,7 @@ async fn concurrent_patch_is_rejected_and_recorded_on_its_own_row() {
     // Second Patch for the same instance while the first is unsettled.
     let second_id = Uuid::new_v4();
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         second_id,
@@ -399,7 +431,7 @@ async fn concurrent_patch_is_rejected_and_recorded_on_its_own_row() {
     }
 
     // Recorded on its own row, terminally Rejected; never relayed.
-    let row = fetch_row(&pool, second_key)
+    let row = common::fetch_patch_row(&pool, second_key)
         .await
         .expect("fetch")
         .expect("the rejected request still holds a row");
@@ -412,7 +444,7 @@ async fn concurrent_patch_is_rejected_and_recorded_on_its_own_row() {
     );
 
     // The first Patch's row is unaffected.
-    let first_row = fetch_row(&pool, patch_key(wi, first_id))
+    let first_row = common::fetch_patch_row(&pool, patch_key(wi, first_id))
         .await
         .expect("fetch")
         .expect("row");
@@ -421,7 +453,7 @@ async fn concurrent_patch_is_rejected_and_recorded_on_its_own_row() {
     // A different instance is not blocked by this instance's in-flight Patch.
     let other_wi = Uuid::new_v4();
     let other_ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         other_wi,
         Uuid::new_v4(),
@@ -448,7 +480,7 @@ async fn relay_failure_leaves_validating_row_and_redrive_ships_it() {
 
     // Ingress with the relay down: still Accepted — the row is durable.
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &FailingPatchSender,
         wi,
         patch_id,
@@ -458,7 +490,10 @@ async fn relay_failure_leaves_validating_row_and_redrive_ships_it() {
     .await
     .expect("ingress");
     assert!(matches!(ingress, PatchIngress::Accepted { .. }));
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(
         row.status, "Validating",
         "a failed relay send leaves the row for the re-drive loop"
@@ -467,7 +502,7 @@ async fn relay_failure_leaves_validating_row_and_redrive_ships_it() {
     // Re-drive with the relay back up: the persisted ops rebuild the exact
     // envelope. min_age zero so the pass picks the row up immediately.
     let sender = CapturingPatchSender::new();
-    let resent = redrive_unsettled(&pool, &sender, Duration::from_secs(0))
+    let resent = redrive_unsettled(&repository(&pool), &sender, Duration::from_secs(0))
         .await
         .expect("re-drive");
     assert_eq!(resent, 1);
@@ -475,14 +510,17 @@ async fn relay_failure_leaves_validating_row_and_redrive_ships_it() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].patch_key, key.to_string());
     assert_eq!(sent[0].ops, ops);
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Submitted");
 
     // A settled row leaves the re-drive scan.
-    correlate_outcome(&pool, &applied_outcome(wi, key, 1))
+    correlate_outcome(&repository(&pool), &applied_outcome(wi, key, 1))
         .await
         .expect("settle");
-    let resent = redrive_unsettled(&pool, &sender, Duration::from_secs(0))
+    let resent = redrive_unsettled(&repository(&pool), &sender, Duration::from_secs(0))
         .await
         .expect("re-drive after settlement");
     assert_eq!(resent, 0, "a terminal row is never re-driven");
@@ -501,7 +539,7 @@ async fn late_outcome_against_settled_row_is_absorbed() {
     let key = patch_key(wi, patch_id);
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -510,7 +548,7 @@ async fn late_outcome_against_settled_row_is_absorbed() {
     )
     .await
     .expect("ingress");
-    correlate_outcome(&pool, &applied_outcome(wi, key, 1))
+    correlate_outcome(&repository(&pool), &applied_outcome(wi, key, 1))
         .await
         .expect("settle");
 
@@ -518,17 +556,24 @@ async fn late_outcome_against_settled_row_is_absorbed() {
     // rewrite the recorded terminal state.
     let late = rejected_outcome(wi, key, "late echo");
     assert_eq!(
-        correlate_outcome(&pool, &late).await.expect("correlate"),
+        correlate_outcome(&repository(&pool), &late)
+            .await
+            .expect("correlate"),
         OutcomeCorrelation::Absorbed
     );
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Applied");
     assert_eq!(row.applied_version, Some(1));
 
     // An outcome for a key this conductor never ingressed is absorbed too.
     let unknown = applied_outcome(wi, Uuid::new_v4(), 2);
     assert_eq!(
-        correlate_outcome(&pool, &unknown).await.expect("correlate"),
+        correlate_outcome(&repository(&pool), &unknown)
+            .await
+            .expect("correlate"),
         OutcomeCorrelation::Absorbed
     );
 }
@@ -536,9 +581,8 @@ async fn late_outcome_against_settled_row_is_absorbed() {
 // ---- Build-at-patch (slice 06) ----------------------------------------------
 
 use tickr_conductor::build_pipeline::BuildOutcome;
-use tickr_conductor::patch_pipeline::{
-    finalize_patch_after_build, record_patch_task_outcome, PatchBuildFinalize,
-};
+use tickr_conductor::patch_pipeline::{finalize_patch_after_build, PatchBuildFinalize};
+use tickr_migrations::patch_repository::PatchLifecycleStatus;
 use tickr_proto::workflow as wf;
 
 /// A minimal proto task definition for a never-built patched-in task, minting a
@@ -668,7 +712,7 @@ async fn build_at_patch_builds_patch_keyed_and_ships_apply_on_success() {
     let (document, t1, t2) = parsed_with_new_tasks();
 
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -686,7 +730,10 @@ async fn build_at_patch_builds_patch_keyed_and_ships_apply_on_success() {
 
     // Row at Building; per-task rows pending; NOTHING relayed at ingress —
     // build-then-apply arms no Stall for the build window.
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Building");
     let rows = patch_build_row_statuses(&pool, key).await;
     assert_eq!(rows.len(), 2);
@@ -707,17 +754,14 @@ async fn build_at_patch_builds_patch_keyed_and_ships_apply_on_success() {
     }
 
     // First build succeeds: not last-one-out — no flip, no apply envelope.
-    record_patch_task_outcome(&pool, key, t1, &BuildOutcome::Success)
-        .await
-        .expect("record t1");
     assert_eq!(
-        finalize_patch_after_build(&pool, &sender, key, &BuildOutcome::Success)
+        finalize_patch_after_build(&repository(&pool), &sender, key, t1, &BuildOutcome::Success,)
             .await
-            .expect("finalize t1"),
-        PatchBuildFinalize::AlreadyTerminalOrNotReady
+            .expect("settle t1"),
+        PatchBuildFinalize::AwaitingTasks
     );
     assert_eq!(
-        fetch_row(&pool, key)
+        common::fetch_patch_row(&pool, key)
             .await
             .expect("fetch")
             .expect("row")
@@ -729,16 +773,15 @@ async fn build_at_patch_builds_patch_keyed_and_ships_apply_on_success() {
 
     // Second build succeeds: last-one-out flips and ships the single
     // validate+apply envelope.
-    record_patch_task_outcome(&pool, key, t2, &BuildOutcome::Success)
-        .await
-        .expect("record t2");
-    assert_eq!(
-        finalize_patch_after_build(&pool, &sender, key, &BuildOutcome::Success)
+    let settlement =
+        finalize_patch_after_build(&repository(&pool), &sender, key, t2, &BuildOutcome::Success)
             .await
-            .expect("finalize t2"),
-        PatchBuildFinalize::FlippedToSubmitted
-    );
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+            .expect("settle t2");
+    assert!(matches!(settlement, PatchBuildFinalize::Submitted(_)));
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Submitted");
     let sent = sender.sent().await;
     assert_eq!(sent.len(), 1, "one envelope, shipped only on build success");
@@ -766,7 +809,7 @@ async fn insert_operation_persists_and_rides_apply_on_build_success() {
     let (document, node_id) = parsed_insert();
 
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -785,7 +828,10 @@ async fn insert_operation_persists_and_rides_apply_on_build_success() {
     // Row at Building; nothing relayed at ingress (no Stall for the build
     // window). The un-lowered operation is persisted on the row (so re-drive /
     // finalize rebuild it), not just relayed.
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "Building");
     assert_eq!(
         row.operation, document.operation,
@@ -799,15 +845,16 @@ async fn insert_operation_persists_and_rides_apply_on_build_success() {
     // Build success: the last-one-out finalizer flips to Submitted and ships
     // the single validate+apply envelope rebuilt from the row — carrying the
     // un-lowered operation.
-    record_patch_task_outcome(&pool, key, node_id, &BuildOutcome::Success)
-        .await
-        .expect("record build");
-    assert_eq!(
-        finalize_patch_after_build(&pool, &sender, key, &BuildOutcome::Success)
-            .await
-            .expect("finalize"),
-        PatchBuildFinalize::FlippedToSubmitted
-    );
+    let settlement = finalize_patch_after_build(
+        &repository(&pool),
+        &sender,
+        key,
+        node_id,
+        &BuildOutcome::Success,
+    )
+    .await
+    .expect("settle build");
+    assert!(matches!(settlement, PatchBuildFinalize::Submitted(_)));
     let sent = sender.sent().await;
     assert_eq!(sent.len(), 1);
     // The insert operation survives persistence and rides the apply leg — the
@@ -843,7 +890,7 @@ async fn build_failure_settles_build_failed_conductor_internally() {
     let (document, t1, t2) = parsed_with_new_tasks();
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -856,17 +903,17 @@ async fn build_failure_settles_build_failed_conductor_internally() {
     let failure = BuildOutcome::Failure {
         error: "nix build exited 1".to_string(),
     };
-    record_patch_task_outcome(&pool, key, t1, &failure)
-        .await
-        .expect("record failure");
     assert_eq!(
-        finalize_patch_after_build(&pool, &sender, key, &failure)
+        finalize_patch_after_build(&repository(&pool), &sender, key, t1, &failure)
             .await
-            .expect("finalize failure"),
-        PatchBuildFinalize::FlippedToBuildFailed
+            .expect("settle failure"),
+        PatchBuildFinalize::BuildFailed
     );
 
-    let row = fetch_row(&pool, key).await.expect("fetch").expect("row");
+    let row = common::fetch_patch_row(&pool, key)
+        .await
+        .expect("fetch")
+        .expect("row");
     assert_eq!(row.status, "BuildFailed");
     assert!(
         row.outcome
@@ -882,17 +929,14 @@ async fn build_failure_settles_build_failed_conductor_internally() {
 
     // The sibling build completing later cannot resurrect the patch: the
     // terminal-state guard absorbs the late success and no apply ships.
-    record_patch_task_outcome(&pool, key, t2, &BuildOutcome::Success)
-        .await
-        .expect("record late success");
     assert_eq!(
-        finalize_patch_after_build(&pool, &sender, key, &BuildOutcome::Success)
+        finalize_patch_after_build(&repository(&pool), &sender, key, t2, &BuildOutcome::Success,)
             .await
-            .expect("late finalize"),
-        PatchBuildFinalize::AlreadyTerminalOrNotReady
+            .expect("late settlement"),
+        PatchBuildFinalize::AlreadySettled(PatchLifecycleStatus::BuildFailed)
     );
     assert_eq!(
-        fetch_row(&pool, key)
+        common::fetch_patch_row(&pool, key)
             .await
             .expect("fetch")
             .expect("row")
@@ -922,7 +966,7 @@ async fn redrive_skips_building_rows_and_resends_apply_for_built_patches() {
     let (document, t1, t2) = parsed_with_new_tasks();
 
     process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -937,27 +981,38 @@ async fn redrive_skips_building_rows_and_resends_apply_for_built_patches() {
     );
 
     // Still Building: the re-drive pass must leave it alone.
-    let resent = redrive_unsettled(&pool, &sender, Duration::from_secs(0))
+    let resent = redrive_unsettled(&repository(&pool), &sender, Duration::from_secs(0))
         .await
         .expect("re-drive");
     assert_eq!(resent, 0, "Building rows are not re-driven");
     assert!(sender.sent().await.is_empty());
 
     // Builds succeed but the apply send is lost (failing sender at finalize):
-    // the row sits at Submitted for the re-drive loop.
-    for t in [t1, t2] {
-        record_patch_task_outcome(&pool, key, t, &BuildOutcome::Success)
-            .await
-            .expect("record");
-    }
+    // the committed row sits at Submitted for the re-drive loop.
     assert_eq!(
-        finalize_patch_after_build(&pool, &FailingPatchSender, key, &BuildOutcome::Success)
-            .await
-            .expect("finalize with relay down"),
-        PatchBuildFinalize::FlippedToSubmitted
+        finalize_patch_after_build(
+            &repository(&pool),
+            &FailingPatchSender,
+            key,
+            t1,
+            &BuildOutcome::Success,
+        )
+        .await
+        .expect("settle first build"),
+        PatchBuildFinalize::AwaitingTasks
     );
+    let settlement = finalize_patch_after_build(
+        &repository(&pool),
+        &FailingPatchSender,
+        key,
+        t2,
+        &BuildOutcome::Success,
+    )
+    .await
+    .expect("settle final build with relay down");
+    assert!(matches!(settlement, PatchBuildFinalize::Submitted(_)));
     assert_eq!(
-        fetch_row(&pool, key)
+        common::fetch_patch_row(&pool, key)
             .await
             .expect("fetch")
             .expect("row")
@@ -966,7 +1021,7 @@ async fn redrive_skips_building_rows_and_resends_apply_for_built_patches() {
     );
 
     // Re-drive re-sends the built patch's single validate+apply envelope.
-    let resent = redrive_unsettled(&pool, &sender, Duration::from_secs(0))
+    let resent = redrive_unsettled(&repository(&pool), &sender, Duration::from_secs(0))
         .await
         .expect("re-drive");
     assert_eq!(resent, 1);
@@ -992,7 +1047,7 @@ async fn retried_self_patch_completion_dedups_to_one_row_and_one_relay() {
     let document = parsed(sample_ops());
 
     let first = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         node_id,
@@ -1006,7 +1061,7 @@ async fn retried_self_patch_completion_dedups_to_one_row_and_one_relay() {
 
     // The retried/redelivered completion forks the same document again.
     let second = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         node_id,
@@ -1035,11 +1090,11 @@ async fn retried_self_patch_completion_dedups_to_one_row_and_one_relay() {
 
     // Settled Applied (the server applied once); a third redelivery replays
     // the terminal outcome and still does not re-relay.
-    correlate_outcome(&pool, &applied_outcome(wi, key, 1))
+    correlate_outcome(&repository(&pool), &applied_outcome(wi, key, 1))
         .await
         .expect("settle");
     let third = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         node_id,

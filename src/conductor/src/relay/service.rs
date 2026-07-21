@@ -9,7 +9,6 @@ use async_stream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use prost::Message;
-use sqlx::PgPool;
 use std::sync::Arc;
 use tickr_proto::codec::compaction::decode_envelope;
 use tickr_proto::coord::{
@@ -455,7 +454,7 @@ pub async fn publish_dispatch_and_deliver(
 pub async fn drain_task_events(
     consumer: jetstream::consumer::PullConsumer,
     relay_tx: mpsc::Sender<ConductorRelayMessage>,
-    pg_pool: Arc<PgPool>,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     nats: async_nats::Client,
     token: CancellationToken,
 ) {
@@ -529,7 +528,7 @@ pub async fn drain_task_events(
         // failure is surfaced loudly and the un-enriched event forwarded, so
         // task completion is never dropped on a routing-var bug.
         match crate::routing_enrichment::enrich_completed_task_event(
-            &pg_pool,
+            definition_repository.as_ref(),
             &nats,
             &mut task_event,
         )
@@ -630,7 +629,14 @@ pub async fn drain_task_events(
                         // here leaves the Stall to the server's TTL backstop:
                         // loud, and the reshape is lost-but-logged.
                         if let Some(parsed) = pending_self_patch.take() {
-                            fork_self_patch(&pg_pool, &nats, event_wfi, event_tid, parsed).await;
+                            fork_self_patch(
+                                definition_repository.as_ref(),
+                                &nats,
+                                event_wfi,
+                                event_tid,
+                                parsed,
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -657,7 +663,7 @@ pub async fn drain_task_events(
 /// build queue). Every outcome is logged; nothing here fails the completion,
 /// which already forwarded and acked.
 async fn fork_self_patch(
-    pg_pool: &PgPool,
+    repositories: &tickr_migrations::backend::WriterRepositoryBundle,
     nats: &async_nats::Client,
     workflow_instance_id: Uuid,
     task_id: Uuid,
@@ -665,7 +671,7 @@ async fn fork_self_patch(
 ) {
     use crate::patch_pipeline::{process_patch, DefaultPatchRelaySender, PatchIngress};
     match process_patch(
-        pg_pool,
+        repositories,
         &DefaultPatchRelaySender,
         workflow_instance_id,
         // The emitting node's definition id is the author key — retried
@@ -907,7 +913,10 @@ pub async fn drain_liveness_markers(
 /// Self-healing wrapper around the relay stream. Retries the connect+stream
 /// loop on any error so that startup ordering against the coordinator gRPC server
 /// (and transient mid-flight drops) doesn't leave the conductor wedged.
-pub async fn run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPool>) -> Result<()> {
+pub async fn run_streaming(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+) -> Result<()> {
     use std::time::{Duration, Instant};
 
     const INITIAL_BACKOFF_MS: u64 = 250;
@@ -922,7 +931,7 @@ pub async fn run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
         }
 
         let started = Instant::now();
-        match try_run_streaming(shutdown_token.clone(), Arc::clone(&pg_pool)).await {
+        match try_run_streaming(shutdown_token.clone(), Arc::clone(&definition_repository)).await {
             Ok(()) => {
                 if shutdown_token.is_cancelled() {
                     return Ok(());
@@ -953,7 +962,10 @@ pub async fn run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
 
 /// One attempt at the bidirectional relay stream. Returns when the stream ends
 /// or a transport error occurs. Caller (`run_streaming`) decides whether to retry.
-async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPool>) -> Result<()> {
+async fn try_run_streaming(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+) -> Result<()> {
     // Connect to NATS
     let nats = async_nats::connect(tickr_proto::config::nats_url()).await?;
 
@@ -991,7 +1003,7 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
     let consumer = task_event_consumer(&nats).await?;
 
     let tx_for_nats = tx_for_updates.clone();
-    let pg_for_forwarder = Arc::clone(&pg_pool);
+    let definitions_for_forwarder = Arc::clone(&definition_repository);
     let nats_for_forwarder = nats.clone();
 
     // Per-cycle token: cancelled when this attempt ends so the forwarder task
@@ -1003,7 +1015,7 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
     let _forwarder_handle = tokio::spawn(drain_task_events(
         consumer,
         tx_for_nats,
-        pg_for_forwarder,
+        definitions_for_forwarder,
         nats_for_forwarder,
         forwarder_token,
     ));
@@ -1073,16 +1085,16 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
 
                                     // 1a. For trigger-originated tasks, reconcile the (signal_id
                                     //     → run_id) linkage and rehydrate any missing NATS
-                                    //     capture keys from Postgres BEFORE forwarding to the
-                                    //     task queue. This guarantees the executor sees the
+                                    //     capture keys from the SQL repository BEFORE forwarding
+                                    //     to the task queue. This guarantees the executor sees the
                                     //     captures by the time it pulls the task — a conductor
-                                    //     crash between HTTP-receive and event arrival can leave
-                                    //     the cache empty even though Postgres has the row.
+                                    //     crash after ingress can leave the NATS cache empty even
+                                    //     though the durable Event variables remain available.
                                     if let Some(signal_id) = task_queue_item.originating_signal_id.as_deref()
                                         .and_then(|id| Uuid::parse_str(id).ok()) {
                                         if let Ok(wi_id) = Uuid::parse_str(&task_queue_item.workflow_instance_id) {
                                         if let Err(e) = crate::instance_creation_linkage::link_and_rehydrate(
-                                            &pg_pool,
+                                            definition_repository.as_ref(),
                                             &nats_clone,
                                             signal_id,
                                             wi_id,
@@ -1113,7 +1125,7 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
                                         let workflow_id = Uuid::parse_str(&task_queue_item.workflow_id);
                                         if let (Ok(run_id), Ok(workflow_id)) = (run_id, workflow_id) {
                                         if let Err(e) = crate::ctx_graph_mirror::mirror_ctx_graph(
-                                            &pg_pool,
+                                            definition_repository.as_ref(),
                                             &nats_clone,
                                             run_id,
                                             workflow_id,
@@ -1171,8 +1183,8 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
                                 // durably in the per-tenant NATS work queue and ACK'd
                                 // immediately — ACK means "durably staged", not "archived",
                                 // so live-state retirement is not gated on object-storage or
-                                // Postgres latency. The compaction drain worker (any
-                                // conductor instance) performs the archival off the queue.
+                                // SQL repository latency. The Compaction drain worker performs
+                                // the archival from the staged queue.
                                 let ack_tx = tx_for_updates.clone();
                                 let nats_for_stage = nats_clone.clone();
                                 tokio::spawn(async move {
@@ -1334,36 +1346,33 @@ async fn try_run_streaming(shutdown_token: CancellationToken, pg_pool: Arc<PgPoo
                                 // re-drive loop can echo outcomes).
                                 match pp::PatchOutcome::decode(&msg.payload[..]) {
                                     Ok(outcome) => {
-                                        // On a successful apply the server relays the
-                                        // reshaped ctx graph; re-mirror `tickr_graph`
-                                        // so a self-patching task re-reads the patched
-                                        // graph (new structures, fresh identity codes)
-                                        // straight from NATS. Best-effort: a failure
-                                        // leaves the mirror at its prior value.
-                                        let applied = matches!(
-                                            outcome.outcome.as_ref().and_then(|o| o.kind.as_ref()),
-                                            Some(pp::patch_outcome_kind::Kind::Applied(_))
-                                        );
-                                        if let (true, Some(graph_json), Ok(run_id)) = (
-                                            applied,
-                                            &outcome.reshaped_graph_json,
-                                            uuid::Uuid::parse_str(&outcome.workflow_instance_id),
-                                        ) {
-                                            if let Err(e) = crate::ctx_graph_mirror::mirror_reshaped_ctx_graph(
-                                                &nats_clone,
-                                                run_id,
-                                                graph_json,
-                                            )
-                                            .await
-                                            {
-                                                eprintln!(
-                                                    "ctx graph re-mirror on patch apply failed for run {}: {} (mirror stays at prior value)",
-                                                    outcome.workflow_instance_id, e
-                                                );
-                                            }
-                                        }
-                                        match crate::patch_pipeline::correlate_outcome(&pg_pool, &outcome).await {
+                                        match crate::patch_pipeline::correlate_outcome(&definition_repository, &outcome).await {
                                             Ok(crate::patch_pipeline::OutcomeCorrelation::Settled) => {
+                                                // Only the winning terminal correlation may
+                                                // mirror the reshaped graph. Duplicate or late
+                                                // outcomes are storage and ctx side-effect-free.
+                                                let applied = matches!(
+                                                    outcome.outcome.as_ref().and_then(|o| o.kind.as_ref()),
+                                                    Some(pp::patch_outcome_kind::Kind::Applied(_))
+                                                );
+                                                if let (true, Some(graph_json), Ok(run_id)) = (
+                                                    applied,
+                                                    &outcome.reshaped_graph_json,
+                                                    uuid::Uuid::parse_str(&outcome.workflow_instance_id),
+                                                ) {
+                                                    if let Err(e) = crate::ctx_graph_mirror::mirror_reshaped_ctx_graph(
+                                                        &nats_clone,
+                                                        run_id,
+                                                        graph_json,
+                                                    )
+                                                    .await
+                                                    {
+                                                        eprintln!(
+                                                            "ctx graph re-mirror on patch apply failed for run {}: {} (mirror stays at prior value)",
+                                                            outcome.workflow_instance_id, e
+                                                        );
+                                                    }
+                                                }
                                                 println!(
                                                     "PatchOutcome settled patch {} on instance {}",
                                                     outcome.patch_key, outcome.workflow_instance_id

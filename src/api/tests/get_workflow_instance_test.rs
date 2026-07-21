@@ -1,20 +1,8 @@
-//! Integration test for the API component's instance-snapshot lookup path:
-//!   1. `archive_queries::get_workflow_instance` returns `Some(_)` when a
-//!      row exists in the conductor's `workflow_instances` table.
-//!   2. `archive_queries::get_workflow_instance` returns `None` when the row
-//!      is absent (i.e. the instance is still live, not yet compacted).
-//!   3. The archived JSONB rehydrates through the **archive-grade projection**
-//!      with the recorded history intact and no non-tenant data on the wire.
-//!   4. `coordinator_client::get_workflow_instance` decodes a live snapshot from
-//!      a fake coordinator Axum router run in-process.
-//!   5. `coordinator_client::get_workflow_instance` surfaces a 404 from the fake
-//!      coordinator as `CoordinatorClientError::NotFound`.
-//!   6. `coordinator_client::get_workflow_instance` surfaces a timeout against a
-//!      slow fake coordinator as `CoordinatorClientError::Timeout`, and a coordinator
-//!      503 as `Server { status: 503 }` (the handler's "live store
-//!      unreachable" branch).
+//! Integration tests for the API component's selected archive-detail read and
+//! live coordinator fallback. Archive assertions cover present/absent terminal
+//! rows, projection reconstruction, history, and data-plane field isolation.
+//! Coordinator assertions cover success, 404, 503, and timeout behavior.
 //!
-//! Archive rows are captured from the compaction drain's output (see `common`).
 //! PostgreSQL tests require Docker; fake coordinator tests run in-process.
 
 #![cfg(not(madsim))]
@@ -25,8 +13,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries;
 use tickr_api::http::coordinator_client::{CoordinatorClient, CoordinatorClientError};
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use tickr_proto::instance as ip;
 use uuid::Uuid;
 
@@ -56,8 +44,12 @@ async fn archive_query_returns_some_when_row_exists() -> Result<(), Box<dyn std:
     )
     .await;
 
-    let found = archive_queries::get_workflow_instance(&pool, id).await?;
-    let found = found.expect("row must be returned");
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let found = repository
+        .archived_workflow_detail(id)
+        .await?
+        .expect("row must be returned")
+        .instance;
     assert_eq!(found.id, id.to_string(), "round-trip preserves id");
     assert_eq!(
         found.state, "Completed",
@@ -84,7 +76,8 @@ async fn archive_query_returns_none_when_row_absent() -> Result<(), Box<dyn std:
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
 
     let missing_id = Uuid::new_v4();
-    let result = archive_queries::get_workflow_instance(&pool, missing_id).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let result = repository.archived_workflow_detail(missing_id).await?;
     assert!(result.is_none(), "no row inserted, query must return None");
     Ok(())
 }
@@ -145,9 +138,12 @@ async fn archived_jsonb_rehydrates_through_projection_with_history_and_no_intern
     // into the instance-detail render, which the handler stamps `storage:
     // archived` to serve. The union embeds the task-instance records, so the
     // task list rehydrates from the one stored shape — no separate task blob.
-    let archived = archive_queries::get_workflow_instance(&pool, id)
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let archived = repository
+        .archived_workflow_detail(id)
         .await?
-        .expect("archived row");
+        .expect("archived row")
+        .instance;
     let snapshot = tickr_proto::codec::archive::snapshot_from_archived(archived, "archived");
     let json = serde_json::to_value(&snapshot)?;
     assert_eq!(json["storage"], "archived");

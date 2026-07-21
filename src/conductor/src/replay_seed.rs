@@ -75,9 +75,9 @@ pub enum ReplayReject {
     /// timed-out run) so the default resume-from is empty — the caller must
     /// pass `resume_from` explicitly.
     NoFailedNodes,
-    /// The source run's archived blob is absent — nothing to replay. A full
-    /// `just fresh` drops `postgres-data`, wiping the archive; a live registry reset
-    /// leaves it intact, so a run stays replayable across that.
+    /// The source run's archived blob is absent — nothing to replay. Resetting
+    /// the selected Data-plane store removes the archive; resetting only live
+    /// registry state leaves it intact.
     VersionUnresolvable,
 }
 

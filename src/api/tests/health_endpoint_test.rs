@@ -4,10 +4,11 @@
 //! check — no cached health table. Tests drive a component into a known state and
 //! assert the *reported row*, never a private field:
 //!
-//! - deterministic, no-Docker: API-self is always healthy; a closed/unreachable
-//!   Postgres pool reports `unhealthy`; an unreachable NATS client reports the KV
-//!   row `unhealthy`; the serialized shape carries `checked_at` + lowercase status.
-//! - Docker-gated (testcontainers, skipped when unavailable): a reachable Postgres
+//! - deterministic, no-Docker: API-self is always healthy; an unreachable
+//!   selected repository reports `unhealthy` without leaking connection details;
+//!   an unreachable NATS client reports the KV row `unhealthy`; the serialized
+//!   shape carries `checked_at` + lowercase status.
+//! - Docker-gated (testcontainers, skipped when unavailable): reachable Postgres
 //!   and NATS report `healthy`, and the wired `/api/health` route serves the typed
 //!   report and reflects a mid-flight state change (proving no cached table) while
 //!   the top-level `/health` readiness probe stays `{"status":"ok"}`.
@@ -21,6 +22,7 @@ use std::time::Duration;
 use async_nats::jetstream;
 use futures::StreamExt as _;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::sqlite::SqlitePoolOptions;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -28,9 +30,12 @@ use testcontainers_modules::testcontainers::ImageExt;
 use tickr_api::commands::client::send_command;
 use tickr_api::http::coordinator_client::CoordinatorClient;
 use tickr_api::http::health::{
-    api_self, build_health_report, check_conductor, check_control_plane, check_executors,
-    check_nats_kv, check_postgres, ComponentStatus,
+    api_self, build_health_report, check_conductor, check_control_plane, check_data_plane_sql,
+    check_executors, check_nats_kv, ComponentStatus, DataPlaneSqlImplementation,
 };
+use tickr_migrations::backend::{ReadOnlyRepositoryBundle, RepositoryFactory};
+use tickr_migrations::{apply_sqlite, apply_target, sqlite_writer_options, MigrationTarget};
+use tickr_proto::config::DataPlaneSql;
 use tickr_proto::coord::{
     component_liveness_key, ComponentLivenessValue, COMPONENT_LIVENESS_BUCKET,
 };
@@ -49,18 +54,30 @@ async fn api_self_row_is_always_healthy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_down_row_is_unhealthy() {
-    // Lazy pool at a dead port: no connection is made until the query runs, at
-    // which point `SELECT 1` fails within the acquire timeout -> unhealthy.
+async fn selected_postgres_down_row_is_unhealthy_without_connection_detail() {
+    let secret = "top-secret";
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(2))
-        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+        .connect_lazy(&format!(
+            "postgres://operator:{secret}@127.0.0.1:1/postgres"
+        ))
         .expect("lazy pool builds");
-    let row = check_postgres(&pool).await;
+    let row = check_data_plane_sql(&ReadOnlyRepositoryBundle::from_postgres_pool(pool)).await;
+    assert_eq!(row.implementation, DataPlaneSqlImplementation::Postgres);
     assert_eq!(
         row.status,
         ComponentStatus::Unhealthy,
-        "unreachable Postgres must report unhealthy, got detail: {}",
+        "unreachable repository must report unhealthy, got detail: {}",
+        row.detail
+    );
+    assert!(
+        row.detail.starts_with("repository health check failed: "),
+        "failure uses shared classification: {}",
+        row.detail
+    );
+    assert!(
+        !row.detail.contains(secret) && !row.detail.contains("postgres://"),
+        "failure detail must redact connection material: {}",
         row.detail
     );
 }
@@ -203,7 +220,10 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
     // unhealthy — still present with a stable shape, which is all this asserts.
     let coordinator = CoordinatorClient::new("http://127.0.0.1:1".to_string());
 
-    let report = build_health_report(&pool, &client, &coordinator, Duration::from_secs(1)).await;
+    let repositories =
+        tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
+    let report =
+        build_health_report(&repositories, &client, &coordinator, Duration::from_secs(1)).await;
     let json = serde_json::to_value(&report).expect("serializes");
 
     assert!(
@@ -212,7 +232,7 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
     );
     for row in [
         "api",
-        "postgres",
+        "data_plane_sql",
         "nats_kv",
         "executors",
         "conductor",
@@ -238,6 +258,11 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
             "row {row} carries a detection_window string"
         );
     }
+    assert_eq!(json["data_plane_sql"]["implementation"], "postgres");
+    assert!(
+        json.get("postgres").is_none(),
+        "legacy Postgres-specific row must be absent"
+    );
     assert_eq!(
         json["api"]["status"], "healthy",
         "API-self is always healthy"
@@ -267,6 +292,7 @@ async fn start_postgres() -> Option<(
         .connect(&url)
         .await
         .ok()?;
+    apply_target(MigrationTarget::Conductor, &pool).await.ok()?;
     Some((container, pool))
 }
 
@@ -296,11 +322,66 @@ async fn start_nats() -> Option<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_reachable_row_is_healthy() {
+async fn selected_postgres_reachable_row_is_healthy() {
     let Some((_pg, pool)) = start_postgres().await else {
         return;
     };
-    assert_eq!(check_postgres(&pool).await.status, ComponentStatus::Healthy);
+    let repositories = ReadOnlyRepositoryBundle::from_postgres_pool(pool);
+    let row = check_data_plane_sql(&repositories).await;
+    assert_eq!(row.implementation, DataPlaneSqlImplementation::Postgres);
+    assert_eq!(row.status, ComponentStatus::Healthy);
+}
+
+async fn migrated_sqlite_repository() -> (tempfile::TempDir, String, ReadOnlyRepositoryBundle) {
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let path = directory.path().join("health.db");
+    let url = format!("sqlite://{}", path.display());
+    let options = sqlite_writer_options(&url, true).expect("SQLite writer options");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open SQLite migration role");
+    apply_sqlite(MigrationTarget::Conductor, &pool)
+        .await
+        .expect("migrate SQLite");
+    pool.close().await;
+    let repositories = RepositoryFactory::new(DataPlaneSql::Sqlite { url: url.clone() })
+        .open_read_only()
+        .await
+        .expect("open selected SQLite read-only role");
+    (directory, url, repositories)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_sqlite_reports_implementation_and_schema_health() {
+    let (_directory, url, repositories) = migrated_sqlite_repository().await;
+    let healthy = check_data_plane_sql(&repositories).await;
+    assert_eq!(healthy.implementation, DataPlaneSqlImplementation::Sqlite);
+    assert_eq!(healthy.status, ComponentStatus::Healthy);
+
+    let options = sqlite_writer_options(&url, false).expect("SQLite writer options");
+    let writer = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open SQLite writer");
+    sqlx::query("DROP TABLE events")
+        .execute(&writer)
+        .await
+        .expect("make logical schema incompatible");
+    writer.close().await;
+
+    let unhealthy = check_data_plane_sql(&repositories).await;
+    assert_eq!(unhealthy.status, ComponentStatus::Unhealthy);
+    assert_eq!(
+        unhealthy.detail,
+        "repository health check failed: incompatible schema"
+    );
+    assert!(
+        !unhealthy.detail.contains(&url),
+        "failure detail must not expose the SQLite URL or path"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -334,7 +415,16 @@ async fn spawn_api(nats: async_nats::Client, pool: Arc<sqlx::PgPool>) -> String 
         minio,
         nats.clone(),
     ));
-    let state = tickr_api::http::routes::build_app_state(Arc::new(nats), pool, coordinator, logs);
+    let state = tickr_api::http::routes::build_app_state(
+        Arc::new(nats),
+        Arc::new(
+            tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(
+                pool.as_ref().clone(),
+            ),
+        ),
+        coordinator,
+        logs,
+    );
     let app = tickr_api::http::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -368,8 +458,9 @@ async fn endpoint_serves_typed_report_fresh_per_request() {
         .await
         .expect("json");
     assert_eq!(first["api"]["status"], "healthy");
-    assert_eq!(first["postgres"]["status"], "healthy");
-    assert_eq!(first["nats_kv"]["status"], "healthy");
+    assert_eq!(first["data_plane_sql"]["implementation"], "postgres");
+    assert_eq!(first["data_plane_sql"]["status"], "healthy");
+    assert!(first.get("postgres").is_none());
     // No executor keys are seeded here, so the pool row is zero-fleet unhealthy —
     // present in the typed report with its detail, proving the wired field exists.
     assert_eq!(first["executors"]["status"], "unhealthy");
@@ -389,11 +480,14 @@ async fn endpoint_serves_typed_report_fresh_per_request() {
         .await
         .expect("json");
     assert_eq!(second["api"]["status"], first["api"]["status"]);
-    assert_eq!(second["postgres"]["status"], first["postgres"]["status"]);
+    assert_eq!(
+        second["data_plane_sql"]["status"],
+        first["data_plane_sql"]["status"]
+    );
     assert_eq!(second["nats_kv"]["status"], first["nats_kv"]["status"]);
 
     // Bracket a state change: close the pool the handler holds, then re-request.
-    // No cached table => the Postgres row now reflects the change.
+    // No cached table => the selected SQL row now reflects the change.
     pool_handle.close().await;
     let after: serde_json::Value = reqwest::get(format!("{}/api/health", base))
         .await
@@ -402,7 +496,7 @@ async fn endpoint_serves_typed_report_fresh_per_request() {
         .await
         .expect("json");
     assert_eq!(
-        after["postgres"]["status"], "unhealthy",
+        after["data_plane_sql"]["status"], "unhealthy",
         "a state change between requests is reflected — no cached health table"
     );
 
@@ -636,9 +730,15 @@ async fn spawn_command_consumer(nats: &async_nats::Client) -> CancellationToken 
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
         .expect("lazy pool builds");
+    let pool = Arc::new(pool);
+    let definition_repository = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        ),
+    );
     let cancel = CancellationToken::new();
     let state = tickr_conductor::api_commands_consumer::ApiCommandsState {
-        pg_pool: Arc::new(pool),
+        definition_repository,
         nats: nats.clone(),
         relay_sender: Arc::new(tickr_conductor::wakeup_translator::DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),

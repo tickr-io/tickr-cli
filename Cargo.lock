@@ -1967,6 +1967,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -4112,6 +4113,7 @@ dependencies = [
  "anyhow",
  "clap",
  "sqlx",
+ "tempfile",
  "testcontainers-modules",
  "tickr_api",
  "tickr_conductor",
@@ -4254,10 +4256,15 @@ name = "tickr_migrations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "serde_json",
  "sqlx",
+ "tempfile",
  "testcontainers-modules",
  "thiserror 1.0.69",
+ "tickr_proto",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

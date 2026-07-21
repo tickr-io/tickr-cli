@@ -15,9 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
 use super::coordinator_client::CoordinatorClient;
@@ -39,14 +38,14 @@ fn is_future_armed(state: &str) -> bool {
     matches!(state, "PendingSchedule" | "Scheduled")
 }
 
-/// Is `a` at least as recent as `b`? Recency key is `scheduled_at`; a present
-/// timestamp beats an absent one, and ties keep the incumbent.
+/// Is `a` at least as recent as `b`? A present `scheduled_at` beats an absent
+/// one; equal timestamps use the instance identity as a stable tie-break.
 fn at_least_as_recent(a: &RunCandidate, b: &RunCandidate) -> bool {
     match (a.scheduled_at, b.scheduled_at) {
-        (Some(x), Some(y)) => x >= y,
+        (Some(x), Some(y)) => x > y || (x == y && a.instance_id >= b.instance_id),
         (Some(_), None) => true,
         (None, Some(_)) => false,
-        (None, None) => false,
+        (None, None) => a.instance_id >= b.instance_id,
     }
 }
 
@@ -115,29 +114,19 @@ pub fn resolve(
         .collect()
 }
 
-/// Read the latest terminal instance per workflow from the conductor's PG
-/// archive. The archive holds only terminal rows (`Completed`/`Failed`) by
-/// construction, so "latest terminal per workflow" is just the most-recent row
-/// per `workflow_id`. Columns (`workflow_id`, `state`, `scheduled_at`,
-/// `archived_at`) are indexed — no JSONB extraction.
-async fn fetch_archive_candidates(pool: &PgPool) -> Result<Vec<RunCandidate>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT DISTINCT ON (workflow_id) workflow_id, id, state, scheduled_at
-        FROM workflow_instances
-        ORDER BY workflow_id, scheduled_at DESC NULLS LAST, archived_at DESC
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
+/// Read the selected archive repository's deterministic terminal candidates.
+async fn fetch_archive_candidates(
+    repositories: &ReadOnlyRepositoryBundle,
+) -> Result<Vec<RunCandidate>, tickr_migrations::backend::RepositoryError> {
+    Ok(repositories
+        .latest_archived_runs()
+        .await?
         .into_iter()
         .map(|row| RunCandidate {
-            workflow_id: row.get("workflow_id"),
-            instance_id: row.get::<Uuid, _>("id").to_string(),
-            state: row.get("state"),
-            scheduled_at: row.get("scheduled_at"),
+            workflow_id: row.workflow_id,
+            instance_id: row.instance_id.to_string(),
+            state: row.state,
+            scheduled_at: row.scheduled_at,
         })
         .collect())
 }
@@ -158,20 +147,20 @@ fn candidate_from_live(inst: WorkflowInstanceResponse) -> Option<RunCandidate> {
 }
 
 /// Resolve the latest fired-instance *candidate* for a batch of workflows in one
-/// PG query plus one live cluster subquery. The live read is best-effort: if the
-/// coordinator is unreachable the resolver degrades to archive-only (terminal runs
-/// still show; in-flight runs are momentarily invisible) rather than failing.
-/// Callers that need both the latest state and its timestamp read them off the
-/// one returned candidate.
+/// selected-repository read plus one live cluster subquery. The live read is
+/// best-effort: if the coordinator is unreachable the resolver degrades to
+/// archive-only rather than failing.
 pub async fn resolve_latest_runs(
-    pool: &PgPool,
+    repositories: &ReadOnlyRepositoryBundle,
     coordinator: &CoordinatorClient,
     workflow_ids: &[Uuid],
 ) -> HashMap<Uuid, Option<RunCandidate>> {
-    let archive = fetch_archive_candidates(pool).await.unwrap_or_else(|e| {
-        eprintln!("latest_run_resolver: archive query failed: {e}");
-        Vec::new()
-    });
+    let archive = fetch_archive_candidates(repositories)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("latest_run_resolver: archive query failed: {e}");
+            Vec::new()
+        });
 
     let live = match coordinator.list_all_workflow_instances().await {
         Ok(instances) => instances
@@ -190,11 +179,11 @@ pub async fn resolve_latest_runs(
 /// State-only view of [`resolve_latest_runs`] for the workflows-list handler,
 /// which needs the latest run state but not its timestamp.
 pub async fn resolve_latest_run_states(
-    pool: &PgPool,
+    repositories: &ReadOnlyRepositoryBundle,
     coordinator: &CoordinatorClient,
     workflow_ids: &[Uuid],
 ) -> HashMap<Uuid, Option<String>> {
-    resolve_latest_runs(pool, coordinator, workflow_ids)
+    resolve_latest_runs(repositories, coordinator, workflow_ids)
         .await
         .into_iter()
         .map(|(id, c)| (id, c.map(|c| c.state)))
@@ -252,6 +241,30 @@ mod tests {
             vec![cand(w, "old", "InProgress", Some(20))],
         );
         assert_eq!(out[&w], Some("Completed".to_string()));
+    }
+
+    #[test]
+    fn equal_time_candidates_use_stable_instance_id_tie_break() {
+        let workflow_id = Uuid::new_v4();
+        let out = resolve_candidates(
+            &[workflow_id],
+            vec![cand(
+                workflow_id,
+                "00000000-0000-0000-0000-000000000001",
+                "Completed",
+                Some(20),
+            )],
+            vec![cand(
+                workflow_id,
+                "00000000-0000-0000-0000-000000000002",
+                "InProgress",
+                Some(20),
+            )],
+        );
+        assert_eq!(
+            out[&workflow_id].as_ref().unwrap().instance_id,
+            "00000000-0000-0000-0000-000000000002"
+        );
     }
 
     #[test]

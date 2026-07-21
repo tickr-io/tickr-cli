@@ -12,7 +12,7 @@
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries::default_version;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
 async fn insert_version(
@@ -53,6 +53,7 @@ async fn resolves_default_version_per_rule() -> Result<(), Box<dyn std::error::E
         .connect(&url)
         .await?;
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
 
     // wf_a: a newer `Submitted` beats an older `Ready`, and a still-newer
     // `Building` does not win (it is not live). Default = the Submitted v2.0.0.
@@ -78,24 +79,23 @@ async fn resolves_default_version_per_rule() -> Result<(), Box<dyn std::error::E
     let wf_unknown = Uuid::new_v4();
 
     assert_eq!(
-        default_version(&pool, wf_a).await?,
+        repository.default_definition_version(wf_a).await?,
         Some((2, "Submitted".to_string())),
         "latest live (Submitted) beats older Ready and newer Building"
     );
     assert_eq!(
-        default_version(&pool, wf_b).await?,
+        repository.default_definition_version(wf_b).await?,
         Some((2, "BuildFailed".to_string())),
-        "no live version → fall back to latest by inserted_at"
+        "no live version falls back to the highest explicit version"
     );
     assert_eq!(
-        default_version(&pool, wf_c).await?,
+        repository.default_definition_version(wf_c).await?,
         Some((4, "Ready".to_string())),
-        "latest live wins over a later-inserted non-live version"
+        "highest live version wins regardless of insertion order"
     );
     assert_eq!(
-        default_version(&pool, wf_unknown).await?,
-        None,
-        "unknown workflow id resolves to None"
+        repository.default_definition_version(wf_unknown).await?,
+        None
     );
     Ok(())
 }

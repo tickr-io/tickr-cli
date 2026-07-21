@@ -6,8 +6,8 @@
 //! the transport edge (request body shape, idempotency-key sourcing, relay-
 //! forward strategy) but share every step in between: workflow-definition
 //! lookup, inputs-vs-declared-captures check, signal_id minting, idempotency
-//! cache consultation, JSONPath captures extraction, Postgres write, NATS
-//! KV write, wire `Signal` construction.
+//! cache consultation, JSONPath captures extraction, repository write, NATS
+//! KV write, and wire `Signal` construction.
 //!
 //! This module is the shared middle layer. Callers build a `TriggerRequest`
 //! from their transport, invoke `process_trigger`, and adapt the resulting
@@ -21,8 +21,8 @@ use anyhow::{anyhow, Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::PgPool;
 use tickr_ctx::envelope::SignalSource;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::signal as sp;
 use tickr_proto::workflow as wf;
 use uuid::Uuid;
@@ -71,7 +71,7 @@ pub struct TriggerRequest {
 }
 
 /// Outcome of `process_trigger`. The pipeline applies all side effects
-/// (Postgres + NATS writes, cache insertion) only on `Fresh`; on `Dedup`
+/// (SQL repository + NATS writes, cache insertion) only on `Fresh`; on `Dedup`
 /// and `Conflict` it short-circuits before any persistence mutation. The
 /// caller emits the wire `Signal` (when present) over its own relay path.
 pub enum TriggerOutcome {
@@ -119,17 +119,17 @@ pub enum TriggerError {
     #[error("idempotency cache: {0}")]
     Idempotency(#[source] anyhow::Error),
     #[error("captures archive: {0}")]
-    PostgresWrite(#[source] anyhow::Error),
+    RepositoryWrite(#[source] anyhow::Error),
     #[error("captures cache: {0}")]
     NatsWrite(#[source] anyhow::Error),
 }
 
 /// Run the shared trigger pipeline. On `TriggerOutcome::Fresh`, captures
-/// have been written to Postgres and NATS, the idempotency cache has been
+/// have been written to the SQL repository and NATS, the idempotency cache has been
 /// populated (when a key was supplied), and the `Signal` is ready for the
 /// caller to forward over its preferred relay path.
 pub async fn process_trigger(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     req: TriggerRequest,
 ) -> Result<TriggerOutcome, TriggerError> {
@@ -142,7 +142,7 @@ pub async fn process_trigger(
     //    re-registered with changed capture declarations extracts under the
     //    new declarations on the very next trigger. A missing row is a 404 /
     //    structured error; an I/O failure is a 5xx.
-    let workflow = load_live_workflow_definition(pool, req.workflow_id)
+    let workflow = load_live_workflow_definition(repositories, req.workflow_id)
         .await
         .map_err(TriggerError::WorkflowLookup)?
         .ok_or(TriggerError::WorkflowNotFound {
@@ -162,7 +162,7 @@ pub async fn process_trigger(
     }
 
     // 3. Mint signal_id up front so it threads through every persistence
-    //    site (Postgres row, NATS keys, envelope lineage, wire signal).
+    //    site (SQL archive, NATS keys, envelope lineage, wire signal).
     let signal_id = Uuid::new_v4();
 
     // 4. Idempotency cache. Only consulted when a producer-supplied key
@@ -213,8 +213,8 @@ pub async fn process_trigger(
             },
         )?;
 
-    // 6. Postgres write first — durable source of truth. NATS comes after
-    //    so a later read-side miss can rehydrate from Postgres.
+    // 6. Repository write first — durable source of truth. NATS comes after
+    //    so a later read-side miss can rehydrate from the SQL archive.
     let row_envelopes: Vec<signal_captures::NamedEnvelope> = extracted
         .iter()
         .map(|e| signal_captures::NamedEnvelope {
@@ -223,14 +223,14 @@ pub async fn process_trigger(
         })
         .collect();
     signal_captures::insert(
-        pool,
+        repositories,
         signal_id,
         req.workflow_id,
         Some(workflow_version),
         &row_envelopes,
     )
     .await
-    .map_err(TriggerError::PostgresWrite)?;
+    .map_err(TriggerError::RepositoryWrite)?;
 
     // 6b. Back-fill the (signal_id → run_id) linkage for a future-dated
     //     trigger so the signals read-path can surface the scheduled
@@ -245,7 +245,7 @@ pub async fn process_trigger(
     //     `mark_materialized` is idempotent under its `IS NULL` guard).
     if let Some(scheduled_at) = req.scheduled_at {
         if let Err(e) = crate::instance_creation_linkage::backfill_pending_schedule_linkage(
-            pool,
+            repositories,
             signal_id,
             req.workflow_id,
             scheduled_at,
@@ -320,29 +320,18 @@ pub async fn process_trigger(
 /// external-signal path — reach this through `process_trigger`, so a single
 /// resolver corrects both.
 pub async fn load_live_workflow_definition(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     workflow_id: Uuid,
 ) -> Result<Option<wf::WorkflowDefinition>> {
-    let row: Option<(Value,)> = sqlx::query_as(
-        "SELECT definition FROM workflows \
-         WHERE id = $1 AND status IN ('Ready', 'Submitted') \
-         ORDER BY inserted_at DESC LIMIT 1",
-    )
-    .bind(workflow_id)
-    .fetch_optional(pool)
-    .await?;
-
-    match row {
-        Some((definition,)) => Ok(Some(crate::definition_store::proto_from_stored_definition(
-            definition,
-        )?)),
-        None => Ok(None),
-    }
+    repositories
+        .live_workflow_definition(workflow_id)
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 /// Mirror the extracted envelopes to the per-tenant `ctx-<ns>` NATS KV
 /// bucket keyed by `<signal_id>/<name>`. The bucket is the working-set
-/// cache; Postgres is the durable archive.
+/// cache; the selected SQL repository is the durable archive.
 async fn write_captures_to_nats(
     nats: &NatsClient,
     signal_id: Uuid,

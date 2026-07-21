@@ -1,7 +1,7 @@
 //! Integration test for the API component's merged list-instances path:
 //!
-//!   - `archive_queries::list_workflow_instances_by_workflow` returns the
-//!     archive rows for a workflow id, newest first.
+//!   - the selected archive repository returns Workflow-instance rows newest
+//!     first with stable tie-breaks.
 //!   - `coordinator_client::list_workflow_instances` decodes a coordinator live
 //!     response into the same DTO the API serves.
 //!   - The merge resolves collisions to the archive row and combines live +
@@ -19,10 +19,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries;
 use tickr_api::http::coordinator_client::CoordinatorClient;
 use tickr_api::http::dto::WorkflowInstanceResponse;
 use tickr_api::http::live_archive_merge::merge_instances;
+use tickr_migrations::archive_repository::ArchivePage;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
 mod common;
@@ -57,7 +58,10 @@ async fn archive_query_returns_rows_for_workflow_newest_first(
     let later_id = Uuid::new_v4();
     common::insert_instance(&pool, &common::instance_blob(later_id, wf, "Failed", None)).await;
 
-    let rows = archive_queries::list_workflow_instances_by_workflow(&pool, wf).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let rows = repository
+        .archived_workflow_instances(wf, ArchivePage::unbounded())
+        .await?;
     assert_eq!(rows.len(), 2, "both rows must be returned");
     assert_eq!(rows[0].id, later_id.to_string(), "newest archived_at first");
     assert_eq!(rows[1].id, earlier_id.to_string());

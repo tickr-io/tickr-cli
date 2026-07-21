@@ -38,6 +38,8 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_conductor::system_tasks::compaction_drain;
 use tickr_conductor::system_tasks::{run_compaction_drain, stage_compaction_payload};
+use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::signal_repository::SignalCapturesInput;
 use tickr_proto::archive::{ArchiveProjection, CompactionEnvelope};
 use tickr_proto::instance::SnapshotTaskInstance;
 use tokio_util::sync::CancellationToken;
@@ -256,6 +258,9 @@ async fn drain_archives_a_staged_job() -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
 
     let payload = build_payload("Completed", 2);
     let wfi_id = payload.instance_id;
@@ -264,7 +269,7 @@ async fn drain_archives_a_staged_job() -> Result<(), Box<dyn std::error::Error>>
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
         nats.clone(),
-        Arc::clone(&pool),
+        Arc::clone(&repositories),
         memory_operator(),
         shutdown.clone(),
     ));
@@ -320,11 +325,50 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
 
     let payload = build_payload("Failed", 1);
     let wfi_id = payload.instance_id;
     let ti_id = Uuid::parse_str(&payload.tasks[0].id)?;
     let bytes = encode_proto_job(&payload);
+
+    // Link one Trigger-derived Event-variable archive and its NATS working key
+    // before terminal delivery. The first drain must settle/delete it; the
+    // duplicate delivery must remain an idempotent no-op.
+    let signal_id = Uuid::new_v4();
+    repositories
+        .insert_signal_captures(&SignalCapturesInput {
+            signal_id,
+            workflow_id: payload.workflow_id,
+            workflow_version: Some(1),
+            captures: serde_json::json!([{
+                "name": "order",
+                "envelope": {
+                    "present": true,
+                    "value": {"id": 42},
+                    "producer": {
+                        "kind": "Signal",
+                        "signal_id": signal_id,
+                        "source": {"Manual": {}}
+                    },
+                    "lineage": [{"segment": "inputs.order"}]
+                }
+            }]),
+        })
+        .await?;
+    repositories.link_signal_captures(signal_id, wfi_id).await?;
+    let js = async_nats::jetstream::new(nats.clone());
+    let ctx = js
+        .create_key_value(async_nats::jetstream::kv::Config {
+            bucket: "ctx-default".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let signal_key = format!("{signal_id}/order");
+    ctx.put(&signal_key, b"working-value".to_vec().into())
+        .await?;
 
     // Two copies of the same job: the shape a server re-ship produces, and
     // the shape a drain crash between archive-commit and queue-ack produces
@@ -335,7 +379,7 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
         nats.clone(),
-        Arc::clone(&pool),
+        Arc::clone(&repositories),
         memory_operator(),
         shutdown.clone(),
     ));
@@ -374,6 +418,113 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
         .get(0);
     assert_eq!(ti_count, 1, "task_instance row must also be deduped");
 
+    let terminal_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT terminal_at FROM signal_captures WHERE signal_id = $1")
+            .bind(signal_id)
+            .fetch_one(pool.as_ref())
+            .await?;
+    assert!(
+        terminal_at.is_some(),
+        "the archive commit must be followed by SQL-backed terminal marking"
+    );
+    assert!(
+        ctx.get(&signal_key).await?.is_none(),
+        "terminal cleanup must remove the Signal/Event-variable NATS key"
+    );
+
+    shutdown.cancel();
+    let _ = drain_handle.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_cleanup_sql_failure_is_non_fatal_after_archive_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((_nats_container, nats)) = start_nats().await else {
+        return Ok(());
+    };
+    let Some((_pg_container, pool)) = start_postgres_with_migrations().await else {
+        return Ok(());
+    };
+    let pool = Arc::new(pool);
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
+    let payload = build_payload("Completed", 0);
+    let signal_id = Uuid::new_v4();
+    repositories
+        .insert_signal_captures(&SignalCapturesInput {
+            signal_id,
+            workflow_id: payload.workflow_id,
+            workflow_version: Some(1),
+            captures: serde_json::json!([{
+                "name": "order",
+                "envelope": {
+                    "present": true,
+                    "value": {"id": 42},
+                    "producer": {
+                        "kind": "Signal",
+                        "signal_id": signal_id,
+                        "source": {"Manual": {}}
+                    },
+                    "lineage": []
+                }
+            }]),
+        })
+        .await?;
+    repositories
+        .link_signal_captures(signal_id, payload.instance_id)
+        .await?;
+    // The terminal UPDATE commits, but decoding the malformed returned value
+    // fails. Compaction must retain the archive commit and ACK the staged job.
+    sqlx::query("UPDATE signal_captures SET captures = '{}'::jsonb WHERE signal_id = $1")
+        .bind(signal_id)
+        .execute(pool.as_ref())
+        .await?;
+
+    let js = async_nats::jetstream::new(nats.clone());
+    let ctx = js
+        .create_key_value(async_nats::jetstream::kv::Config {
+            bucket: "ctx-default".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let signal_key = format!("{signal_id}/order");
+    ctx.put(&signal_key, b"working-value".to_vec().into())
+        .await?;
+    stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
+
+    let shutdown = CancellationToken::new();
+    let drain_handle = tokio::spawn(run_compaction_drain(
+        nats.clone(),
+        Arc::clone(&repositories),
+        memory_operator(),
+        shutdown.clone(),
+    ));
+    assert!(
+        wait_for_archived(&pool, payload.instance_id, Duration::from_secs(15)).await,
+        "cleanup failure must not roll back the terminal archive"
+    );
+    let mut stream = js.get_stream(compaction_drain::STREAM_NAME).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stream.info().await?.state.messages > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "non-fatal cleanup failure must not prevent queue completion"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let terminal_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT terminal_at FROM signal_captures WHERE signal_id = $1")
+            .bind(signal_id)
+            .fetch_one(pool.as_ref())
+            .await?;
+    assert!(terminal_at.is_some());
+    assert!(
+        ctx.get(&signal_key).await?.is_some(),
+        "a failed SQL decode cannot supply NATS cleanup keys"
+    );
+
     shutdown.cancel();
     let _ = drain_handle.await;
     Ok(())
@@ -389,6 +540,9 @@ async fn failed_tasks_logs_are_archived_and_subject_purged(
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
 
     // A failed workflow whose single (failed) task staged two log batches.
     let mut payload = build_payload("Failed", 1);
@@ -412,7 +566,7 @@ async fn failed_tasks_logs_are_archived_and_subject_purged(
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
         nats.clone(),
-        Arc::clone(&pool),
+        Arc::clone(&repositories),
         storage.clone(),
         shutdown.clone(),
     ));
@@ -486,6 +640,9 @@ async fn retried_attempts_get_separate_subjects_and_blobs() -> Result<(), Box<dy
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
 
     // Two attempts of one task = two TaskInstances sharing task_id, each
     // with its own id — and therefore its own log subject and blob.
@@ -531,7 +688,7 @@ async fn retried_attempts_get_separate_subjects_and_blobs() -> Result<(), Box<dy
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
         nats.clone(),
-        Arc::clone(&pool),
+        Arc::clone(&repositories),
         storage.clone(),
         shutdown.clone(),
     ));

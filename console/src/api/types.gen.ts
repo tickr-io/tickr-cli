@@ -695,6 +695,18 @@ export interface components {
             signal_id: string;
         };
         /** @description Public API contract. */
+        DataPlaneSqlHealth: {
+            detail: string;
+            detection_window: string;
+            implementation: components["schemas"]["DataPlaneSqlImplementation"];
+            status: components["schemas"]["ComponentStatus"];
+        };
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        DataPlaneSqlImplementation: "postgres" | "sqlite";
+        /** @description Public API contract. */
         DayCounts: {
             /** Format: int64 */
             completed: number;
@@ -745,9 +757,9 @@ export interface components {
             checked_at: string;
             conductor: components["schemas"]["ComponentHealth"];
             control_plane: components["schemas"]["ComponentHealth"];
+            data_plane_sql: components["schemas"]["DataPlaneSqlHealth"];
             executors: components["schemas"]["ComponentHealth"];
             nats_kv: components["schemas"]["ComponentHealth"];
-            postgres: components["schemas"]["ComponentHealth"];
         };
         /** @description Public API contract. */
         HelloResponse: {

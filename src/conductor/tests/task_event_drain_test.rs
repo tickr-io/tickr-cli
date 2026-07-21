@@ -203,6 +203,11 @@ async fn durable_consumer_redelivers_on_unack_then_acks_on_forward_with_enrichme
         .expect("publish")
         .await
         .expect("publish ack");
+    let definitions = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        ),
+    );
 
     // --- 1. Simulated outage: drain with a CLOSED relay channel. The forward
     // fails, the drain NAKs and stops — the event is NOT acked, so it stays in
@@ -212,7 +217,14 @@ async fn durable_consumer_redelivers_on_unack_then_acks_on_forward_with_enrichme
         drop(closed_rx); // relay outbound is "down"
         let consumer = task_event_consumer(&nats).await.expect("consumer");
         let token = CancellationToken::new();
-        drain_task_events(consumer, closed_tx, Arc::clone(&pool), nats.clone(), token).await;
+        drain_task_events(
+            consumer,
+            closed_tx,
+            Arc::clone(&definitions),
+            nats.clone(),
+            token,
+        )
+        .await;
     }
     // Still parked in the queue — redelivery must keep it.
     assert!(
@@ -226,10 +238,17 @@ async fn durable_consumer_redelivers_on_unack_then_acks_on_forward_with_enrichme
     let consumer = task_event_consumer(&nats).await.expect("consumer");
     let token = CancellationToken::new();
     let drain_token = token.clone();
-    let drain_pool = Arc::clone(&pool);
     let drain_nats = nats.clone();
+    let drain_definitions = Arc::clone(&definitions);
     let handle = tokio::spawn(async move {
-        drain_task_events(consumer, open_tx, drain_pool, drain_nats, drain_token).await;
+        drain_task_events(
+            consumer,
+            open_tx,
+            drain_definitions,
+            drain_nats,
+            drain_token,
+        )
+        .await;
     });
 
     let msg = tokio::time::timeout(Duration::from_secs(15), open_rx.recv())

@@ -85,7 +85,16 @@ async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
         minio,
         nats.clone(),
     ));
-    let state = tickr_api::http::routes::build_app_state(Arc::new(nats), pool, coordinator, logs);
+    let state = tickr_api::http::routes::build_app_state(
+        Arc::new(nats),
+        Arc::new(
+            tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(
+                pool.as_ref().clone(),
+            ),
+        ),
+        coordinator,
+        logs,
+    );
     let app = tickr_api::http::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await

@@ -37,6 +37,8 @@ async fn backfill_marks_pending_scheduled_run_targetable() -> Result<(), Box<dyn
     let Some(pool) = pg_pool().await else {
         return Ok(());
     };
+    let repositories =
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone());
 
     let signal_id = Uuid::new_v4();
     let workflow_id = Uuid::new_v4();
@@ -44,8 +46,9 @@ async fn backfill_marks_pending_scheduled_run_targetable() -> Result<(), Box<dyn
 
     // A freshly-triggered signal starts un-materialized (the trigger pipeline
     // inserts the captures row before the run is minted).
-    tickr_conductor::signal_captures::insert(&pool, signal_id, workflow_id, None, &[]).await?;
-    let before = tickr_conductor::signal_captures::read(&pool, signal_id)
+    tickr_conductor::signal_captures::insert(&repositories, signal_id, workflow_id, None, &[])
+        .await?;
+    let before = tickr_conductor::signal_captures::read(&repositories, signal_id)
         .await?
         .expect("captures row must exist after insert");
     assert!(
@@ -55,7 +58,7 @@ async fn backfill_marks_pending_scheduled_run_targetable() -> Result<(), Box<dyn
 
     // Back-fill the linkage as the trigger pipeline does for a future-dated run.
     let run_id = tickr_conductor::instance_creation_linkage::backfill_pending_schedule_linkage(
-        &pool,
+        &repositories,
         signal_id,
         workflow_id,
         scheduled_at,
@@ -71,7 +74,7 @@ async fn backfill_marks_pending_scheduled_run_targetable() -> Result<(), Box<dyn
 
     // The read side now surfaces the pending run's id — an operator has a
     // target before it fires.
-    let after = tickr_conductor::signal_captures::read(&pool, signal_id)
+    let after = tickr_conductor::signal_captures::read(&repositories, signal_id)
         .await?
         .expect("captures row still present");
     assert_eq!(
@@ -82,9 +85,10 @@ async fn backfill_marks_pending_scheduled_run_targetable() -> Result<(), Box<dyn
 
     // Idempotent with the fire-time back-fill: re-marking with the same id is a
     // no-op under the `IS NULL` guard, and a stray different id never overwrites.
-    tickr_conductor::signal_captures::mark_materialized(&pool, signal_id, expected).await?;
-    tickr_conductor::signal_captures::mark_materialized(&pool, signal_id, Uuid::new_v4()).await?;
-    let final_row = tickr_conductor::signal_captures::read(&pool, signal_id)
+    tickr_conductor::signal_captures::mark_materialized(&repositories, signal_id, expected).await?;
+    tickr_conductor::signal_captures::mark_materialized(&repositories, signal_id, Uuid::new_v4())
+        .await?;
+    let final_row = tickr_conductor::signal_captures::read(&repositories, signal_id)
         .await?
         .expect("captures row still present");
     assert_eq!(

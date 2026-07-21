@@ -5,7 +5,7 @@
 //! archive-grade projection + an opaque correlation) durably in the
 //! per-tenant NATS work queue (`tickr.compaction.jobs`) and ACKs the
 //! server immediately — the ACK means "durably staged", not "archived",
-//! so live-state retirement is never gated on object-storage or Postgres
+//! so live-state retirement is never gated on object-storage or repository
 //! latency. The staged message is the only copy of the payload in the gap
 //! between ACK and archive; that is why staging awaits the JetStream
 //! publish acknowledgement before the relay ACK is sent.
@@ -30,18 +30,16 @@ use async_nats::Client as NatsClient;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use opendal::Operator;
-use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::archive as ap;
 use tickr_proto::codec::compaction::decode_envelope;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::system_tasks::compaction_receiver::{
-    audit_patch_settlement, persist_compaction_projection,
-};
+use crate::system_tasks::compaction_receiver::persist_compaction_projection;
 use crate::system_tasks::log_uploader::{purge_task_log_subject, upload_task_logs};
 
 /// The archive-grade content of one staged compaction job, decoded from the
@@ -136,7 +134,7 @@ pub async fn init_stream_and_consumer(nats: &NatsClient) -> Result<PullConsumer>
 /// signal-captures cleanup), then log-subject purge. Each step is
 /// idempotent, so a re-run after a mid-job crash converges.
 async fn drain_one(
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     log_storage: &Operator,
     job: &DecodedJob,
@@ -184,7 +182,7 @@ async fn drain_one(
         .with_context(|| format!("log upload for task instance {}", ti_id))?;
     }
 
-    persist_compaction_projection(pg_pool, projection, job.shipped_at, Some(nats)).await?;
+    persist_compaction_projection(repositories, projection, job.shipped_at, Some(nats)).await?;
 
     // Terminal-time patch settlement audit: reconcile the durable patch ledger
     // against this terminal instance's applied-patch log and record a loud
@@ -197,13 +195,24 @@ async fn drain_one(
         .iter()
         .filter_map(|p| Uuid::parse_str(&p.patch_key).ok())
         .collect();
-    let discrepancies = audit_patch_settlement(pg_pool, workflow_instance_id, &applied_patch_keys)
+    let discrepancies = repositories
+        .audit_patch_settlement(workflow_instance_id, &applied_patch_keys)
         .await
         .with_context(|| format!("patch settlement audit for {}", workflow_instance_id))?;
-    if discrepancies > 0 {
+    for discrepancy in &discrepancies {
+        eprintln!(
+            "patch_settlement_audit: DISCREPANCY instance={} patch_key={} status={}: {}",
+            discrepancy.workflow_instance_id,
+            discrepancy.patch_key,
+            discrepancy.ledger_status.as_str(),
+            discrepancy.detail
+        );
+    }
+    if !discrepancies.is_empty() {
         eprintln!(
             "compaction_drain: patch settlement audit for {} recorded {} discrepancy record(s)",
-            workflow_instance_id, discrepancies
+            workflow_instance_id,
+            discrepancies.len()
         );
     }
 
@@ -227,7 +236,7 @@ async fn drain_one(
 /// corruption, and NAK-forever would only redeliver it eternally.
 pub async fn run_compaction_drain(
     nats: NatsClient,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     log_storage: Operator,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
@@ -269,7 +278,7 @@ pub async fn run_compaction_drain(
                             }
                         };
                         let wfi_id = job.projection.id.clone();
-                        match drain_one(&pg_pool, &nats, &log_storage, &job).await {
+                        match drain_one(&repositories, &nats, &log_storage, &job).await {
                             Ok(()) => {
                                 if let Err(e) = msg.ack().await {
                                     // The archive write committed but the queue keeps the

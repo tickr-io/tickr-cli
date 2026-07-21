@@ -2,7 +2,7 @@
 //! module layout so the read handlers and their support modules port over
 //! unchanged.
 
-pub mod archive_queries;
+pub mod calendar;
 pub mod coordinator_client;
 pub mod ctx_reader;
 pub mod dto;

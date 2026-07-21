@@ -16,7 +16,7 @@
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries::list_replays_for_source;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
 #[allow(clippy::too_many_arguments)]
@@ -70,6 +70,7 @@ async fn lists_a_source_runs_replays_indexed_and_scoped() -> Result<(), Box<dyn 
         .connect(&url)
         .await?;
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
+    let repositories = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
 
     let source = Uuid::new_v4();
     let other_source = Uuid::new_v4();
@@ -77,8 +78,8 @@ async fn lists_a_source_runs_replays_indexed_and_scoped() -> Result<(), Box<dyn 
 
     // Two replays of `source` (an older one, then a newer one), plus a replay of
     // an unrelated `other_source` that must NOT leak into `source`'s answer.
-    let older = Uuid::new_v4();
-    let newer = Uuid::new_v4();
+    let older = Uuid::from_u128(1);
+    let newer = Uuid::from_u128(2);
     insert_replay(
         &pool,
         older,
@@ -98,7 +99,7 @@ async fn lists_a_source_runs_replays_indexed_and_scoped() -> Result<(), Box<dyn 
         None,
         &[node],
         &["db_password"],
-        "2026-07-13T11:00:00Z",
+        "2026-07-13T10:00:00Z",
     )
     .await;
     insert_replay(
@@ -113,11 +114,11 @@ async fn lists_a_source_runs_replays_indexed_and_scoped() -> Result<(), Box<dyn 
     )
     .await;
 
-    let rows = list_replays_for_source(&pool, source).await?;
+    let rows = repositories.replays_for_source(source).await?;
     // Exactly the source's two replays — the unrelated source's row is excluded
     // by the indexed `WHERE source_instance_id = $1`, not filtered post-scan.
     assert_eq!(rows.len(), 2, "only this source's replays are returned");
-    // Newest first.
+    // Newest first, with replay identity descending as the equal-time tie-break.
     assert_eq!(rows[0].replay_instance_id, newer);
     assert_eq!(rows[1].replay_instance_id, older);
     assert!(rows.iter().all(|r| r.source_instance_id == source));
@@ -129,7 +130,7 @@ async fn lists_a_source_runs_replays_indexed_and_scoped() -> Result<(), Box<dyn 
     assert!(rows[1].shadowed_keys.is_empty());
 
     // A source with no replays is an empty list, not an error.
-    let empty = list_replays_for_source(&pool, Uuid::new_v4()).await?;
+    let empty = repositories.replays_for_source(Uuid::new_v4()).await?;
     assert!(empty.is_empty(), "a run with no replays lists empty");
 
     Ok(())

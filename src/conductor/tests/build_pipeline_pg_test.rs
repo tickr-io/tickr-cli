@@ -15,8 +15,10 @@
 
 use sqlx::PgPool;
 use std::sync::Arc;
-use tickr_conductor::build_pipeline::{
-    finalize_after_task_outcome, BuildOutcome, FinalizerOutcome,
+use tickr_conductor::build_pipeline::BuildOutcome;
+use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::definition_repository::{
+    DefinitionBuildSettlementOutcome, DefinitionTaskBuildResult,
 };
 use tickr_proto::workflow as wf;
 use uuid::Uuid;
@@ -126,20 +128,6 @@ async fn seed_workflow_and_task_rows(
     Ok(())
 }
 
-async fn mark_task_success(pool: &PgPool, wf_id: Uuid, version: i64, task_id: Uuid) {
-    sqlx::query(
-        r#"UPDATE workflow_task_builds
-              SET status = 'success', built_at = now()
-            WHERE workflow_id = $1 AND workflow_version = $2 AND task_id = $3"#,
-    )
-    .bind(wf_id)
-    .bind(version)
-    .bind(task_id)
-    .execute(pool)
-    .await
-    .expect("mark success");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_path_flips_to_ready() -> Result<(), Box<dyn std::error::Error>> {
     let Some((_pg, pool)) = start_pg().await else {
@@ -149,32 +137,27 @@ async fn happy_path_flips_to_ready() -> Result<(), Box<dyn std::error::Error>> {
     let (wf, task_ids) = workflow_with_n_tasks("happy-path", 1, 3);
     seed_workflow_and_task_rows(&pool, &wf, &task_ids).await?;
 
-    // Walk the tasks: each one flips its row to success, then runs the
-    // finalizer. Only the last one should observe FlippedToReady.
-    let mut outcomes = Vec::new();
+    let repository = WriterRepositoryBundle::from_postgres_pool(pool.clone());
     for (i, task_id) in task_ids.iter().enumerate() {
-        mark_task_success(&pool, wf.get_id(), wf.get_version(), *task_id).await;
-        let outcome = finalize_after_task_outcome(
-            &pool,
-            wf.get_id(),
-            wf.get_version(),
-            &BuildOutcome::Success,
-        )
-        .await?;
-        outcomes.push(outcome.clone());
+        let outcome = repository
+            .settle_definition_task_build(
+                wf.get_id(),
+                wf.get_version(),
+                *task_id,
+                DefinitionTaskBuildResult::Success,
+            )
+            .await?;
         if i < task_ids.len() - 1 {
-            // Other tasks still pending; finalizer must be a no-op.
             assert_eq!(
                 outcome,
-                FinalizerOutcome::AlreadyTerminalOrNotReady,
+                DefinitionBuildSettlementOutcome::AwaitingTasks,
                 "task {} of {} should not flip while siblings pend",
                 i + 1,
                 task_ids.len()
             );
         } else {
-            assert_eq!(
-                outcome,
-                FinalizerOutcome::FlippedToReady,
+            assert!(
+                matches!(outcome, DefinitionBuildSettlementOutcome::Ready(_)),
                 "last task must flip workflow to Ready"
             );
         }
@@ -200,18 +183,18 @@ async fn any_failure_flips_to_build_failed() -> Result<(), Box<dyn std::error::E
     let (wf, task_ids) = workflow_with_n_tasks("failing-build", 1, 2);
     seed_workflow_and_task_rows(&pool, &wf, &task_ids).await?;
 
-    // First task fails — workflow should short-circuit to BuildFailed
-    // regardless of what the second task eventually does.
-    let outcome = finalize_after_task_outcome(
-        &pool,
-        wf.get_id(),
-        wf.get_version(),
-        &BuildOutcome::Failure {
-            error: "synthetic test failure".to_string(),
-        },
-    )
-    .await?;
-    assert_eq!(outcome, FinalizerOutcome::FlippedToBuildFailed);
+    let repository = WriterRepositoryBundle::from_postgres_pool(pool.clone());
+    let outcome = repository
+        .settle_definition_task_build(
+            wf.get_id(),
+            wf.get_version(),
+            task_ids[0],
+            DefinitionTaskBuildResult::Failure {
+                error: "synthetic test failure",
+            },
+        )
+        .await?;
+    assert_eq!(outcome, DefinitionBuildSettlementOutcome::BuildFailed);
 
     let (status,): (String,) =
         sqlx::query_as("SELECT status FROM workflows WHERE id = $1 AND version = $2")
@@ -221,13 +204,20 @@ async fn any_failure_flips_to_build_failed() -> Result<(), Box<dyn std::error::E
             .await?;
     assert_eq!(status, "BuildFailed");
 
-    // A subsequent stray success-finalizer attempt must be a no-op —
-    // BuildFailed is terminal.
-    mark_task_success(&pool, wf.get_id(), wf.get_version(), task_ids[1]).await;
-    let stray =
-        finalize_after_task_outcome(&pool, wf.get_id(), wf.get_version(), &BuildOutcome::Success)
-            .await?;
-    assert_eq!(stray, FinalizerOutcome::AlreadyTerminalOrNotReady);
+    let stray = repository
+        .settle_definition_task_build(
+            wf.get_id(),
+            wf.get_version(),
+            task_ids[1],
+            DefinitionTaskBuildResult::Success,
+        )
+        .await?;
+    assert_eq!(
+        stray,
+        DefinitionBuildSettlementOutcome::AlreadySettled(
+            tickr_migrations::definition_repository::DefinitionLifecycleStatus::BuildFailed
+        )
+    );
 
     Ok(())
 }
@@ -235,10 +225,8 @@ async fn any_failure_flips_to_build_failed() -> Result<(), Box<dyn std::error::E
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_finalizers_flip_to_ready_exactly_once() -> Result<(), Box<dyn std::error::Error>>
 {
-    // Non-negotiable atomicity test: N workers flip their last per-task
-    // rows simultaneously and race the finalizer. The conditional
-    // UPDATE is the locking mechanism — at most one finalizer wins, the
-    // others see `Building` is no longer the row's status and exit.
+    // Every task settles concurrently. The repository serializes each
+    // aggregate decision so exactly the final committed task wins Ready.
     let Some((_pg, pool)) = start_pg().await else {
         return Ok(());
     };
@@ -247,37 +235,40 @@ async fn concurrent_finalizers_flip_to_ready_exactly_once() -> Result<(), Box<dy
     const N: usize = 8;
     let (wf, task_ids) = workflow_with_n_tasks("concurrent-finalizer", 1, N);
     seed_workflow_and_task_rows(&pool, &wf, &task_ids).await?;
-
-    // Pre-mark every task `success` so every spawned worker's finalizer
-    // call is eligible to win on the eligibility predicate. The race
-    // narrows to the conditional UPDATE itself.
-    for task_id in &task_ids {
-        mark_task_success(&pool, wf.get_id(), wf.get_version(), *task_id).await;
-    }
+    let repository = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool.as_ref().clone(),
+    ));
 
     let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
-        let pool = Arc::clone(&pool);
+    for task_id in task_ids {
+        let repository = Arc::clone(&repository);
         let wf_id = wf.get_id();
         let version = wf.get_version();
         handles.push(tokio::spawn(async move {
-            finalize_after_task_outcome(&pool, wf_id, version, &BuildOutcome::Success).await
+            repository
+                .settle_definition_task_build(
+                    wf_id,
+                    version,
+                    task_id,
+                    DefinitionTaskBuildResult::Success,
+                )
+                .await
         }));
     }
 
-    let mut flipped = 0usize;
-    let mut already = 0usize;
-    for h in handles {
-        match h.await? {
-            Ok(FinalizerOutcome::FlippedToReady) => flipped += 1,
-            Ok(FinalizerOutcome::AlreadyTerminalOrNotReady) => already += 1,
-            Ok(other) => panic!("unexpected outcome: {:?}", other),
-            Err(e) => panic!("finalizer error: {}", e),
+    let mut ready = 0usize;
+    let mut awaiting = 0usize;
+    for handle in handles {
+        match handle.await? {
+            Ok(DefinitionBuildSettlementOutcome::Ready(_)) => ready += 1,
+            Ok(DefinitionBuildSettlementOutcome::AwaitingTasks) => awaiting += 1,
+            Ok(other) => panic!("unexpected outcome: {other:?}"),
+            Err(error) => panic!("settlement error: {error}"),
         }
     }
 
-    assert_eq!(flipped, 1, "exactly one finalizer must flip to Ready");
-    assert_eq!(already, N - 1, "the rest must be AlreadyTerminalOrNotReady");
+    assert_eq!(ready, 1, "exactly one finalizer must flip to Ready");
+    assert_eq!(awaiting, N - 1, "the rest must await other tasks");
 
     // Verify the workflow row sits at Ready exactly once.
     let (status,): (String,) =

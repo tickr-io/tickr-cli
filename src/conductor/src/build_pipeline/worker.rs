@@ -2,22 +2,16 @@
 //!
 //! Each worker subscribes to the build queue with NATS queue-group
 //! semantics so a job is processed by exactly one worker across the
-//! cluster of conductor replicas. For each job: deserialize, invoke
-//! the injected [`BuildExecutor`], record the per-task outcome to PG,
-//! run the finalizer pass. On finalizer transition to `Ready`, publish
-//! a `SubmissionMessage` onto the submission queue so the submission
-//! consumer ships the SubmitWorkflow envelope cross-plane, then
-//! refresh the in-process waits-on-signal subscription index so the
-//! next external wakeup can dispatch.
+//! cluster of conductor replicas. For each job, it invokes the executor and
+//! asks the selected repository to settle the Task plus aggregate lifecycle
+//! atomically. The single winning `Ready` outcome publishes a
+//! `SubmissionMessage`; the committed row remains the recovery anchor.
 //!
 //! The worker terminates cleanly when the supplied `CancellationToken`
 //! is cancelled, after a brief grace window for an in-flight finalizer
 //! publish.
 
-use crate::build_pipeline::executor::BuildExecutor;
-use crate::build_pipeline::finalizer::{
-    finalize_after_task_outcome, record_task_outcome, FinalizerOutcome,
-};
+use crate::build_pipeline::executor::{BuildExecutor, BuildOutcome};
 use crate::build_pipeline::job::TaskBuildJob;
 use crate::build_pipeline::BUILD_QUEUE_SUBJECT;
 use crate::submission_consumer::{publish_submission, SubmissionMessage};
@@ -25,9 +19,12 @@ use crate::waits_on_signal_lifecycle::apply_workflow_state;
 use anyhow::Result;
 use async_nats::Client as NatsClient;
 use futures::StreamExt;
-use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::definition_repository::{
+    DefinitionBuildSettlementOutcome, DefinitionTaskBuildResult,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Grace window the build worker gives in-flight nix builds + the
@@ -44,7 +41,7 @@ pub const BUILD_QUEUE_GROUP: &str = "conductor-build-workers";
 /// resolves when the subscription stream ends or the token cancels.
 pub async fn start_build_worker(
     nats: NatsClient,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     executor: Arc<dyn BuildExecutor>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -62,7 +59,7 @@ pub async fn start_build_worker(
                 println!("Build worker received shutdown signal; draining in-flight builds.");
                 let _ = tokio::time::timeout(SHUTDOWN_DRAIN, async {
                     while let Some(msg) = sub.next().await {
-                        process_job(&nats, &pg_pool, executor.as_ref(), msg).await;
+                        process_job(&nats, &repositories, executor.as_ref(), msg).await;
                     }
                 })
                 .await;
@@ -70,7 +67,7 @@ pub async fn start_build_worker(
                 break;
             }
             Some(msg) = sub.next() => {
-                process_job(&nats, &pg_pool, executor.as_ref(), msg).await;
+                process_job(&nats, &repositories, executor.as_ref(), msg).await;
             }
             else => {
                 println!("Build queue subscription ended.");
@@ -83,7 +80,7 @@ pub async fn start_build_worker(
 
 async fn process_job(
     nats: &NatsClient,
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     executor: &dyn BuildExecutor,
     msg: async_nats::Message,
 ) {
@@ -95,91 +92,65 @@ async fn process_job(
         }
     };
     let outcome = executor.build(&job).await;
-    if let Err(e) = record_task_outcome(
-        pg_pool,
-        job.workflow_id,
-        job.workflow_version,
-        job.task_id,
-        &outcome,
-    )
-    .await
-    {
-        eprintln!(
-            "build worker: failed to record outcome for task {}: {}",
-            job.task_id, e
-        );
-        return;
-    }
-    match finalize_after_task_outcome(pg_pool, job.workflow_id, job.workflow_version, &outcome)
+    let build_result = match &outcome {
+        BuildOutcome::Success => DefinitionTaskBuildResult::Success,
+        BuildOutcome::Failure { error } => DefinitionTaskBuildResult::Failure {
+            error: error.as_str(),
+        },
+    };
+    match repositories
+        .settle_definition_task_build(
+            job.workflow_id,
+            job.workflow_version,
+            job.task_id,
+            build_result,
+        )
         .await
     {
-        Ok(FinalizerOutcome::FlippedToReady) => {
-            // Publish the submission pointer onto the submission queue
-            // so the submission consumer ships the SubmitWorkflow
-            // envelope cross-plane. A publish failure here is bounded
-            // by the boot-time reconciliation scan — the workflow row
-            // stays at Ready and gets republished on next conductor
-            // start.
+        Ok(DefinitionBuildSettlementOutcome::Ready(intent)) => {
             let pointer = SubmissionMessage {
-                workflow_id: job.workflow_id,
-                workflow_version: job.workflow_version,
+                workflow_id: intent.workflow_id,
+                workflow_version: intent.workflow_version,
             };
             if let Err(e) = publish_submission(nats, &pointer).await {
                 eprintln!(
                     "build worker: submission queue publish failed for ({}, {}): {} (boot reconciliation will retry)",
-                    job.workflow_id, job.workflow_version, e
+                    intent.workflow_id, intent.workflow_version, e
                 );
             }
-            // Refresh the in-process waits-on-signal index so a
-            // subsequent wakeup can dispatch without waiting for a
-            // conductor restart's reconciliation scan.
-            if let Err(e) =
-                refresh_subscription_index(pg_pool, job.workflow_id, job.workflow_version).await
-            {
+            if let Err(e) = apply_workflow_state(&intent.definition) {
                 eprintln!(
                     "build worker: waits-on-signal refresh failed for {}: {}",
-                    job.workflow_id, e
+                    intent.workflow_id, e
                 );
             }
         }
-        Ok(FinalizerOutcome::FlippedToBuildFailed) => {
-            // FlippedToBuildFailed only comes from a Failure outcome, which
-            // carries the captured `nix build` stderr. Surface it so an
-            // author sees why the build failed without re-running nix.
+        Ok(DefinitionBuildSettlementOutcome::BuildFailed) => {
             let diagnostic = match &outcome {
-                crate::build_pipeline::executor::BuildOutcome::Failure { error } => error.as_str(),
-                _ => "",
+                BuildOutcome::Failure { error } => error.as_str(),
+                BuildOutcome::Success => "",
             };
             eprintln!(
                 "build worker: workflow {} v{} task {} flipped to BuildFailed; nix build stderr:\n{}",
                 job.workflow_id, job.workflow_version, job.task_id, diagnostic
             );
         }
-        Ok(FinalizerOutcome::AlreadyTerminalOrNotReady) => {
-            // Another worker handled the transition or other tasks are
-            // still pending. No-op.
+        Ok(
+            DefinitionBuildSettlementOutcome::AwaitingTasks
+            | DefinitionBuildSettlementOutcome::AlreadySettled(_)
+            | DefinitionBuildSettlementOutcome::TaskAlreadySettled,
+        ) => {}
+        Ok(DefinitionBuildSettlementOutcome::Absent) => {
+            eprintln!(
+                "build worker: definition or task absent for {} v{} task {}",
+                job.workflow_id, job.workflow_version, job.task_id
+            );
         }
         Err(e) => {
             eprintln!(
-                "build worker: finalizer pass failed for {} v{}: {}",
+                "build worker: settlement failed for {} v{}: {}",
                 job.workflow_id, job.workflow_version, e
             );
         }
     }
-}
-
-async fn refresh_subscription_index(
-    pool: &PgPool,
-    workflow_id: uuid::Uuid,
-    workflow_version: i64,
-) -> Result<()> {
-    let (definition,): (serde_json::Value,) =
-        sqlx::query_as("SELECT definition FROM workflows WHERE id = $1 AND version = $2")
-            .bind(workflow_id)
-            .bind(workflow_version)
-            .fetch_one(pool)
-            .await?;
-    let workflow = crate::definition_store::proto_from_stored_definition(definition)?;
-    apply_workflow_state(&workflow)?;
-    Ok(())
 }

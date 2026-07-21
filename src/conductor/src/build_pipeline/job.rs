@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// One build-job-per-task message. The conductor's HTTP registration
-/// handler emits one of these for every task in a workflow, after the
-/// single Postgres transaction inserting the workflow + per-task rows
-/// commits. Workers consume the queue with NATS queue-group semantics —
+/// handler emits one of these for every Task after the repository transaction
+/// that inserted the definition and per-Task rows commits. Workers consume the
+/// queue with NATS queue-group semantics —
 /// exactly one worker handles each job.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskBuildJob {

@@ -15,11 +15,11 @@
 use anyhow::{Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
 use serde_json::Value;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use tickr_ctx::envelope::{Envelope, Producer};
 use tickr_ctx::scope::sanitize_segment;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::instance as ip;
 use tickr_proto::workflow as wf;
 
@@ -257,7 +257,7 @@ const DEFAULT_CTX_NAMESPACE: &str = "default";
 /// before any definition load. Best-effort — a failure leaves the advisory
 /// mirror absent and is surfaced by the caller; it never blocks dispatch.
 pub async fn mirror_ctx_graph(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     run_id: Uuid,
     workflow_id: Uuid,
@@ -283,7 +283,11 @@ pub async fn mirror_ctx_graph(
         return Ok(());
     }
 
-    let workflow = match read_latest_workflow_definition(pool, workflow_id).await? {
+    let workflow = match repositories
+        .latest_workflow_definition(workflow_id)
+        .await
+        .map_err(anyhow::Error::new)?
+    {
         Some(w) => w,
         None => {
             // No stored definition for this workflow id — should not happen for
@@ -378,29 +382,5 @@ async fn get_or_create_ctx_bucket(js: &jetstream::Context) -> Result<jetstream::
             })
             .await
             .context("create ctx bucket for graph mirror"),
-    }
-}
-
-/// Load the current definition for `workflow_id` from the conductor's
-/// per-tenant `workflows` table. The table is keyed `(id, version)` and holds
-/// one immutable row per version; a just-materialized instance ran off the
-/// latest, so we take the highest version. Returns `None` when no row exists.
-async fn read_latest_workflow_definition(
-    pool: &PgPool,
-    workflow_id: Uuid,
-) -> Result<Option<wf::WorkflowDefinition>> {
-    let row: Option<(Value,)> = sqlx::query_as(
-        "SELECT definition FROM workflows WHERE id = $1 ORDER BY version DESC LIMIT 1",
-    )
-    .bind(workflow_id)
-    .fetch_optional(pool)
-    .await?;
-
-    match row {
-        Some((definition,)) => Ok(Some(
-            crate::definition_store::proto_from_stored_definition(definition)
-                .context("decode workflow definition from JSONB")?,
-        )),
-        None => Ok(None),
     }
 }

@@ -11,10 +11,15 @@ publish = false
 workspace = true
 
 [dependencies]
+tickr_proto = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 testcontainers-modules = { workspace = true }
 anyhow = { workspace = true }
+tempfile = { workspace = true }

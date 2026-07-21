@@ -22,8 +22,7 @@
 //!    and the random ids never enter the hash.
 //!
 //! Serialization for the hash is canonical (sorted keys, stable encoding) via
-//! [`crate::canonical_json`]; the Postgres JSONB round-trip is never the hash
-//! input.
+//! [`crate::canonical_json`]; a storage JSON round-trip is never the hash input.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;

@@ -23,6 +23,7 @@ use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_conductor::nats_ingress::{self, RelaySendOutcome, RelaySender};
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::codec::definition::definition_proto_to_json;
 use tickr_proto::signal as sp;
 use tickr_proto::workflow as wf;
@@ -149,11 +150,13 @@ async fn trigger_envelope_flows_end_to_end() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -273,11 +276,13 @@ async fn cancel_envelope_flows_end_to_end() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -346,21 +351,17 @@ async fn cancel_envelope_flows_end_to_end() {
     let _ = translator.await;
 }
 
-/// Slice 02 acceptance: same idempotency_key + byte-identical payload on
-/// a second publish returns the Deduplicated outcome — the second arrival
-/// does not produce a second relay forward.
+/// External Cancel redelivery is absorbed by the NATS idempotency bucket.
+/// The duplicate performs no SQL-backed Signal audit write and produces no
+/// second relay effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_envelope_dedups_without_re_forwarding() {
+async fn cancel_redelivery_uses_nats_idempotency_without_sql_or_second_relay() {
     let Some((_pg_container, pool)) = start_postgres_with_migrations().await else {
         return;
     };
     let Some((_nats_container, nats)) = start_nats().await else {
         return;
     };
-
-    let workflow = empty_workflow("nats-ingress-test-dedup");
-    let workflow_id = Uuid::parse_str(&workflow.id).expect("workflow id");
-    insert_workflow(&pool, &workflow).await;
 
     let (relay_tx, mut relay_rx) = mpsc::channel::<sp::Signal>(32);
     let sender = Arc::new(CapturingRelaySender { tx: relay_tx });
@@ -369,11 +370,13 @@ async fn duplicate_envelope_dedups_without_re_forwarding() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -391,12 +394,15 @@ async fn duplicate_envelope_dedups_without_re_forwarding() {
     }
     assert!(stream_ready);
 
-    let idempotency_key = format!("ext-dedup-{}", Uuid::new_v4());
+    let instance_id = Uuid::new_v4();
+    let idempotency_key = format!("ext-cancel-redelivery-{}", Uuid::new_v4());
     let envelope = json!({
         "version": 1,
-        "variant": "Trigger",
+        "variant": "Cancel",
         "idempotency_key": idempotency_key,
-        "workflow_id": workflow_id.to_string(),
+        "target": { "Instance": { "workflow_instance_id": instance_id.to_string(), "node_id": null } },
+        "reason": { "UserRequested": { "actor": "alice" } },
+        "note": "operator cancel",
     });
     let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
 
@@ -442,6 +448,19 @@ async fn duplicate_envelope_dedups_without_re_forwarding() {
         dedup_bumped,
         "signals_deduplicated counter must increment for duplicate envelope"
     );
+    let sql_signal_rows: i64 = sqlx::query_scalar(
+        "SELECT
+            (SELECT COUNT(*) FROM signal_cancels)
+          + (SELECT COUNT(*) FROM signal_captures)
+          + (SELECT COUNT(*) FROM signal_wakeups)",
+    )
+    .fetch_one(pool_arc.as_ref())
+    .await
+    .expect("read SQL-backed Signal audit counts");
+    assert_eq!(
+        sql_signal_rows, 0,
+        "external Cancel delivery and redelivery must not touch SQL-backed Signal state"
+    );
 
     shutdown.cancel();
     let _ = translator.await;
@@ -473,11 +492,13 @@ async fn collision_envelope_drops_with_counter_and_no_forward() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -585,11 +606,13 @@ async fn wakeup_envelope_with_no_subscribers_acks_without_forwarding() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -669,11 +692,13 @@ async fn wakeup_envelope_with_subscriber_forwards_trigger() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -782,11 +807,13 @@ async fn saturated_relay_buffer_results_in_nak_with_counter() {
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -860,11 +887,13 @@ async fn malformed_envelope_increments_rejection_counter_and_does_not_forward() 
     let pool_arc = Arc::new(pool);
     let translator_nats = nats.clone();
     let translator_shutdown = shutdown.clone();
-    let translator_pool = Arc::clone(&pool_arc);
+    let translator_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let translator = tokio::spawn(async move {
         nats_ingress::run_translator_with_sender(
             translator_nats,
-            translator_pool,
+            translator_repositories,
             sender,
             translator_shutdown,
         )
@@ -948,11 +977,18 @@ async fn translator_restart_picks_up_pending_messages() {
     let t1_sender = Arc::new(CapturingRelaySender { tx: t1_tx });
     let t1_shutdown = CancellationToken::new();
     let t1_nats = nats.clone();
-    let t1_pool = Arc::clone(&pool_arc);
+    let t1_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let t1_shutdown_clone = t1_shutdown.clone();
     let t1 = tokio::spawn(async move {
-        nats_ingress::run_translator_with_sender(t1_nats, t1_pool, t1_sender, t1_shutdown_clone)
-            .await
+        nats_ingress::run_translator_with_sender(
+            t1_nats,
+            t1_repositories,
+            t1_sender,
+            t1_shutdown_clone,
+        )
+        .await
     });
 
     let js = jetstream::new(nats.clone());
@@ -1000,11 +1036,18 @@ async fn translator_restart_picks_up_pending_messages() {
     let t2_sender = Arc::new(CapturingRelaySender { tx: t2_tx });
     let t2_shutdown = CancellationToken::new();
     let t2_nats = nats.clone();
-    let t2_pool = Arc::clone(&pool_arc);
+    let t2_repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(
+        pool_arc.as_ref().clone(),
+    ));
     let t2_shutdown_clone = t2_shutdown.clone();
     let t2 = tokio::spawn(async move {
-        nats_ingress::run_translator_with_sender(t2_nats, t2_pool, t2_sender, t2_shutdown_clone)
-            .await
+        nats_ingress::run_translator_with_sender(
+            t2_nats,
+            t2_repositories,
+            t2_sender,
+            t2_shutdown_clone,
+        )
+        .await
     });
 
     let signal = tokio::time::timeout(Duration::from_secs(10), t2_rx.recv())

@@ -209,7 +209,7 @@ pub struct UpcomingInstanceResponse {
 
 /// One day's per-state instance counts for the Run calendar, keyed by date in
 /// the requested IANA timezone. Terminal counts (`completed` / `failed`) come
-/// from the Postgres archive; non-terminal (`in_progress` / `scheduled`) from
+/// from the selected terminal archive; non-terminal (`in_progress` / `scheduled`) from
 /// the live source. `total` is their sum. The UI maps these onto a single cell
 /// colour via the Calendar colour tier rule — the wire carries counts, not a
 /// colour or a "future" flag.

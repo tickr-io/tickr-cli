@@ -1,19 +1,19 @@
 //! Conductor-to-server submission consumer.
 //!
-//! The per-task build pipeline's finalizer commits a `Building -> Ready`
-//! flip on the conductor's `workflows` row and (after commit) publishes a
+//! The per-task build repository commits a `Building -> Ready` transition
+//! and returns the single winning publication intent. The worker then publishes a
 //! small `{ workflow_id, workflow_version }` message onto a NATS
 //! JetStream durable subject. This module consumes that subject with
 //! queue-group semantics across replicas and ships the freshly-built
 //! workflow definition over the relay as a `SubmitWorkflow` envelope.
 //!
-//! Idempotency anchor: the consumer reads the workflow row from PG and
-//! ACKs without shipping when the row is no longer at `Ready`. That
+//! Idempotency anchor: the consumer reads through the selected repository and
+//! ACKs without shipping when the definition is no longer at `Ready`. That
 //! covers both the JetStream redelivery case (the message gets
 //! re-delivered after a slow ACK) and the boot-time reconciliation case
 //! where a duplicate publish is intentionally produced.
 //!
-//! Dual-write hazard (PG commits to `Ready`, NATS publish fails) is
+//! Dual-write hazard (the repository commits `Ready`, NATS publish fails) is
 //! bounded by [`reconcile_orphan_ready_rows`]: at startup, before the
 //! consumer subscribes, the conductor scans for orphan `Ready` rows
 //! and republishes a message per row. No periodic reconciliation runs

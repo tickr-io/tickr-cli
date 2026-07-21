@@ -1,8 +1,7 @@
-//! Integration test for `http::archive_queries::list_workflow_defs` as served
-//! by the API component. Spins up an ephemeral Postgres via
-//! `testcontainers-modules`, applies the conductor's migrations (the API never
-//! owns the schema), inserts published workflow-definition fixtures, and
-//! asserts the archive-queries layer rehydrates the same proto shape.
+//! Integration tests for the definition read repository as served by the API
+//! component. Spins up ephemeral Postgres, applies the conductor migrations,
+//! inserts published workflow-definition fixtures, and asserts that the
+//! repository rehydrates the same proto shape.
 //!
 //! Requires Docker (testcontainers). Skipped automatically when Docker isn't
 //! available — the marker is the connection failure.
@@ -12,7 +11,8 @@
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries::{completed_run_counts, list_workflow_defs, WorkflowListRow};
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
+use tickr_migrations::definition_repository::DefinitionListRow;
 use tickr_proto::workflow as wf;
 use uuid::Uuid;
 
@@ -33,11 +33,15 @@ fn build_workflow(name: &str, cron: Option<&str>) -> wf::WorkflowDefinition {
     }
 }
 
-fn trigger_of(row: &WorkflowListRow) -> Option<&wf::trigger::Kind> {
+fn trigger_of(row: &DefinitionListRow) -> Option<&wf::trigger::Kind> {
     row.workflow
         .trigger
         .as_ref()
         .and_then(|trigger| trigger.kind.as_ref())
+}
+
+fn definition_repository(pool: &sqlx::PgPool) -> ReadOnlyRepositoryBundle {
+    ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone())
 }
 
 /// Inserts a workflow row in the same shape the register handler writes —
@@ -79,7 +83,7 @@ async fn empty_when_table_has_no_rows() -> Result<(), Box<dyn std::error::Error>
         .await?;
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
 
-    let workflows = list_workflow_defs(&pool).await?;
+    let workflows = definition_repository(&pool).list_definitions().await?;
     assert!(workflows.is_empty(), "fresh DB should yield no workflows");
     Ok(())
 }
@@ -108,14 +112,14 @@ async fn returns_inserted_rows_rehydrated_through_jsonb() -> Result<(), Box<dyn 
     insert_workflow(&pool, &w1).await;
     insert_workflow(&pool, &w2).await;
 
-    let rows = list_workflow_defs(&pool).await?;
+    let rows = definition_repository(&pool).list_definitions().await?;
     assert_eq!(rows.len(), 2, "expected two workflow rows");
 
     // Round-trip: every field that was set must come back intact through the
     // JSONB column as the published proto definition message. The order is
     // `inserted_at DESC`, but with sub-millisecond inserts the relative order
     // can race; assert presence by id instead.
-    let by_id: std::collections::HashMap<String, &WorkflowListRow> =
+    let by_id: std::collections::HashMap<String, &DefinitionListRow> =
         rows.iter().map(|r| (r.workflow.id.clone(), r)).collect();
     let r1 = by_id.get(&w1.id).expect("w1 missing from rehydrated set");
     assert_eq!(r1.workflow.name, "alpha");
@@ -133,9 +137,8 @@ async fn returns_inserted_rows_rehydrated_through_jsonb() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// Inserts a single `(id, version)` row with an explicit `status` and
-/// `inserted_at` so version-ordering assertions are deterministic (no reliance
-/// on sub-millisecond insert races).
+/// Inserts a single `(id, version)` row with an explicit timestamp so the test
+/// can prove version reads do not depend on insertion-time ordering.
 async fn insert_version(
     pool: &sqlx::PgPool,
     id: Uuid,
@@ -174,10 +177,9 @@ async fn insert_version(
     .expect("insert versioned workflow row");
 }
 
-/// DC-0014 version/build semantics: a workflow with several `(id, version)`
-/// rows collapses to exactly one list row; `build_version` is the latest-
-/// inserted row's version (no semver comparison — ordering is `inserted_at`),
-/// and `version` (live) is the latest-inserted `Ready`/`Submitted` row.
+/// A workflow with several `(id, version)` rows collapses to one list row.
+/// `build_version` is the highest explicit version, and `live_version` is the
+/// highest `Ready`/`Submitted` version, regardless of insertion timestamps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collapses_versions_and_picks_live_and_build_versions(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -197,24 +199,21 @@ async fn collapses_versions_and_picks_live_and_build_versions(
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
 
     let id = Uuid::new_v4();
-    // Non-monotonic semver strings, but strictly increasing inserted_at. The
-    // latest-inserted row (0.2.0) is mid-build; the latest *live* row is 0.3.0.
+    // Timestamps intentionally disagree with version order. Explicit version
+    // remains the stable ordering key for both latest and latest-live rows.
     insert_version(&pool, id, "svc", 1, "Ready", "2026-01-01T00:00:00Z").await;
     insert_version(&pool, id, "svc", 3, "Ready", "2026-01-02T00:00:00Z").await;
     insert_version(&pool, id, "svc", 2, "Building", "2026-01-03T00:00:00Z").await;
 
-    let rows = list_workflow_defs(&pool).await?;
+    let rows = definition_repository(&pool).list_definitions().await?;
     assert_eq!(rows.len(), 1, "three versions collapse to exactly one row");
     let row = &rows[0];
-    assert_eq!(row.build_version, 2, "build_version is latest-inserted");
-    assert_eq!(
-        row.build_status, "Building",
-        "build_status is latest-inserted"
-    );
+    assert_eq!(row.build_version, 3, "highest explicit version is current");
+    assert_eq!(row.build_status, "Ready", "status belongs to version 3");
     assert_eq!(
         row.live_version,
         Some(3),
-        "live version is latest-inserted Ready row, not the newer Building one"
+        "highest Ready version wins regardless of insertion timestamp"
     );
     Ok(())
 }
@@ -242,7 +241,7 @@ async fn submitted_row_yields_a_live_version() -> Result<(), Box<dyn std::error:
     let id = Uuid::new_v4();
     insert_version(&pool, id, "live", 1, "Submitted", "2026-01-01T00:00:00Z").await;
 
-    let rows = list_workflow_defs(&pool).await?;
+    let rows = definition_repository(&pool).list_definitions().await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].live_version,
@@ -296,7 +295,7 @@ async fn completed_run_counts_count_terminal_only() -> Result<(), Box<dyn std::e
     insert_instance(&pool, nonterminal_wf, "InProgress").await;
     insert_instance(&pool, nonterminal_wf, "Scheduled").await;
 
-    let counts = completed_run_counts(&pool).await?;
+    let counts = definition_repository(&pool).completed_run_counts().await?;
     assert_eq!(
         counts.get(&terminal_wf),
         Some(&3),

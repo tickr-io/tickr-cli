@@ -17,7 +17,8 @@ mod common;
 
 use sqlx::PgPool;
 use std::collections::HashSet;
-use tickr_conductor::system_tasks::compaction_receiver::audit_patch_settlement;
+use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::patch_repository::PatchLifecycleStatus;
 use uuid::Uuid;
 
 async fn start_pg() -> Option<(common::DbGuard, sqlx::PgPool)> {
@@ -42,16 +43,6 @@ async fn seed_ledger_row(pool: &PgPool, instance_id: Uuid, patch_key: Uuid, stat
     .expect("seed workflow_patches row");
 }
 
-async fn discrepancy_count(pool: &PgPool, instance_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM workflow_patch_discrepancies WHERE workflow_instance_id = $1",
-    )
-    .bind(instance_id)
-    .fetch_one(pool)
-    .await
-    .expect("count discrepancy rows")
-}
-
 /// All ledger patches settled cleanly → zero discrepancy records. An `Applied`
 /// patch present in the applied-patch log and a decided `Rejected` patch both
 /// settle without a terminal-time gap, so neither is flagged.
@@ -60,6 +51,7 @@ async fn fully_settled_instance_records_no_discrepancy() {
     let Some((_container, pool)) = start_pg().await else {
         return;
     };
+    let repository = WriterRepositoryBundle::from_postgres_pool(pool.clone());
     let instance_id = Uuid::new_v4();
     let applied_key = Uuid::new_v4();
     let rejected_key = Uuid::new_v4();
@@ -71,12 +63,20 @@ async fn fully_settled_instance_records_no_discrepancy() {
     // patch is legitimately absent from it.
     let applied: HashSet<Uuid> = [applied_key].into_iter().collect();
 
-    let recorded = audit_patch_settlement(&pool, instance_id, &applied)
+    let recorded = repository
+        .audit_patch_settlement(instance_id, &applied)
         .await
         .expect("audit runs");
 
-    assert_eq!(recorded, 0, "no discrepancies for a fully-settled instance");
-    assert_eq!(discrepancy_count(&pool, instance_id).await, 0);
+    assert!(
+        recorded.is_empty(),
+        "no discrepancies for a fully-settled instance"
+    );
+    assert!(repository
+        .patch_settlement_discrepancies(instance_id)
+        .await
+        .expect("read discrepancies")
+        .is_empty());
 }
 
 /// A patch left unsettled (`Submitted`) at terminal compaction → exactly one
@@ -87,6 +87,7 @@ async fn unsettled_patch_records_exactly_one_discrepancy() {
     let Some((_container, pool)) = start_pg().await else {
         return;
     };
+    let repository = WriterRepositoryBundle::from_postgres_pool(pool.clone());
     let instance_id = Uuid::new_v4();
     let unsettled_key = Uuid::new_v4();
 
@@ -95,27 +96,37 @@ async fn unsettled_patch_records_exactly_one_discrepancy() {
     // Applied-patch log is empty — the patch never reached an outcome.
     let applied: HashSet<Uuid> = HashSet::new();
 
-    let recorded = audit_patch_settlement(&pool, instance_id, &applied)
+    let recorded = repository
+        .audit_patch_settlement(instance_id, &applied)
         .await
         .expect("audit runs");
-    assert_eq!(recorded, 1, "the unsettled patch is the sole discrepancy");
-    assert_eq!(discrepancy_count(&pool, instance_id).await, 1);
-
-    let status: String = sqlx::query_scalar(
-        "SELECT ledger_status FROM workflow_patch_discrepancies
-          WHERE workflow_instance_id = $1 AND patch_key = $2",
-    )
-    .bind(instance_id)
-    .bind(unsettled_key)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch discrepancy row");
-    assert_eq!(status, "Submitted");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the unsettled patch is the sole discrepancy"
+    );
+    let discrepancies = repository
+        .patch_settlement_discrepancies(instance_id)
+        .await
+        .expect("read discrepancies");
+    assert_eq!(discrepancies.len(), 1);
+    assert_eq!(
+        discrepancies[0].ledger_status,
+        PatchLifecycleStatus::Submitted
+    );
 
     // Idempotent under redelivery: a second audit pass upserts, not duplicates.
-    let recorded_again = audit_patch_settlement(&pool, instance_id, &applied)
+    let recorded_again = repository
+        .audit_patch_settlement(instance_id, &applied)
         .await
         .expect("audit re-runs");
-    assert_eq!(recorded_again, 1);
-    assert_eq!(discrepancy_count(&pool, instance_id).await, 1);
+    assert_eq!(recorded_again.len(), 1);
+    assert_eq!(
+        repository
+            .patch_settlement_discrepancies(instance_id)
+            .await
+            .expect("read discrepancies")
+            .len(),
+        1
+    );
 }

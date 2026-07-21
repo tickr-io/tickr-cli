@@ -4,9 +4,8 @@
 //! finalizer when a workflow flips to `Ready` so external publishers
 //! don't see ghost subscribers during a deploy window.
 //!
-//! The index is in-memory only; the authoritative source is the
-//! conductor's `workflows` Postgres table. On startup the conductor
-//! rebuilds the index by scanning that table for rows at
+//! The index is in-memory only; the selected definition repository is
+//! authoritative. On startup the Conductor rebuilds the index from rows at
 //! `status IN ('Ready', 'Submitted')`.
 //!
 //! Pure data structure: register / unregister / lookup. No I/O. The

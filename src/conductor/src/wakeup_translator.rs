@@ -5,7 +5,7 @@
 //! The translator looks the name up in the subscription index, evaluates
 //! each subscriber's optional JSONPath predicate against the payload,
 //! extracts the subscriber's merged captures, writes those captures to
-//! the `signal_captures` archive (Postgres) + the per-tenant `ctx-<ns>`
+//! the selected `signal_captures` repository + the per-tenant `ctx-<ns>`
 //! NATS KV bucket, then synthesizes one `Signal::Trigger { source =
 //! TriggerSource::Wakeup { name } }` per subscriber. The server's wheel
 //! materializes one instance per emitted Trigger, each with
@@ -23,8 +23,8 @@
 use anyhow::{anyhow, Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
 use serde_json::Value;
-use sqlx::PgPool;
 use tickr_ctx::envelope::SignalSource;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::signal as sp;
 use uuid::Uuid;
 
@@ -112,7 +112,7 @@ impl WakeupRelaySender for DefaultRelaySender {
 /// from `GateIndex::new()` in tests so concurrent test runs don't
 /// stomp on each other.
 pub async fn process_wakeup(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     sender: &dyn WakeupRelaySender,
     gate_index: &GateIndex,
@@ -189,9 +189,15 @@ pub async fn process_wakeup(
         if !predicate_matches(&entry, &payload_value) {
             continue;
         }
-        if let Err(e) =
-            persist_subscriber_captures(pool, nats, signal_id, &req.name, &entry, &payload_value)
-                .await
+        if let Err(e) = persist_subscriber_captures(
+            repositories,
+            nats,
+            signal_id,
+            &req.name,
+            &entry,
+            &payload_value,
+        )
+        .await
         {
             // First-writer-wins on shared signal_id is the known
             // footgun; log and continue rather than fail the whole
@@ -280,7 +286,7 @@ pub async fn process_wakeup(
         name: req.name.clone(),
         matched_workflows: matched_workflows as i32,
     };
-    if let Err(e) = crate::signal_wakeups::insert(pool, &audit_row).await {
+    if let Err(e) = crate::signal_wakeups::insert(repositories, &audit_row).await {
         tracing::warn!(
             "wakeup translator: signal_wakeups audit write failed (signal_id={}): {}",
             signal_id,
@@ -304,11 +310,10 @@ fn gate_predicate_matches(entry: &GateEntry, payload: &Value) -> bool {
 
 /// Mirror the subscriber-captures persistence shape for a matched
 /// gate. Writes only NATS KV (the executor's working-set cache via
-/// `tickr-ctx get`) — the Postgres `signal_captures` archive is keyed
-/// on `workflow_id` which the gate-fan-out site doesn't carry; the
+/// `tickr-ctx get`) — the SQL `signal_captures` archive is keyed on
+/// `workflow_id` which the gate-fan-out site doesn't carry; the
 /// gate's recovery path is a re-issued `DispatchPrecondition` from
-/// the server, so the Postgres rehydration channel isn't load-bearing
-/// for gates.
+/// the server, so SQL rehydration isn't load-bearing for gates.
 async fn write_gate_captures(
     nats: &NatsClient,
     signal_id: Uuid,
@@ -352,7 +357,7 @@ fn predicate_matches(entry: &Entry, payload: &Value) -> bool {
 }
 
 async fn persist_subscriber_captures(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     signal_id: Uuid,
     name: &str,
@@ -396,7 +401,14 @@ async fn persist_subscriber_captures(
             .collect();
         // Wakeups resolve no live workflow version, so the version stamp stays
         // NULL on these rows.
-        signal_captures::insert(pool, signal_id, entry.workflow_id, None, &row_envelopes).await?;
+        signal_captures::insert(
+            repositories,
+            signal_id,
+            entry.workflow_id,
+            None,
+            &row_envelopes,
+        )
+        .await?;
         write_captures_to_nats(nats, signal_id, &extracted).await?;
     }
     Ok(())

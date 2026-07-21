@@ -30,6 +30,7 @@ use tickr_conductor::waits_on_signal_lifecycle::{apply_workflow_state, signal_su
 use tickr_conductor::wakeup_translator::{
     process_wakeup, WakeupOutcome, WakeupRelaySender, WakeupRequest,
 };
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::signal as sp;
 use tickr_proto::workflow as wf;
 use tokio::sync::Mutex;
@@ -62,6 +63,9 @@ async fn start_nats() -> Option<(
 
 async fn start_postgres() -> Option<(common::DbGuard, sqlx::PgPool)> {
     common::test_db().await
+}
+fn repositories(pool: &sqlx::PgPool) -> WriterRepositoryBundle {
+    WriterRepositoryBundle::from_postgres_pool(pool.clone())
 }
 
 /// In-process relay sender that buffers what the translator forwards,
@@ -148,7 +152,7 @@ async fn wakeup_with_matching_dispatched_gate_emits_gate_outcome() {
 
     let sender = RecordingSender::default();
     let outcome = process_wakeup(
-        &pool,
+        &repositories(&pool),
         &nats,
         &sender,
         &gate_index,
@@ -214,7 +218,7 @@ async fn wakeup_with_failed_gate_predicate_keeps_entry_and_emits_nothing() {
 
     let sender = RecordingSender::default();
     let outcome = process_wakeup(
-        &pool,
+        &repositories(&pool),
         &nats,
         &sender,
         &gate_index,
@@ -266,7 +270,7 @@ async fn wakeup_with_predicate_filter_only_fires_matching_subscriber() {
     let gate_index = GateIndex::new();
     let sender = RecordingSender::default();
     let outcome = process_wakeup(
-        &pool,
+        &repositories(&pool),
         &nats,
         &sender,
         &gate_index,

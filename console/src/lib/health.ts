@@ -17,31 +17,13 @@
  */
 
 import type { BadgeVariant } from '@/api/normalize';
+import type { components } from '@/api/types.gen';
 
-/** Raw per-component status as the endpoint serializes it (lowercase). */
-export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
-
-/** One row of the endpoint's response: observed status, a human detail, and the
- * detection window describing how quickly a red row would have flipped. */
-export interface ComponentHealth {
-  status: HealthStatus;
-  detail: string;
-  detection_window: string;
-}
-
-/** The typed body of `GET /api/health` — one `{status, detail, detection_window}`
- * row per component plus one global `checked_at`. Not in the generated OpenAPI
- * types (the endpoint is hand-rolled in the `api` crate), so it is declared here
- * and fetched directly. */
-export interface HealthResponse {
-  checked_at: string;
-  api: ComponentHealth;
-  postgres: ComponentHealth;
-  nats_kv: ComponentHealth;
-  executors: ComponentHealth;
-  conductor: ComponentHealth;
-  control_plane: ComponentHealth;
-}
+/** Health wire types come from the generated OpenAPI contract. */
+export type HealthStatus = components['schemas']['ComponentStatus'];
+export type ComponentHealth = components['schemas']['ComponentHealth'];
+export type DataPlaneSqlHealth = components['schemas']['DataPlaneSqlHealth'];
+export type HealthResponse = components['schemas']['HealthResponse'];
 
 /** The three page sections, in the order they mirror the topology. */
 export type HealthSection = 'api' | 'data' | 'control';
@@ -52,7 +34,7 @@ export type RowKey =
   | 'conductor'
   | 'nats_kv'
   | 'executors'
-  | 'postgres'
+  | 'data_plane_sql'
   | 'control_plane';
 
 export interface RowSpec {
@@ -64,16 +46,16 @@ export interface RowSpec {
 
 /**
  * Rows in render order: **API** → **Data plane** (Conductor, NATS JetStream KV,
- * Executors, Postgres) → **Control plane** (one rollup). The Executors entry is
- * a single **pool** row — its detail is the endpoint's *"N alive · X/Y slots"*,
- * never per-executor rows.
+ * Executors, selected SQL repository) → **Control plane** (one rollup). The
+ * Executors entry is a single **pool** row — its detail is the endpoint's
+ * *"N alive · X/Y slots"*, never per-executor rows.
  */
 export const HEALTH_ROWS: readonly RowSpec[] = [
   { key: 'api', section: 'api', name: 'API gateway' },
   { key: 'conductor', section: 'data', name: 'Conductor' },
   { key: 'nats_kv', section: 'data', name: 'NATS JetStream KV' },
   { key: 'executors', section: 'data', name: 'Executors' },
-  { key: 'postgres', section: 'data', name: 'Postgres' },
+  { key: 'data_plane_sql', section: 'data', name: 'SQL repository' },
   { key: 'control_plane', section: 'control', name: 'Control plane' },
 ];
 
@@ -114,10 +96,11 @@ export type HealthReading =
   | { ok: true; response: HealthResponse }
   | { ok: false };
 
-/** A row as displayed: the (debounced) status and its detail text. */
+/** A row as displayed. SQL implementation metadata affects only its label. */
 export interface DisplayRow {
   status: HealthStatus;
   detail: string;
+  implementation?: DataPlaneSqlHealth['implementation'];
 }
 
 export type HealthDisplay = Record<RowKey, DisplayRow>;
@@ -136,6 +119,19 @@ export function initialHealthState(): HealthState {
   return { display: null, pending: {} };
 }
 
+/** Resolve row copy. Backend selection never changes status behavior. */
+export function healthRowName(spec: RowSpec, row: DisplayRow): string {
+  if (spec.key !== 'data_plane_sql') return spec.name;
+  switch (row.implementation) {
+    case 'postgres':
+      return 'Postgres';
+    case 'sqlite':
+      return 'SQLite';
+    default:
+      return spec.name;
+  }
+}
+
 /**
  * The raw effective rows for one reading, cascade applied but NOT yet debounced.
  * Unreachable ⇒ the API row is unhealthy and every row below cascades to
@@ -151,21 +147,26 @@ function rawRows(reading: HealthReading): HealthDisplay {
       conductor: down,
       nats_kv: down,
       executors: down,
-      postgres: down,
+      data_plane_sql: down,
       control_plane: down,
     };
   }
   const r = reading.response;
   const api: DisplayRow = { status: r.api.status, detail: r.api.detail };
   const cascade = api.status === 'unhealthy';
-  const row = (c: ComponentHealth): DisplayRow =>
-    cascade ? { status: 'unhealthy', detail: 'API unhealthy — cannot verify' } : { status: c.status, detail: c.detail };
+  const row = (
+    component: ComponentHealth,
+    implementation?: DataPlaneSqlHealth['implementation'],
+  ): DisplayRow =>
+    cascade
+      ? { status: 'unhealthy', detail: 'API unhealthy — cannot verify', implementation }
+      : { status: component.status, detail: component.detail, implementation };
   return {
     api,
     conductor: row(r.conductor),
     nats_kv: row(r.nats_kv),
     executors: row(r.executors),
-    postgres: row(r.postgres),
+    data_plane_sql: row(r.data_plane_sql, r.data_plane_sql.implementation),
     control_plane: row(r.control_plane),
   };
 }
