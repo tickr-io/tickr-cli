@@ -23,10 +23,10 @@ use anyhow::{Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
 use futures::StreamExt;
 use serde_json::Value;
-use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tickr_ctx::envelope::{Envelope, Producer};
 use tickr_ctx::scope::sanitize_segment;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::task as tc;
 use tickr_proto::workflow::{RoutingValue, RoutingVarDecl};
 use uuid::Uuid;
@@ -141,7 +141,7 @@ pub fn stamp_routing_variables(
 /// loudly and the un-enriched event forwards — a gate over the variable then
 /// stays unevaluable rather than the task completion being dropped.
 pub async fn enrich_completed_task_event(
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     event: &mut tc::TaskEvent,
 ) -> Result<(), EnrichmentError> {
@@ -159,7 +159,7 @@ pub async fn enrich_completed_task_event(
     let task_instance_id =
         Uuid::parse_str(&event.task_instance_id).context("task event task_instance_id")?;
 
-    let declared = load_declared_specs(pg_pool, task_id).await?;
+    let declared = load_declared_specs(repositories, task_id).await?;
     if declared.is_empty() {
         // The task legitimately declares no routing variables → nothing to
         // enrich; the bare event forwards unchanged.
@@ -190,21 +190,18 @@ pub async fn enrich_completed_task_event(
 /// are never deleted) and is a [`EnrichmentError::LookupIntegrity`] fault the
 /// caller fails closed on.
 async fn load_declared_specs(
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     task_id: Uuid,
 ) -> Result<Vec<RoutingVarDecl>, EnrichmentError> {
-    let row: Option<(Value,)> =
-        sqlx::query_as("SELECT routing_vars FROM task_specs WHERE task_id = $1")
-            .bind(task_id)
-            .fetch_optional(pg_pool)
-            .await
-            .context("read declared routing-variable specs for enrichment")?;
-
-    match row {
-        Some((value,)) => {
-            Ok(serde_json::from_value(value)
-                .context("deserialize declared routing-variable specs")?)
-        }
+    match repositories
+        .task_specification(task_id)
+        .await
+        .map_err(|error| {
+            EnrichmentError::Forwardable(anyhow::anyhow!(
+                "read declared routing-variable specs for enrichment: {error}"
+            ))
+        })? {
+        Some(specs) => Ok(specs),
         None => Err(EnrichmentError::LookupIntegrity { task_id, rows: 0 }),
     }
 }

@@ -94,3 +94,44 @@ pub async fn test_db_pool() -> Option<PgPool> {
     std::mem::forget(guard);
     Some(pool)
 }
+
+/// Backend-specific assertion helper kept in test setup so production Patch
+/// callers never receive a pool, SQL row, query, or storage encoding.
+pub async fn fetch_patch_row(
+    pool: &PgPool,
+    key: Uuid,
+) -> Result<Option<tickr_conductor::patch_pipeline::PatchRow>, sqlx::Error> {
+    type PatchRowTuple = (
+        Uuid,
+        Uuid,
+        Uuid,
+        String,
+        serde_json::Value,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<serde_json::Value>,
+    );
+
+    let row = sqlx::query_as::<_, PatchRowTuple>(
+        "SELECT patch_key, patch_id, workflow_instance_id, status, ops, reason, outcome, applied_version, provenance, operation
+           FROM workflow_patches WHERE patch_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| tickr_conductor::patch_pipeline::PatchRow {
+        patch_key: row.0,
+        patch_id: row.1,
+        workflow_instance_id: row.2,
+        status: row.3,
+        ops: row.4,
+        reason: row.5,
+        outcome: row.6,
+        applied_version: row.7,
+        provenance: tickr_conductor::patch_pipeline::PatchProvenance::from_wire(&row.8),
+        operation: row.9.and_then(|value| serde_json::from_value(value).ok()),
+    }))
+}

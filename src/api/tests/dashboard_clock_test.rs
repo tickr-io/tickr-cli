@@ -1,9 +1,9 @@
 //! Integration test for the API component's day-clock path. Covers the two
 //! data sources the handler merges:
 //!
-//!   - `archive_queries::list_dashboard_instances` — archived runs windowed by
-//!     `scheduled_at`, carrying the instance id, the snapshotted workflow name,
-//!     and the verbatim state.
+//!   - the selected archive repository returns archived runs windowed by
+//!     `scheduled_at`, carrying the instance id, snapshotted Workflow name,
+//!     and verbatim state.
 //!   - `coordinator_client::dashboard_clock` — the live half (per-instance rows).
 //!   - `merge_clock_instances` — dedup-by-id with archive-wins on the
 //!     compaction-window collision.
@@ -18,10 +18,10 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries::list_dashboard_instances;
 use tickr_api::http::coordinator_client::CoordinatorClient;
 use tickr_api::http::dto::ClockInstance;
 use tickr_api::http::live_archive_merge::merge_clock_instances;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
 mod common;
@@ -53,7 +53,8 @@ async fn archive_rows_carry_id_name_and_verbatim_state() -> Result<(), Box<dyn s
         .insert("workflow_name".into(), serde_json::json!("nightly-etl"));
     common::insert_instance(&pool, &blob).await;
 
-    let rows = list_dashboard_instances(&pool, None, None).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let rows = repository.archived_dashboard_instances(None, None).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, inst, "row carries the instance id for dedup");
     assert_eq!(rows[0].workflow_id, wf);

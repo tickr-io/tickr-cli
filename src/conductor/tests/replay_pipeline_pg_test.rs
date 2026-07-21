@@ -7,21 +7,26 @@
 
 mod common;
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use anyhow::Result;
+use chrono::Utc;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use tickr_conductor::replay_pipeline::{
-    fetch_row, process_replay, reconcile_orphan_replay_rows, replay_instance_id, ReplayError,
-    ReplayIngress, ReplayRelaySender, ReplayRequest, STATUS_MATERIALIZING, STATUS_RELEASED,
-    STATUS_VERSION_UNRESOLVABLE,
+    fetch_row, process_replay, reconcile_orphan_replay_rows, redrive_unsettled, replay_instance_id,
+    ReplayError, ReplayIngress, ReplayRelaySender, ReplayRequest, STATUS_MATERIALIZING,
+    STATUS_RELEASED, STATUS_VERSION_UNRESOLVABLE,
 };
 use tickr_conductor::replay_rehydration::RehydrationPlan;
 use tickr_ctx::envelope::{Envelope, Producer};
 use tickr_ctx::scope::sanitize_segment;
+use tickr_migrations::backend::{RepositoryErrorKind, WriterRepositoryBundle};
+use tickr_migrations::replay_repository::{
+    ReplayLifecycleStatus, ReplayRedriveCandidate, ReplaySettlementOutcome,
+};
 use tickr_proto::archive as ap;
 use tickr_proto::codec::definition::definition_proto_to_json;
 use tickr_proto::instance as ip;
@@ -31,6 +36,10 @@ use tickr_proto::workflow as wf;
 
 async fn start_pg() -> Option<(common::DbGuard, PgPool)> {
     common::test_db().await
+}
+
+fn repository(pool: &PgPool) -> WriterRepositoryBundle {
+    WriterRepositoryBundle::from_postgres_pool(pool.clone())
 }
 
 /// Recording sender: buffers every relayed Signal and re-hydration call so a
@@ -89,6 +98,34 @@ impl ReplayRelaySender for FailingReplaySender {
 
     async fn rehydrate(&self, _replay_run_id: Uuid, _plan: &RehydrationPlan) -> Result<()> {
         Err(anyhow::anyhow!("nats down"))
+    }
+}
+
+struct HydrationFailingSender {
+    signals: Mutex<Vec<sp::Signal>>,
+}
+
+impl HydrationFailingSender {
+    fn new() -> Self {
+        Self {
+            signals: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn signals(&self) -> Vec<sp::Signal> {
+        self.signals.lock().await.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ReplayRelaySender for HydrationFailingSender {
+    async fn send(&self, signal: &sp::Signal) -> Result<()> {
+        self.signals.lock().await.push(signal.clone());
+        Ok(())
+    }
+
+    async fn rehydrate(&self, _replay_run_id: Uuid, _plan: &RehydrationPlan) -> Result<()> {
+        anyhow::bail!("sentinel write failed")
     }
 }
 
@@ -285,9 +322,13 @@ async fn ingress_persists_row_with_seed_sha256_and_drives_release() {
         .expect("insert union archive");
 
     let sender = CapturingReplaySender::new();
-    let outcome = process_replay(&pool, &sender, request(fixture.id, Some("key-1")))
-        .await
-        .expect("ingress");
+    let outcome = process_replay(
+        &repository(&pool),
+        &sender,
+        request(fixture.id, Some("key-1")),
+    )
+    .await
+    .expect("ingress");
     let replay_id = match outcome {
         ReplayIngress::Accepted {
             replay_instance_id, ..
@@ -295,7 +336,7 @@ async fn ingress_persists_row_with_seed_sha256_and_drives_release() {
         other => panic!("expected Accepted, got {other:?}"),
     };
 
-    let row = fetch_row(&pool, replay_id)
+    let row = fetch_row(&repository(&pool), replay_id)
         .await
         .expect("read row")
         .expect("row present");
@@ -324,7 +365,7 @@ async fn secondary_union_projection_replays_through_the_archive_read() {
 
     assert!(matches!(
         process_replay(
-            &pool,
+            &repository(&pool),
             &CapturingReplaySender::new(),
             request(fixture.id, Some("secondary"))
         )
@@ -339,14 +380,17 @@ async fn blob_absent_source_parks_version_unresolvable() {
         return;
     };
     let sender = CapturingReplaySender::new();
-    let outcome = process_replay(&pool, &sender, request(Uuid::new_v4(), None))
+    let outcome = process_replay(&repository(&pool), &sender, request(Uuid::new_v4(), None))
         .await
         .expect("ingress");
     let replay_id = match outcome {
         ReplayIngress::VersionUnresolvable { replay_instance_id } => replay_instance_id,
         other => panic!("expected VersionUnresolvable, got {other:?}"),
     };
-    let row = fetch_row(&pool, replay_id).await.unwrap().unwrap();
+    let row = fetch_row(&repository(&pool), replay_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.status, STATUS_VERSION_UNRESOLVABLE);
     assert!(row.seed_sha256.is_none());
     assert!(sender.signals().await.is_empty());
@@ -362,18 +406,26 @@ async fn idempotency_collision_returns_existing_replay_id() {
         .await
         .unwrap();
     let sender = CapturingReplaySender::new();
-    let first = process_replay(&pool, &sender, request(fixture.id, Some("dup")))
-        .await
-        .unwrap();
+    let first = process_replay(
+        &repository(&pool),
+        &sender,
+        request(fixture.id, Some("dup")),
+    )
+    .await
+    .unwrap();
     let first_id = match first {
         ReplayIngress::Accepted {
             replay_instance_id, ..
         } => replay_instance_id,
         other => panic!("expected Accepted, got {other:?}"),
     };
-    let second = process_replay(&pool, &sender, request(fixture.id, Some("dup")))
-        .await
-        .unwrap();
+    let second = process_replay(
+        &repository(&pool),
+        &sender,
+        request(fixture.id, Some("dup")),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         second,
         ReplayIngress::Deduplicated {
@@ -393,10 +445,10 @@ async fn omitted_key_mints_fresh_replay_every_post() {
         .unwrap();
     let sender = CapturingReplaySender::new();
     let ids = [
-        process_replay(&pool, &sender, request(fixture.id, None))
+        process_replay(&repository(&pool), &sender, request(fixture.id, None))
             .await
             .unwrap(),
-        process_replay(&pool, &sender, request(fixture.id, None))
+        process_replay(&repository(&pool), &sender, request(fixture.id, None))
             .await
             .unwrap(),
     ]
@@ -419,7 +471,7 @@ async fn boot_reconcile_redrives_unsettled_row() {
         .await
         .unwrap();
     let outcome = process_replay(
-        &pool,
+        &repository(&pool),
         &FailingReplaySender,
         request(fixture.id, Some("retry")),
     )
@@ -431,18 +483,383 @@ async fn boot_reconcile_redrives_unsettled_row() {
         } => replay_instance_id,
         other => panic!("expected Accepted, got {other:?}"),
     };
-    let row = fetch_row(&pool, replay_id).await.unwrap().unwrap();
+    let row = fetch_row(&repository(&pool), replay_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.status, STATUS_MATERIALIZING);
     assert_eq!(replay_id, replay_instance_id(fixture.id, row.signal_id));
 
     let sender = CapturingReplaySender::new();
     assert_eq!(
-        reconcile_orphan_replay_rows(&pool, &sender).await.unwrap(),
+        reconcile_orphan_replay_rows(&repository(&pool), &sender)
+            .await
+            .unwrap(),
         1
     );
     assert_eq!(
-        fetch_row(&pool, replay_id).await.unwrap().unwrap().status,
+        fetch_row(&repository(&pool), replay_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         STATUS_RELEASED
+    );
+}
+
+#[tokio::test]
+async fn recovery_scan_is_stable_excludes_terminal_rows_and_isolates_corruption() {
+    let Some((_guard, pool)) = start_pg().await else {
+        return;
+    };
+    let fixture = terminal_fixture("ordered-recovery", 0);
+    insert_archived_run(&pool, &fixture, serde_json::json!([]))
+        .await
+        .unwrap();
+    let repositories = repository(&pool);
+
+    let mut interrupted = Vec::new();
+    for key in ["healthy-a", "corrupt", "healthy-b"] {
+        let outcome = process_replay(
+            &repositories,
+            &FailingReplaySender,
+            request(fixture.id, Some(key)),
+        )
+        .await
+        .unwrap();
+        interrupted.push(match outcome {
+            ReplayIngress::Accepted {
+                replay_instance_id, ..
+            } => replay_instance_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        });
+    }
+    let terminal = match process_replay(
+        &repositories,
+        &CapturingReplaySender::new(),
+        request(fixture.id, Some("already-terminal")),
+    )
+    .await
+    .unwrap()
+    {
+        ReplayIngress::Accepted {
+            replay_instance_id, ..
+        } => replay_instance_id,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+
+    sqlx::query(
+        "UPDATE workflow_replays SET updated_at = '2026-07-21T00:00:00Z'::timestamptz \
+         WHERE source_instance_id = $1",
+    )
+    .bind(fixture.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workflow_replays SET resume_from = '{}'::jsonb WHERE replay_instance_id = $1",
+    )
+    .bind(interrupted[1])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let selected = repositories
+        .unsettled_replays_before(Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 3, "terminal rows are excluded by the scan");
+    let mut selected_ids = Vec::new();
+    for candidate in selected {
+        match candidate {
+            ReplayRedriveCandidate::Ready(row) => selected_ids.push(row.replay_instance_id),
+            ReplayRedriveCandidate::Corrupt { identity, error } => {
+                assert_eq!(error.kind(), RepositoryErrorKind::CorruptStoredValue);
+                selected_ids.push(Uuid::parse_str(&identity).unwrap());
+            }
+        }
+    }
+    let mut expected = interrupted.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        selected_ids, expected,
+        "equal-age recovery candidates use the replay identity tie-break"
+    );
+
+    let sender = CapturingReplaySender::new();
+    assert_eq!(
+        redrive_unsettled(&repositories, &sender, Duration::ZERO)
+            .await
+            .unwrap(),
+        2,
+        "the corrupt row does not block healthy recovery rows"
+    );
+    assert_eq!(sender.signals().await.len(), 4);
+    assert_eq!(sender.rehydration_count().await, 2);
+    for replay_id in [interrupted[0], interrupted[2], terminal] {
+        assert_eq!(
+            fetch_row(&repositories, replay_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_RELEASED
+        );
+    }
+    assert_eq!(
+        fetch_row(&repositories, interrupted[1])
+            .await
+            .unwrap_err()
+            .kind(),
+        RepositoryErrorKind::CorruptStoredValue
+    );
+    assert_eq!(
+        redrive_unsettled(&repositories, &sender, Duration::ZERO)
+            .await
+            .unwrap(),
+        0,
+        "terminal rows remain excluded on repeated steady-state passes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_steady_state_drives_converge_on_one_terminal_replay() {
+    let Some((_guard, pool)) = start_pg().await else {
+        return;
+    };
+    let fixture = terminal_fixture("concurrent-drive", 0);
+    insert_archived_run(&pool, &fixture, serde_json::json!([]))
+        .await
+        .unwrap();
+    let repositories = repository(&pool);
+    let replay_id = match process_replay(
+        &repositories,
+        &FailingReplaySender,
+        request(fixture.id, Some("concurrent-drive")),
+    )
+    .await
+    .unwrap()
+    {
+        ReplayIngress::Accepted {
+            replay_instance_id, ..
+        } => replay_instance_id,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let sender = CapturingReplaySender::new();
+
+    let (left, right) = tokio::join!(
+        redrive_unsettled(&repositories, &sender, Duration::ZERO),
+        redrive_unsettled(&repositories, &sender, Duration::ZERO)
+    );
+    assert!(left.unwrap() + right.unwrap() >= 1);
+    assert_eq!(
+        fetch_row(&repositories, replay_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RELEASED
+    );
+    assert_eq!(
+        repositories
+            .settle_replay_released(replay_id)
+            .await
+            .unwrap(),
+        ReplaySettlementOutcome::AlreadySettled(ReplayLifecycleStatus::Released)
+    );
+    assert_eq!(
+        redrive_unsettled(&repositories, &sender, Duration::ZERO)
+            .await
+            .unwrap(),
+        0,
+        "the terminal replay is not selected again"
+    );
+}
+
+#[tokio::test]
+async fn committed_drive_decisions_survive_hydration_and_witness_failures() {
+    let Some((_guard, pool)) = start_pg().await else {
+        return;
+    };
+    let fixture = terminal_fixture("durable-drive", 0);
+    insert_archived_run(&pool, &fixture, serde_json::json!([]))
+        .await
+        .unwrap();
+    let repositories = repository(&pool);
+    let failing = HydrationFailingSender::new();
+    let outcome = process_replay(
+        &repositories,
+        &failing,
+        ReplayRequest {
+            resume_from: Some(vec![fixture.b]),
+            ..request(fixture.id, Some("durable-drive"))
+        },
+    )
+    .await
+    .unwrap();
+    let replay_id = match outcome {
+        ReplayIngress::Accepted {
+            replay_instance_id, ..
+        } => replay_instance_id,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let row = fetch_row(&repositories, replay_id).await.unwrap().unwrap();
+    assert_eq!(row.status, STATUS_MATERIALIZING);
+    assert_eq!(row.resume_from, vec![fixture.b]);
+    assert!(!row.pre_grounded.is_empty());
+    assert_eq!(replay_id, replay_instance_id(fixture.id, row.signal_id));
+    let witness = row.seed_sha256.clone().expect("seed witness");
+    assert_eq!(
+        failing.signals().await.len(),
+        1,
+        "hydration failure must not send the release Resume"
+    );
+
+    sqlx::query(
+        "UPDATE workflow_replays SET seed_sha256 = 'mismatched' WHERE replay_instance_id = $1",
+    )
+    .bind(replay_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let blocked = CapturingReplaySender::new();
+    assert_eq!(
+        reconcile_orphan_replay_rows(&repositories, &blocked)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        blocked.signals().await.is_empty(),
+        "a witness mismatch fails before relay"
+    );
+    assert_eq!(
+        fetch_row(&repositories, replay_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_MATERIALIZING
+    );
+
+    sqlx::query("UPDATE workflow_replays SET seed_sha256 = $2 WHERE replay_instance_id = $1")
+        .bind(replay_id)
+        .bind(witness)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recovered = CapturingReplaySender::new();
+    assert_eq!(
+        reconcile_orphan_replay_rows(&repositories, &recovered)
+            .await
+            .unwrap(),
+        1
+    );
+    let signals = recovered.signals().await;
+    assert_eq!(signals.len(), 2, "recovery relays Trigger then Resume");
+    let Some(sp::signal::Variant::Trigger(trigger)) = signals[0].variant.as_ref() else {
+        panic!("first recovery signal must be Trigger");
+    };
+    let Some(sp::trigger_source::Source::Replay(provenance)) = trigger
+        .source
+        .as_ref()
+        .and_then(|source| source.source.as_ref())
+    else {
+        panic!("trigger must carry replay provenance");
+    };
+    assert_eq!(provenance.resume_from, vec![fixture.b.to_string()]);
+    assert_eq!(
+        trigger.replay.as_ref().unwrap().replay_instance_id,
+        replay_id.to_string()
+    );
+    assert_eq!(
+        fetch_row(&repositories, replay_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RELEASED
+    );
+}
+
+#[tokio::test]
+async fn terminal_settlement_is_conditional_and_race_safe() {
+    let Some((_guard, pool)) = start_pg().await else {
+        return;
+    };
+    let fixture = terminal_fixture("settlement-race", 0);
+    insert_archived_run(&pool, &fixture, serde_json::json!([]))
+        .await
+        .unwrap();
+    let repositories = repository(&pool);
+    let outcome = process_replay(
+        &repositories,
+        &FailingReplaySender,
+        request(fixture.id, Some("settlement-race")),
+    )
+    .await
+    .unwrap();
+    let replay_id = match outcome {
+        ReplayIngress::Accepted {
+            replay_instance_id, ..
+        } => replay_instance_id,
+        other => panic!("expected Accepted, got {other:?}"),
+    };
+    let (left, right) = tokio::join!(
+        repositories.settle_replay_released(replay_id),
+        repositories.settle_replay_released(replay_id)
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ReplaySettlementOutcome::Released))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                ReplaySettlementOutcome::AlreadySettled(ReplayLifecycleStatus::Released)
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        repositories
+            .settle_replay_released(Uuid::new_v4())
+            .await
+            .unwrap(),
+        ReplaySettlementOutcome::Absent
+    );
+
+    let parked_id = match process_replay(
+        &repositories,
+        &CapturingReplaySender::new(),
+        request(Uuid::new_v4(), Some("late-park")),
+    )
+    .await
+    .unwrap()
+    {
+        ReplayIngress::VersionUnresolvable { replay_instance_id } => replay_instance_id,
+        other => panic!("expected VersionUnresolvable, got {other:?}"),
+    };
+    assert_eq!(
+        repositories
+            .settle_replay_released(parked_id)
+            .await
+            .unwrap(),
+        ReplaySettlementOutcome::AlreadySettled(ReplayLifecycleStatus::VersionUnresolvable)
+    );
+    assert_eq!(
+        fetch_row(&repositories, parked_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_VERSION_UNRESOLVABLE
     );
 }
 
@@ -531,7 +948,7 @@ async fn inputs_shadows_declared_capture_and_audits_name_only() {
 
     let sender = CapturingReplaySender::new();
     let outcome = process_replay(
-        &pool,
+        &repository(&pool),
         &sender,
         ReplayRequest {
             inputs: shadow("api_credential", serde_json::json!("fresh-token")),
@@ -547,7 +964,7 @@ async fn inputs_shadows_declared_capture_and_audits_name_only() {
         other => panic!("expected Accepted, got {other:?}"),
     };
     assert_eq!(
-        fetch_row(&pool, replay_id)
+        fetch_row(&repository(&pool), replay_id)
             .await
             .unwrap()
             .unwrap()
@@ -585,7 +1002,7 @@ async fn inputs_undeclared_or_task_produced_keys_typed_reject() {
 
     for (key, expected_task_output) in [("not_a_capture", false), ("build_digest", true)] {
         let error = process_replay(
-            &pool,
+            &repository(&pool),
             &sender,
             ReplayRequest {
                 inputs: shadow(key, serde_json::json!("forged")),
@@ -631,7 +1048,7 @@ async fn shadow_validates_against_archived_version_not_latest() {
 
     assert!(matches!(
         process_replay(
-            &pool,
+            &repository(&pool),
             &sender,
             ReplayRequest {
                 inputs: shadow("cred", serde_json::json!("refreshed")),
@@ -643,7 +1060,7 @@ async fn shadow_validates_against_archived_version_not_latest() {
     ));
     assert!(matches!(
         process_replay(
-            &pool,
+            &repository(&pool),
             &sender,
             ReplayRequest {
                 inputs: shadow("rotated", serde_json::json!("x")),
@@ -741,7 +1158,12 @@ async fn chained_replay_rehydrates_through_union_archive_rows() {
 
     let sender = CapturingReplaySender::new();
     assert!(matches!(
-        process_replay(&pool, &sender, request(child.id, Some("chain"))).await,
+        process_replay(
+            &repository(&pool),
+            &sender,
+            request(child.id, Some("chain")),
+        )
+        .await,
         Ok(ReplayIngress::Accepted { .. })
     ));
     let plan = &sender.rehydrations().await[0].1;

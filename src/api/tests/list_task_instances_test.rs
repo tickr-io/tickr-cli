@@ -1,7 +1,7 @@
 //! Integration test for the API component's merged task-list path:
 //!
-//!   - `archive_queries::list_task_instances` rehydrates the archived task
-//!     projections in their established completion order.
+//!   - The selected read-only repository rehydrates archived Task projections
+//!     in stable completion/UUID order.
 //!   - `coordinator_client::list_task_instances` decodes a coordinator live response
 //!     into the same DTO the API serves.
 //!   - `merge_tasks` combines live + archive with archive-wins-on-collision.
@@ -18,10 +18,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries;
 use tickr_api::http::coordinator_client::{CoordinatorClient, DEFAULT_TIMEOUT};
 use tickr_api::http::dto::TaskInstanceResponse;
 use tickr_api::http::live_archive_merge::merge_tasks;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use tickr_proto::instance as ip;
 use uuid::Uuid;
 
@@ -56,7 +56,8 @@ async fn archive_query_returns_task_projections_in_completion_order(
     let second = snapshot_task(Uuid::new_v4(), Uuid::new_v4(), "load", "Failed");
     insert_archived_task(&pool, wi, wf, &second).await;
 
-    let rows = archive_queries::list_task_instances(&pool, wi).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
+    let rows = repository.archived_task_instances(wi).await?;
     assert_eq!(rows.len(), 2, "both task records must be returned");
     assert_eq!(rows[0].id, first.id, "oldest archived_at first");
     assert_eq!(rows[0].name, "extract");

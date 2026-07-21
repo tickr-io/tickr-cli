@@ -17,6 +17,7 @@
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tickr_migrations::signal_repository::SignalAuditRecord;
 use uuid::Uuid;
 
 /// Stand up an ephemeral Postgres with the conductor's migrations applied.
@@ -44,6 +45,9 @@ async fn pg_pool() -> Option<sqlx::PgPool> {
         .ok()?;
     Some(pool)
 }
+fn repository(pool: &sqlx::PgPool) -> tickr_migrations::backend::ReadOnlyRepositoryBundle {
+    tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wakeup_row_resolves_from_wakeups_table_only() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,16 +65,11 @@ async fn wakeup_row_resolves_from_wakeups_table_only() -> Result<(), Box<dyn std
     .execute(&pool)
     .await?;
 
-    let wakeup = tickr_api::signal_wakeups::read(&pool, sid).await?;
-    let wakeup = wakeup.expect("wakeup row must be returned");
+    let Some(SignalAuditRecord::Wakeup(wakeup)) = repository(&pool).signal_audit(sid).await? else {
+        panic!("wakeup row must be returned");
+    };
     assert_eq!(wakeup.name, "user-paid");
     assert_eq!(wakeup.matched_workflows, 3);
-
-    // Disjoint keyspace: the same id resolves in neither other table.
-    assert!(tickr_api::signal_captures::read(&pool, sid)
-        .await?
-        .is_none());
-    assert!(tickr_api::signal_cancels::read(&pool, sid).await?.is_none());
     Ok(())
 }
 
@@ -92,15 +91,11 @@ async fn cancel_row_resolves_from_cancels_table_only() -> Result<(), Box<dyn std
     .execute(&pool)
     .await?;
 
-    let cancel = tickr_api::signal_cancels::read(&pool, sid).await?;
-    let cancel = cancel.expect("cancel row must be returned");
+    let Some(SignalAuditRecord::Cancel(cancel)) = repository(&pool).signal_audit(sid).await? else {
+        panic!("cancel row must be returned");
+    };
     assert_eq!(cancel.applied_count, 2);
     assert_eq!(cancel.note.as_deref(), Some("operator stop"));
-
-    assert!(tickr_api::signal_wakeups::read(&pool, sid).await?.is_none());
-    assert!(tickr_api::signal_captures::read(&pool, sid)
-        .await?
-        .is_none());
     Ok(())
 }
 
@@ -121,18 +116,17 @@ async fn capture_row_resolves_from_captures_table_only() -> Result<(), Box<dyn s
         .execute(&pool)
         .await?;
 
-    let captures = tickr_api::signal_captures::read(&pool, sid).await?;
-    let captures = captures.expect("captures row must be returned");
+    let Some(SignalAuditRecord::Captures(captures)) = repository(&pool).signal_audit(sid).await?
+    else {
+        panic!("captures row must be returned");
+    };
     assert_eq!(captures.workflow_id, workflow_id);
     assert!(
         captures.materialized_run_id.is_none(),
         "not yet materialized"
     );
     assert!(captures.terminal_at.is_none(), "not yet terminal");
-    assert!(captures.captures.is_empty(), "no named captures");
-
-    assert!(tickr_api::signal_wakeups::read(&pool, sid).await?.is_none());
-    assert!(tickr_api::signal_cancels::read(&pool, sid).await?.is_none());
+    assert!(captures.capture_names().is_empty(), "no named captures");
     Ok(())
 }
 
@@ -143,10 +137,6 @@ async fn unknown_signal_is_absent_from_all_tables() -> Result<(), Box<dyn std::e
     };
 
     let sid = Uuid::new_v4();
-    assert!(tickr_api::signal_wakeups::read(&pool, sid).await?.is_none());
-    assert!(tickr_api::signal_captures::read(&pool, sid)
-        .await?
-        .is_none());
-    assert!(tickr_api::signal_cancels::read(&pool, sid).await?.is_none());
+    assert!(repository(&pool).signal_audit(sid).await?.is_none());
     Ok(())
 }

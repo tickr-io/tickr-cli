@@ -12,8 +12,8 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tickr_proto::tickr_api as api;
@@ -55,18 +55,14 @@ struct TenantInfoResponse {
     workflow_count: i64,
 }
 
-/// Application state shared across handlers. Holds the data-substrate handles
-/// the read endpoints query. The Postgres pool and NATS client are constructed
-/// at boot; subsequent fields (coordinator client, logs resolver) are added by the
-/// slices that introduce the handlers consuming them.
+/// Application state shared across handlers. Every SQL-backed handler receives
+/// only the selected read-only repository operation bundle.
 #[derive(Clone)]
 pub struct AppState {
     // Live log batches + the command-bus transport for write requests. Read by
     // the logs handler and the write handlers.
     nats: Arc<Client>,
-    // Conductor-side Postgres archive. Read by the workflow/instance/signal
-    // handlers.
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
     // HTTP client to the coordinator for live-state subqueries. Separate from
     // any relay so UI query load can't head-of-line block system comms.
     coordinator: Arc<super::coordinator_client::CoordinatorClient>,
@@ -96,9 +92,8 @@ async fn health_handler() -> Json<ReadinessResponse> {
     })
 }
 
-/// Handler for `GET /api/health` — the operator health surface. Wired to app
-/// state (the api pool + shared NATS client) and computes each component row
-/// fresh per request; there is no cached health table, so a "recheck" is
+/// Handler for `GET /api/health` — the operator health surface. The selected
+/// read-only repository owns its SQL probe.
 /// byte-for-byte the same work as any other request. Distinct from the top-level
 /// `/health` readiness probe above.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/health", responses((status = 200, body = super::health::HealthResponse)))]
@@ -107,7 +102,7 @@ async fn api_health_handler(
 ) -> Json<super::health::HealthResponse> {
     Json(
         super::health::build_health_report(
-            &state.pg_pool,
+            &state.repositories,
             &state.nats,
             &state.coordinator,
             state.deadlines.ping,
@@ -123,7 +118,7 @@ async fn api_health_handler(
 /// (`TenantId`), so the two always agree.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/tenant", responses((status = 200, body = TenantInfoResponse), (status = 500)))]
 async fn tenant_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match super::archive_queries::count_workflow_defs(&state.pg_pool).await {
+    match state.repositories.count_definitions().await {
         Ok(workflow_count) => (
             StatusCode::OK,
             Json(TenantInfoResponse {
@@ -149,21 +144,23 @@ async fn tenant_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 /// UI-facing `WorkflowResponse`. Empty list on first start; no 404.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/workflows", responses((status = 200, body = Vec<super::dto::WorkflowResponse>), (status = 500)))]
 async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match super::archive_queries::list_workflow_defs(&state.pg_pool).await {
+    match state.repositories.list_definitions().await {
         Ok(workflows) => {
-            // Resolve every workflow's latest fired-instance state in one batch
-            // (one PG query + one live cluster subquery), then join per row.
+            // Resolve each Workflow's live/archive latest state and terminal
+            // count once, then join those archive fields onto definition rows.
             let ids: Vec<uuid::Uuid> = workflows
                 .iter()
                 .filter_map(|row| uuid::Uuid::parse_str(&row.workflow.id).ok())
                 .collect();
             let mut latest_runs = super::latest_run_resolver::resolve_latest_run_states(
-                &state.pg_pool,
+                &state.repositories,
                 &state.coordinator,
                 &ids,
             )
             .await;
-            let completed_counts = super::archive_queries::completed_run_counts(&state.pg_pool)
+            let completed_counts = state
+                .repositories
+                .completed_run_counts()
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("list_workflows_handler: completed-run count failed: {e}");
@@ -258,7 +255,7 @@ async fn get_workflow_detail_handler(
                     .into_response();
             }
         },
-        None => match super::archive_queries::default_version(&state.pg_pool, wf).await {
+        None => match state.repositories.default_definition_version(wf).await {
             Ok(Some((version, _status))) => version,
             Ok(None) => return workflow_not_found(),
             Err(e) => {
@@ -270,33 +267,33 @@ async fn get_workflow_detail_handler(
 
     // Load the per-version artifacts. A miss here is a 404 whether the id is
     // unknown or the explicit `?version` names a version that never existed.
-    let detail =
-        match super::archive_queries::get_workflow_version(&state.pg_pool, wf, effective_version)
-            .await
-        {
-            Ok(Some(d)) => d,
-            Ok(None) => return workflow_not_found(),
-            Err(e) => {
-                eprintln!("get_workflow_detail_handler: version load failed: {e}");
-                return internal_error("load workflow version");
-            }
-        };
+    let detail = match state
+        .repositories
+        .definition_version(wf, effective_version)
+        .await
+    {
+        Ok(Some(d)) => d,
+        Ok(None) => return workflow_not_found(),
+        Err(e) => {
+            eprintln!("get_workflow_detail_handler: version load failed: {e}");
+            return internal_error("load workflow version");
+        }
+    };
 
-    let available_versions =
-        match super::archive_queries::list_workflow_versions(&state.pg_pool, wf).await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|r| super::dto::AvailableVersion {
-                    version: r.version,
-                    status: r.status,
-                    inserted_at: r.inserted_at.to_rfc3339(),
-                })
-                .collect(),
-            Err(e) => {
-                eprintln!("get_workflow_detail_handler: version list failed: {e}");
-                return internal_error("list workflow versions");
-            }
-        };
+    let available_versions = match state.repositories.list_definition_versions(wf).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| super::dto::AvailableVersion {
+                version: r.version,
+                status: r.status,
+                inserted_at: r.inserted_at.to_rfc3339(),
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("get_workflow_detail_handler: version list failed: {e}");
+            return internal_error("list workflow versions");
+        }
+    };
 
     // Workflow-aggregate scalars — the same resolvers the list handler uses,
     // scoped to this one id. Both degrade soft: a failed live read folds to the
@@ -304,17 +301,22 @@ async fn get_workflow_detail_handler(
     // One resolver call yields the latest fired-instance candidate; the badge
     // reads its state, the calendar's landing year reads its `scheduled_at` —
     // derived from the same pick so they cannot name different instances.
-    let latest_run =
-        super::latest_run_resolver::resolve_latest_runs(&state.pg_pool, &state.coordinator, &[wf])
-            .await
-            .remove(&wf)
-            .flatten();
+    let latest_run = super::latest_run_resolver::resolve_latest_runs(
+        &state.repositories,
+        &state.coordinator,
+        &[wf],
+    )
+    .await
+    .remove(&wf)
+    .flatten();
     let latest_run_at = latest_run
         .as_ref()
         .and_then(|c| c.scheduled_at)
         .map(|dt| dt.to_rfc3339());
     let latest_run_state = latest_run.map(|c| c.state);
-    let completed_runs = super::archive_queries::completed_run_counts(&state.pg_pool)
+    let completed_runs = state
+        .repositories
+        .completed_run_counts()
         .await
         .unwrap_or_else(|e| {
             eprintln!("get_workflow_detail_handler: completed-run count failed: {e}");
@@ -411,14 +413,13 @@ struct DayAcc {
 
 /// Handler for `GET /api/workflows/{id}/calendar?year=YYYY&tz=<IANA>`.
 ///
-/// Per-day instance counts for the Run calendar, bucketed in the client's IANA
-/// timezone: terminal `completed`/`failed` from the PG archive, non-terminal
-/// `in_progress`/`scheduled` from the live source, merged by date. The same
-/// validated tz string threads to both halves so they agree on the bucketing.
+/// Both live and terminal candidates are assigned to viewer-relative dates by
+/// the same Rust bucketer. The archive repository only narrows terminal rows
+/// through a conservative UTC envelope; it never interprets the timezone.
 ///
-/// 400 on a malformed id or unknown IANA name (before any query); 404 on an
-/// unknown workflow id; PG-half failure is a 500 (load-bearing archive); a
-/// live-half failure degrades to terminal-only counts with the header `false`.
+/// 400 on a malformed id, year, or unknown IANA name (before any query); 404
+/// on an unknown workflow id; archive failure is a 500; live failure degrades
+/// to terminal-only counts with the header `false`.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/workflows/{id}/calendar", params(CalendarQuery), responses((status = 200, body = super::dto::CalendarResponse), (status = 400), (status = 404), (status = 500)))]
 async fn workflow_calendar_handler(
     Path(workflow_id): Path<String>,
@@ -436,7 +437,6 @@ async fn workflow_calendar_handler(
         }
     };
 
-    // Resolve + validate the tz once; the same string threads to PG and Rust.
     let tz_str = q.tz.clone().unwrap_or_else(|| "UTC".to_string());
     let tz: chrono_tz::Tz = match tz_str.parse() {
         Ok(t) => t,
@@ -448,8 +448,18 @@ async fn workflow_calendar_handler(
                 .into_response();
         }
     };
+    let envelope = match super::calendar::year_envelope(q.year) {
+        Some(envelope) => envelope,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid calendar year: {}", q.year) })),
+            )
+                .into_response();
+        }
+    };
 
-    match super::archive_queries::workflow_exists(&state.pg_pool, wf).await {
+    match state.repositories.definition_exists(wf).await {
         Ok(true) => {}
         Ok(false) => return workflow_not_found(),
         Err(e) => {
@@ -458,16 +468,17 @@ async fn workflow_calendar_handler(
         }
     }
 
-    let (pg_res, live_res) = tokio::join!(
-        super::archive_queries::calendar_terminal_rollup(&state.pg_pool, wf, q.year, &tz_str),
+    let (archive_res, live_res) = tokio::join!(
+        state
+            .repositories
+            .archived_calendar_candidates(wf, envelope.start, envelope.end),
         state.coordinator.list_workflow_instances(wf),
     );
 
-    // The archive is load-bearing — no useful degraded response without it.
-    let pg_rows = match pg_res {
+    let archive_rows = match archive_res {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("workflow_calendar_handler: PG rollup failed: {e}");
+            eprintln!("workflow_calendar_handler: archive query failed: {e}");
             return internal_error("roll up the calendar");
         }
     };
@@ -485,31 +496,42 @@ async fn workflow_calendar_handler(
     };
 
     let mut by_day: std::collections::BTreeMap<String, DayAcc> = std::collections::BTreeMap::new();
-    for r in pg_rows {
-        let acc = by_day.entry(r.date).or_default();
-        acc.completed += r.completed;
-        acc.failed += r.failed;
+    for candidate in archive_rows {
+        let day = super::calendar::scheduled_local_date(candidate.scheduled_at, tz);
+        if day.year() != q.year {
+            continue;
+        }
+        let acc = by_day
+            .entry(day.format("%Y-%m-%d").to_string())
+            .or_default();
+        match candidate.instance.state.as_str() {
+            "Completed" => acc.completed += 1,
+            "Failed" => acc.failed += 1,
+            _ => unreachable!("archive repository returned a non-terminal calendar candidate"),
+        }
     }
-    for inst in &live_rows {
-        let Some(sched) = inst.scheduled_at.as_deref() else {
+    for instance in &live_rows {
+        let Some(scheduled_at) = instance
+            .scheduled_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|instant| instant.with_timezone(&chrono::Utc))
+        else {
             continue;
         };
-        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(sched) else {
+        let day = super::calendar::scheduled_local_date(scheduled_at, tz);
+        if day.year() != q.year {
             continue;
-        };
-        let day = dt
-            .with_timezone(&tz)
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        let acc = by_day.entry(day).or_default();
-        match inst.state.as_str() {
+        }
+        let acc = by_day
+            .entry(day.format("%Y-%m-%d").to_string())
+            .or_default();
+        match instance.state.as_str() {
             "InProgress" => acc.in_progress += 1,
             // Transient pre-creation states fold into `scheduled`; they exist
             // briefly during the scheduler's flow and are operator-invisible.
             "Scheduled" | "Triggered" | "PendingSchedule" => acc.scheduled += 1,
-            // A terminal live row (rare; terminal live rows are retired) is already
-            // counted by the PG half — don't double-count.
+            // A terminal live row is already counted by the archive half.
             _ => {}
         }
     }
@@ -542,7 +564,7 @@ async fn workflow_calendar_handler(
 
 /// Status of a signal after the conductor accepted it.
 ///
-/// For trigger signals: `pending` means the Postgres row exists but the
+/// For trigger signals: `pending` means the SQL audit row exists but the
 /// server hasn't yet replied with an instance-creation event;
 /// `materialized` means the linkage is recorded; `terminal` means the
 /// originating run reached a terminal state and the row is awaiting its
@@ -602,43 +624,24 @@ async fn get_signal_status_handler(
         }
     };
 
-    // The three tables share `signal_id` keyspace, but a wakeup ingress
-    // that fans out into instances may have captures written too — so
-    // signal_wakeups is checked first to disambiguate the wakeup
-    // response shape from the trigger-captures shape. Cancel rows have
-    // no overlap with the other two.
-    match crate::signal_wakeups::read(state.pg_pool.as_ref(), sid).await {
-        Ok(Some(row)) => {
-            return (
-                StatusCode::OK,
-                Json(SignalStatusResponse {
-                    signal_id: row.signal_id,
-                    workflow_id: None,
-                    workflow_instance_id: None,
-                    status: "materialized",
-                    captures_summary: Vec::new(),
-                    applied_count: None,
-                    name: Some(row.name),
-                    matched_workflows: Some(row.matched_workflows),
-                }),
-            )
-                .into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!(
-                "get_signal_status_handler: signal_wakeups read failed: {}",
-                e
-            );
-            return public_http_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("signal lookup: {e}"),
-            );
-        }
-    }
+    use tickr_migrations::signal_repository::SignalAuditRecord;
 
-    match crate::signal_captures::read(state.pg_pool.as_ref(), sid).await {
-        Ok(Some(row)) => {
+    match state.repositories.signal_audit(sid).await {
+        Ok(Some(SignalAuditRecord::Wakeup(row))) => (
+            StatusCode::OK,
+            Json(SignalStatusResponse {
+                signal_id: row.signal_id,
+                workflow_id: None,
+                workflow_instance_id: None,
+                status: "materialized",
+                captures_summary: Vec::new(),
+                applied_count: None,
+                name: Some(row.name),
+                matched_workflows: Some(row.matched_workflows),
+            }),
+        )
+            .into_response(),
+        Ok(Some(SignalAuditRecord::Captures(row))) => {
             let status = if row.terminal_at.is_some() {
                 "terminal"
             } else if row.materialized_run_id.is_some() {
@@ -646,8 +649,8 @@ async fn get_signal_status_handler(
             } else {
                 "pending"
             };
-            let captures_summary = row.captures.iter().map(|c| c.name.clone()).collect();
-            return (
+            let captures_summary = row.capture_names().into_iter().map(str::to_owned).collect();
+            (
                 StatusCode::OK,
                 Json(SignalStatusResponse {
                     signal_id: row.signal_id,
@@ -660,23 +663,9 @@ async fn get_signal_status_handler(
                     matched_workflows: None,
                 }),
             )
-                .into_response();
+                .into_response()
         }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!(
-                "get_signal_status_handler: signal_captures read failed: {}",
-                e
-            );
-            return public_http_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("signal lookup: {e}"),
-            );
-        }
-    }
-
-    match crate::signal_cancels::read(state.pg_pool.as_ref(), sid).await {
-        Ok(Some(row)) => (
+        Ok(Some(SignalAuditRecord::Cancel(row))) => (
             StatusCode::OK,
             Json(SignalStatusResponse {
                 signal_id: row.signal_id,
@@ -696,10 +685,7 @@ async fn get_signal_status_handler(
         )
             .into_response(),
         Err(e) => {
-            eprintln!(
-                "get_signal_status_handler: signal_cancels read failed: {}",
-                e
-            );
+            eprintln!("get_signal_status_handler: Signal audit read failed: {e}");
             public_http_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("signal lookup: {e}"),
@@ -751,7 +737,7 @@ async fn dashboard_clock_handler(
     };
 
     let (archive_res, live_res) = tokio::join!(
-        super::archive_queries::list_dashboard_instances(&state.pg_pool, start, end),
+        state.repositories.archived_dashboard_instances(start, end),
         state
             .coordinator
             .dashboard_clock(query.start_time, query.end_time),
@@ -847,9 +833,9 @@ fn order_upcoming(
     rows
 }
 
-/// Handler for `GET /api/workflows/{id}/instances`. Merges archive (PG) with
-/// live (coordinator HTTP). Issues both reads in parallel; on coordinator failure
-/// or timeout, falls back to archive-only with `live_data_available: false`.
+/// Handler for `GET /api/workflows/{id}/instances`. Merges terminal archive
+/// rows with live coordinator rows. A local-date click-through narrows terminal
+/// candidates by UTC envelope and applies the same Rust bucketer to both halves.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/workflows/{id}/instances", params(InstancesQuery), responses((status = 200, body = Vec<super::dto::WorkflowInstanceResponse>), (status = 400), (status = 500)))]
 async fn list_workflow_instances_handler(
     Path(workflow_id): Path<String>,
@@ -867,42 +853,67 @@ async fn list_workflow_instances_handler(
         }
     };
 
-    // Optional calendar click-through filter: only runs scheduled on `date`,
-    // bucketed into `tz`. Validate the tz up front (when a date is supplied) so
-    // PG and the client-side live filter agree; an unknown IANA name is a 400.
+    // Validate the timezone and local date before either live or archive reads.
     let tz_str = q.tz.clone().unwrap_or_else(|| "UTC".to_string());
-    if q.date.is_some() && tz_str.parse::<chrono_tz::Tz>().is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("unknown IANA timezone: {tz_str}")})),
-        )
-            .into_response();
-    }
-
-    // Parallel: archive (PG) and live (coordinator HTTP). Independent failure
-    // domains; each can produce its half without waiting on the other.
-    let (archive_res, coordinator_res) = tokio::join!(
-        async {
-            match &q.date {
-                Some(date) => {
-                    super::archive_queries::list_workflow_instances_on_date(
-                        &state.pg_pool,
-                        wf,
-                        date,
-                        &tz_str,
+    let timezone = match tz_str.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => timezone,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unknown IANA timezone: {tz_str}")})),
+            )
+                .into_response();
+        }
+    };
+    let date_filter = match q.date.as_deref() {
+        Some(value) => {
+            let date = match chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+                Ok(date) => date,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("invalid local date: {value}")})),
                     )
-                    .await
+                        .into_response();
                 }
-                None => {
-                    super::archive_queries::list_workflow_instances_by_workflow(&state.pg_pool, wf)
-                        .await
-                }
-            }
-        },
-        state.coordinator.list_workflow_instances(wf),
-    );
+            };
+            let Some(envelope) = super::calendar::date_envelope(date) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid local date: {value}")})),
+                )
+                    .into_response();
+            };
+            Some((date, envelope))
+        }
+        None => None,
+    };
 
-    let archive_rows: Vec<super::dto::WorkflowInstanceResponse> = match archive_res {
+    let archive_read = async {
+        if let Some((_, envelope)) = date_filter {
+            state
+                .repositories
+                .archived_calendar_candidates(wf, envelope.start, envelope.end)
+                .await
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|candidate| candidate.instance)
+                        .collect()
+                })
+        } else {
+            state
+                .repositories
+                .archived_workflow_instances(
+                    wf,
+                    tickr_migrations::archive_repository::ArchivePage::unbounded(),
+                )
+                .await
+        }
+    };
+    let (archive_res, coordinator_res) =
+        tokio::join!(archive_read, state.coordinator.list_workflow_instances(wf),);
+
+    let mut archive_rows: Vec<super::dto::WorkflowInstanceResponse> = match archive_res {
         Ok(rows) => rows.into_iter().map(project_archived_instance).collect(),
         Err(e) => {
             eprintln!(
@@ -918,15 +929,8 @@ async fn list_workflow_instances_handler(
 
     let (live_rows, live_data_available) = match coordinator_res {
         Ok(rows) => (rows, true),
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => {
-            // Coordinator says no live instances for this workflow id. Still a
-            // successful answer — the live half is just empty.
-            (Vec::new(), true)
-        }
+        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => (Vec::new(), true),
         Err(e) => {
-            // Timeout / Unreachable / Server / Decode all degrade gracefully
-            // — the archive half still serves. Log so operators can attribute
-            // the degraded view to a specific upstream incident.
             eprintln!(
                 "list_workflow_instances_handler: coordinator call failed for workflow {}: {:?}",
                 wf, e
@@ -935,41 +939,49 @@ async fn list_workflow_instances_handler(
         }
     };
 
-    // Apply the same date predicate to the (small) live set client-side, so the
-    // filtered list is consistent across both stores.
-    let live_rows = match &q.date {
-        Some(date) => {
-            let tz: chrono_tz::Tz = tz_str.parse().expect("tz validated above");
-            live_rows
-                .into_iter()
-                .filter(|inst| {
-                    inst.scheduled_at
-                        .as_deref()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| {
-                            dt.with_timezone(&tz)
-                                .date_naive()
-                                .format("%Y-%m-%d")
-                                .to_string()
-                                == *date
-                        })
-                        .unwrap_or(false)
-                })
-                .collect()
-        }
-        None => live_rows,
-    };
+    if let Some((date, _)) = date_filter {
+        archive_rows.retain(|instance| instance_occurs_on_date(instance, date, timezone));
+        let mut filtered_live = live_rows;
+        filtered_live.retain(|instance| instance_occurs_on_date(instance, date, timezone));
+        let mut merged = super::live_archive_merge::merge_instances(filtered_live, archive_rows);
+        merged.sort_by(|a, b| {
+            b.scheduled_at
+                .cmp(&a.scheduled_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        return instance_list_response(merged, live_data_available);
+    }
 
     let mut merged = super::live_archive_merge::merge_instances(live_rows, archive_rows);
-    // Sort newest scheduled_at first so list views show recent runs at the
-    // top regardless of which store produced each row.
-    merged.sort_by(|a, b| b.scheduled_at.cmp(&a.scheduled_at));
+    merged.sort_by(|a, b| {
+        b.scheduled_at
+            .cmp(&a.scheduled_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    instance_list_response(merged, live_data_available)
+}
 
-    // `live_data_available` rides on a response header rather than wrapping
-    // the array in an envelope, so existing UI clients consuming the array
-    // shape stay drop-in compatible. Clients that want the degraded-state
-    // indicator opt-in by reading the header.
-    let mut response = (StatusCode::OK, Json(merged)).into_response();
+fn instance_occurs_on_date(
+    instance: &super::dto::WorkflowInstanceResponse,
+    date: chrono::NaiveDate,
+    timezone: chrono_tz::Tz,
+) -> bool {
+    instance
+        .scheduled_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|instant| {
+            super::calendar::scheduled_local_date(instant.with_timezone(&chrono::Utc), timezone)
+                == date
+        })
+        .unwrap_or(false)
+}
+
+fn instance_list_response(
+    instances: Vec<super::dto::WorkflowInstanceResponse>,
+    live_data_available: bool,
+) -> Response {
+    let mut response = (StatusCode::OK, Json(instances)).into_response();
     response.headers_mut().insert(
         LIVE_DATA_AVAILABLE_HEADER,
         axum::http::HeaderValue::from_static(if live_data_available { "true" } else { "false" }),
@@ -996,10 +1008,9 @@ fn project_archived_task(
     }
 }
 
-/// Handler for `GET /api/workflows/instances/{id}/tasks`. Merges archive (PG)
-/// with live (coordinator HTTP). Mirrors `list_workflow_instances_handler`'s
-/// shape: parallel reads, terminal-state merge, `live_data_available` on the
-/// envelope so the UI can render a degraded indicator.
+/// Handler for `GET /api/workflows/instances/{id}/tasks`. Merges the selected
+/// terminal archive with the live coordinator response, preserving the
+/// `live_data_available` response header.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/workflows/instances/{id}/tasks", responses((status = 200, body = Vec<super::dto::TaskInstanceResponse>), (status = 400), (status = 500)))]
 async fn list_task_instances_handler(
     Path(workflow_instance_id): Path<String>,
@@ -1017,7 +1028,7 @@ async fn list_task_instances_handler(
     };
 
     let (archive_res, coordinator_res) = tokio::join!(
-        super::archive_queries::list_task_instances(&state.pg_pool, wi),
+        state.repositories.archived_task_instances(wi),
         state.coordinator.list_task_instances(wi),
     );
 
@@ -1078,12 +1089,11 @@ fn project_archived_instance(
 }
 
 /// Handler for `GET /api/workflows/instances/{id}` — the **instance
-/// snapshot**. PG-first dispatch: hit the conductor's archive and project the
-/// snapshot (`storage: archived`) from the JSONB instance plus its archived
-/// task instances; on miss, fall through to the coordinator, which serves the
-/// identical shape with `storage: live`. On PG miss + coordinator
-/// timeout / unreachable / 503, return 503 so the UI can distinguish
-/// "instance gone" from "live store unreachable".
+/// snapshot**. Archive-first dispatch through the selected read-only
+/// repository; on miss, fall through to the coordinator, which serves the
+/// identical shape with `storage: live`. On archive miss + coordinator timeout
+/// / unreachable / 503, return 503 so the UI can distinguish "instance gone"
+/// from "live store unreachable".
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/workflows/instances/{id}", responses((status = 200, body = super::openapi::InstanceSnapshotDoc), (status = 400), (status = 404), (status = 500), (status = 503)))]
 async fn get_workflow_instance_handler(
     Path(instance_id): Path<String>,
@@ -1107,10 +1117,10 @@ async fn get_workflow_instance_handler(
     //    task-instance blobs) already reduced to the data-plane-visible shape.
     //    Stamping it `storage: archived` yields the same instance-snapshot
     //    response the live path serves — identical by construction.
-    match super::archive_queries::get_workflow_instance(&state.pg_pool, id).await {
-        Ok(Some(archived)) => {
+    match state.repositories.archived_workflow_detail(id).await {
+        Ok(Some(detail)) => {
             let snapshot =
-                tickr_proto::codec::archive::snapshot_from_archived(archived, "archived");
+                tickr_proto::codec::archive::snapshot_from_archived(detail.instance, "archived");
             return (StatusCode::OK, Json(snapshot)).into_response();
         }
         Ok(None) => { /* fall through to live */ }
@@ -1212,23 +1222,15 @@ async fn get_instance_context_handler(
         }
     };
 
-    // 1. Archive first: the enrichment is the terminal instance's scope dump.
-    match super::archive_queries::get_workflow_instance(&state.pg_pool, id).await {
-        Ok(Some(archived)) => {
-            let enrichment =
-                match super::archive_queries::get_run_info_ctx_envelope(&state.pg_pool, id).await {
-                    Ok(v) => v.unwrap_or(serde_json::Value::Array(Vec::new())),
-                    Err(e) => {
-                        eprintln!(
-                            "get_instance_context_handler: run-info lookup failed for {}: {}",
-                            id, e
-                        );
-                        return public_http_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("archive lookup: {e}"),
-                        );
-                    }
-                };
+    // 1. Archive first: one repository detail read returns the projection and
+    //    its linked run enrichment.
+    match state.repositories.archived_workflow_detail(id).await {
+        Ok(Some(detail)) => {
+            let archived = detail.instance;
+            let enrichment = detail
+                .run_info
+                .map(|run_info| run_info.ctx_envelope)
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
             let entries = super::ctx_reader::entries_from_enrichment(&enrichment);
             // The originating (trigger) signal id and the satisfied gate ids are
             // read from the archive projection's trigger provenance and
@@ -2007,7 +2009,7 @@ async fn get_patch_status_handler(
         )
             .into_response();
     };
-    match super::archive_queries::get_patch_status(&state.pg_pool, id).await {
+    match state.repositories.patch_status(id).await {
         Ok(Some(row)) => (
             StatusCode::OK,
             Json(PatchStatusResponse {
@@ -2015,7 +2017,7 @@ async fn get_patch_status_handler(
                 outcome: row.outcome,
                 patch_id: row.patch_id,
                 reason: row.reason,
-                status: row.status,
+                status: row.status.as_str().to_owned(),
                 updated_at: row.updated_at.to_rfc3339(),
                 workflow_instance_id: row.workflow_instance_id,
             }),
@@ -2053,18 +2055,24 @@ async fn get_patch_source_handler(
         )
             .into_response();
     };
-    match super::archive_queries::get_patch_source(&state.pg_pool, id).await {
-        Ok(Some(row)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "patch_id": row.patch_id,
-                "workflow_instance_id": row.workflow_instance_id,
-                "source": row.source,
-                "source_format": row.source_format,
-                "applied_version": row.applied_version,
-            })),
-        )
-            .into_response(),
+    match state.repositories.patch_source(id).await {
+        Ok(Some(row)) => {
+            let (source, source_format) = match row.source {
+                Some(source) => (Some(source.text), Some(source.format.as_str().to_owned())),
+                None => (None, None),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "patch_id": row.patch_id,
+                    "workflow_instance_id": row.workflow_instance_id,
+                    "source": source,
+                    "source_format": source_format,
+                    "applied_version": row.applied_version,
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "no patch with that id"})),
@@ -2183,7 +2191,7 @@ async fn list_instance_replays_handler(
                 .into_response();
         }
     };
-    match super::archive_queries::list_replays_for_source(&state.pg_pool, id).await {
+    match state.repositories.replays_for_source(id).await {
         Ok(rows) => {
             let replays: Vec<super::dto::ReplayRowResponse> = rows
                 .into_iter()
@@ -2617,7 +2625,14 @@ async fn list_events_handler(
     axum::extract::Query(query): axum::extract::Query<EventsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match super::archive_queries::list_events(&state.pg_pool, query.after, EVENTS_BATCH_LIMIT).await
+    match state
+        .repositories
+        .events(
+            tickr_migrations::event_repository::EventFilter::All,
+            query.after,
+            EVENTS_BATCH_LIMIT,
+        )
+        .await
     {
         Ok(rows) => (StatusCode::OK, Json(project_event_rows(rows))).into_response(),
         Err(e) => {
@@ -2631,11 +2646,10 @@ async fn list_events_handler(
     }
 }
 
-/// Project archive `EventRow`s into the wire shape. Shared by the unscoped
-/// Event log and the per-instance event reads so every events surface returns
-/// the identical row shape.
+/// Project repository Event rows into the wire shape. Shared by the unscoped
+/// Event log and per-instance reads so every Event surface returns one shape.
 fn project_event_rows(
-    rows: Vec<super::archive_queries::EventRow>,
+    rows: Vec<tickr_migrations::event_repository::EventProjectionRow>,
 ) -> Vec<super::dto::EventResponse> {
     rows.into_iter()
         .map(|r| super::dto::EventResponse {
@@ -2674,13 +2688,14 @@ async fn list_workflow_instance_events_handler(
                 .into_response();
         }
     };
-    match super::archive_queries::list_workflow_instance_events(
-        &state.pg_pool,
-        id,
-        query.after,
-        EVENTS_BATCH_LIMIT,
-    )
-    .await
+    match state
+        .repositories
+        .events(
+            tickr_migrations::event_repository::EventFilter::WorkflowInstance(id),
+            query.after,
+            EVENTS_BATCH_LIMIT,
+        )
+        .await
     {
         Ok(rows) => (StatusCode::OK, Json(project_event_rows(rows))).into_response(),
         Err(e) => {
@@ -2715,13 +2730,14 @@ async fn list_task_instance_events_handler(
                 .into_response();
         }
     };
-    match super::archive_queries::list_task_instance_events(
-        &state.pg_pool,
-        ti,
-        query.after,
-        EVENTS_BATCH_LIMIT,
-    )
-    .await
+    match state
+        .repositories
+        .events(
+            tickr_migrations::event_repository::EventFilter::TaskInstance(ti),
+            query.after,
+            EVENTS_BATCH_LIMIT,
+        )
+        .await
     {
         Ok(rows) => (StatusCode::OK, Json(project_event_rows(rows))).into_response(),
         Err(e) => {
@@ -2736,7 +2752,7 @@ async fn list_task_instance_events_handler(
 }
 
 /// Stateless top-level routes (hello + health). These need no `AppState`, so
-/// tests can exercise them without standing up Postgres or NATS.
+/// tests can exercise them without a repository or NATS.
 pub fn meta_router() -> Router {
     Router::new()
         .route("/", get(hello_handler))
@@ -2780,7 +2796,7 @@ fn documented_router() -> OpenApiRouter<Arc<AppState>> {
 }
 
 /// Generate the exact OpenAPI document paired with the runtime router without
-/// constructing Postgres, NATS, or other live dependencies.
+/// constructing repositories, NATS, or other live dependencies.
 pub fn openapi_document() -> utoipa::openapi::OpenApi {
     let (_, openapi) = documented_router().split_for_parts();
     customize_openapi(openapi)
@@ -2841,13 +2857,13 @@ pub fn openapi_yaml() -> Result<String> {
 /// the router against a curated state.
 pub fn build_app_state(
     nats: Arc<Client>,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
     coordinator: Arc<super::coordinator_client::CoordinatorClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         nats,
-        pg_pool,
+        repositories,
         coordinator,
         logs,
         deadlines: CommandDeadlines::default(),
@@ -2874,7 +2890,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 pub async fn start_http_server(
     shutdown_rx: watch::Receiver<bool>,
     nats: Client,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
 ) -> Result<()> {
     // Live-state subquery client. Constructed once at startup and shared across
     // handlers via the `AppState` so the connection pool and the 1.5s timeout
@@ -2888,7 +2904,7 @@ pub async fn start_http_server(
 
     let logs = Arc::new(super::logs_resolver::LogsResolver::new(minio, nats.clone()));
 
-    let state = build_app_state(Arc::new(nats), pg_pool, coordinator, logs);
+    let state = build_app_state(Arc::new(nats), repositories, coordinator, logs);
     let app = build_router(state);
 
     let addr = crate::config::api_bind_addr()?;
@@ -2914,7 +2930,7 @@ pub async fn start_http_server(
 pub async fn start_http_server(
     _shutdown_rx: watch::Receiver<bool>,
     _nats: Client,
-    _pg_pool: Arc<PgPool>,
+    _repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
 ) -> Result<()> {
     anyhow::bail!("the API HTTP server is unavailable under madsim")
 }

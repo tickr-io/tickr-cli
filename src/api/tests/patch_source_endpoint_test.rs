@@ -12,7 +12,8 @@
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::archive_queries::get_patch_source;
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
+use tickr_migrations::patch_repository::PatchSourceFormat;
 use uuid::Uuid;
 
 #[allow(clippy::too_many_arguments)]
@@ -61,6 +62,7 @@ async fn read_path_returns_retained_source() -> Result<(), Box<dyn std::error::E
         .connect(&url)
         .await?;
     tickr_migrations::apply_target(tickr_migrations::MigrationTarget::Conductor, &pool).await?;
+    let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
 
     // An applied external patch: the authored Nickel comes back verbatim, and
     // `applied_version` is present so a reader can join to the server's effect.
@@ -96,23 +98,27 @@ async fn read_path_returns_retained_source() -> Result<(), Box<dyn std::error::E
     )
     .await;
 
-    let external = get_patch_source(&pool, external_id)
+    let external = repository
+        .patch_source(external_id)
         .await?
         .expect("external patch source");
-    assert_eq!(external.source.as_deref(), Some(nickel));
-    assert_eq!(external.source_format.as_deref(), Some("nickel"));
+    let external_source = external.source.expect("retained source");
+    assert_eq!(external_source.text, nickel);
+    assert_eq!(external_source.format, PatchSourceFormat::Nickel);
     assert_eq!(external.applied_version, Some(9));
     assert_eq!(external.workflow_instance_id, wi);
 
-    let self_patch = get_patch_source(&pool, self_id)
+    let self_patch = repository
+        .patch_source(self_id)
         .await?
         .expect("self patch source");
-    assert_eq!(self_patch.source.as_deref(), Some(json));
-    assert_eq!(self_patch.source_format.as_deref(), Some("json"));
+    let self_source = self_patch.source.expect("retained source");
+    assert_eq!(self_source.text, json);
+    assert_eq!(self_source.format, PatchSourceFormat::Json);
     assert_eq!(self_patch.applied_version, Some(10));
 
     assert!(
-        get_patch_source(&pool, Uuid::new_v4()).await?.is_none(),
+        repository.patch_source(Uuid::new_v4()).await?.is_none(),
         "unknown patch_id resolves to None"
     );
     Ok(())

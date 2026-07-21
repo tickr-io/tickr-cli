@@ -24,7 +24,7 @@ use futures::StreamExt;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::signal as sp;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -117,7 +117,7 @@ pub enum CancelError {
 /// `SignalApplied` for ByTag targets, and persists the `signal_cancels` audit
 /// row. Side effects run only past the dedup/conflict short-circuit.
 pub async fn process_cancel(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     req: CancelRequest,
 ) -> Result<CancelOutcome, CancelError> {
@@ -241,7 +241,7 @@ pub async fn process_cancel(
             target: target_json,
             note: req.note,
         };
-        if let Err(e) = crate::signal_cancels::insert(pool, &row).await {
+        if let Err(e) = crate::signal_cancels::insert(repositories, &row).await {
             eprintln!("cancel pipeline: signal_cancels persist failed: {}", e);
         }
         Ok(CancelOutcome::ByTag {
@@ -258,7 +258,7 @@ pub async fn process_cancel(
             target: target_json,
             note: req.note,
         };
-        if let Err(e) = crate::signal_cancels::insert(pool, &row).await {
+        if let Err(e) = crate::signal_cancels::insert(repositories, &row).await {
             eprintln!("cancel pipeline: signal_cancels persist failed: {}", e);
         }
         Ok(CancelOutcome::Instance { signal_id })

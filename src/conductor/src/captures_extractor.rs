@@ -8,8 +8,8 @@
 //! `present: false` on the envelope — an explicit value-absent state the
 //! consumer can branch on — not an error.
 //!
-//! The function performs no I/O. Postgres + NATS writes are the HTTP
-//! handler's responsibility once this layer has produced the envelopes.
+//! The function performs no I/O. SQL repository + NATS writes are the
+//! caller's responsibility once this layer has produced the envelopes.
 
 use serde_json::Value;
 use serde_json_path::JsonPath;
@@ -19,7 +19,7 @@ use tickr_proto::workflow::{capture_source, CaptureDeclaration};
 use uuid::Uuid;
 
 /// A capture-name paired with the envelope the extractor built for it.
-/// HTTP handler writes these into Postgres `signal_captures.captures` and
+/// The ingress adapter writes these into the SQL Event-variable archive and
 /// NATS KV `ctx-<ns>/<signal_id>/<name>` verbatim.
 #[derive(Debug, Clone)]
 pub struct NamedEnvelope {

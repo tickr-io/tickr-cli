@@ -65,6 +65,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+fn repository(pool: &sqlx::PgPool) -> tickr_migrations::backend::WriterRepositoryBundle {
+    tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone())
+}
+
 async fn start_nats() -> Option<(
     testcontainers_modules::testcontainers::ContainerAsync<Nats>,
     async_nats::Client,
@@ -401,9 +405,14 @@ fn spawn_drain(
     let (tx, rx) = mpsc::channel::<ConductorRelayMessage>(16);
     let token = CancellationToken::new();
     let drain_token = token.clone();
+    let definitions = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        ),
+    );
     let handle = tokio::spawn(async move {
         let consumer = task_event_consumer(&nats).await.expect("consumer");
-        drain_task_events(consumer, tx, pool, nats.clone(), drain_token).await;
+        drain_task_events(consumer, tx, definitions, nats.clone(), drain_token).await;
     });
     (rx, token, handle)
 }
@@ -839,7 +848,7 @@ async fn patched_in_task_resolves_from_unified_store_and_gate_evaluates() {
     let wi = Uuid::new_v4();
     let patch_id = Uuid::new_v4();
     let ingress = process_patch(
-        &pool,
+        &repository(&pool),
         &sender,
         wi,
         patch_id,
@@ -856,27 +865,18 @@ async fn patched_in_task_resolves_from_unified_store_and_gate_evaluates() {
     assert_eq!(build_jobs.len(), 1);
     assert_eq!(build_jobs[0].task_id, minted);
 
-    // Build success → the finalizer flips Building → Submitted and ships the
-    // single validate+apply envelope carrying the lowered ops.
-    tickr_conductor::patch_pipeline::record_patch_task_outcome(
-        &pool,
+    // Build success → the finalizer atomically records the Task result, flips
+    // Building → Submitted, and ships the single validate+apply envelope.
+    let settlement = finalize_patch_after_build(
+        &repository(&pool),
+        &sender,
         key,
         minted,
         &tickr_conductor::build_pipeline::BuildOutcome::Success,
     )
     .await
-    .expect("record outcome");
-    assert_eq!(
-        finalize_patch_after_build(
-            &pool,
-            &sender,
-            key,
-            &tickr_conductor::build_pipeline::BuildOutcome::Success
-        )
-        .await
-        .expect("finalize"),
-        PatchBuildFinalize::FlippedToSubmitted
-    );
+    .expect("settle build");
+    assert!(matches!(settlement, PatchBuildFinalize::Submitted(_)));
     let sent = sender.sent.lock().await.clone();
     assert_eq!(
         sent.len(),
@@ -963,7 +963,7 @@ async fn continue_iteration_bare_absence_forwards_completed_unchanged() {
 /// opens the lifecycle row and relays the patch envelope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_patch_output_is_detected_stamped_and_forked_on_the_drain() {
-    use tickr_conductor::patch_pipeline::{fetch_row, patch_key};
+    use tickr_conductor::patch_pipeline::patch_key;
 
     let Some((_nats_c, nats)) = start_nats().await else {
         return;
@@ -1083,9 +1083,21 @@ async fn self_patch_output_is_detected_stamped_and_forked_on_the_drain() {
     let drain_token = token.clone();
     let drain_nats = nats.clone();
     let drain_pool = Arc::clone(&pool);
+    let drain_definitions = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            drain_pool.as_ref().clone(),
+        ),
+    );
     let handle = tokio::spawn(async move {
         let consumer = task_event_consumer(&drain_nats).await.expect("consumer");
-        drain_task_events(consumer, tx, drain_pool, drain_nats.clone(), drain_token).await;
+        drain_task_events(
+            consumer,
+            tx,
+            drain_definitions,
+            drain_nats.clone(),
+            drain_token,
+        )
+        .await;
     });
 
     async fn recv(rx: &mut mpsc::Receiver<ConductorRelayMessage>) -> ConductorRelayMessage {
@@ -1133,7 +1145,7 @@ async fn self_patch_output_is_detected_stamped_and_forked_on_the_drain() {
     // The relay flips the row to Submitted on a background drain task, which
     // can lag the wire-order assertions above; poll rather than fetch-once so
     // the assertion doesn't race the async flip (~5s ceiling).
-    let mut row = fetch_row(&pool, expected_key)
+    let mut row = common::fetch_patch_row(&pool, expected_key)
         .await
         .expect("fetch")
         .expect("the fork opens a lifecycle row");
@@ -1142,7 +1154,7 @@ async fn self_patch_output_is_detected_stamped_and_forked_on_the_drain() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        row = fetch_row(&pool, expected_key)
+        row = common::fetch_patch_row(&pool, expected_key)
             .await
             .expect("fetch")
             .expect("the fork opens a lifecycle row");

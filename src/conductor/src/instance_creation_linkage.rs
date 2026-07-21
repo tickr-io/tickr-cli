@@ -8,16 +8,16 @@
 //! point that closes the HTTP-receive → schedule-due → task-dispatch loop:
 //! captures land in NATS up front during the trigger HTTP handler, the
 //! link from signal_id to the eventually-minted workflow_instance_id is
-//! recorded here, and the NATS cache is rehydrated from the Postgres
-//! source of truth if a prior conductor crash left it incomplete.
+//! recorded here, and the NATS cache is rehydrated from the SQL repository
+//! if a prior conductor crash left it incomplete.
 //!
-//! Idempotent: a second event for the same `signal_id` is a no-op against
-//! Postgres (the `mark_materialized` UPDATE has a `WHERE materialized_run_id
-//! IS NULL` guard) and at most repeats the NATS writes (identical bytes).
+//! Idempotent: a second event for the same `signal_id` observes the durable
+//! linkage without replacing it and at most repeats the NATS writes
+//! (identical bytes).
 
 use anyhow::{Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
-use sqlx::PgPool;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::derive_scheduled_workflow_instance_id;
 use uuid::Uuid;
 
@@ -30,27 +30,27 @@ const DEFAULT_CTX_NAMESPACE: &str = "default";
 
 /// Reconcile a workflow-instance-creation event against the conductor's
 /// signal_captures archive: record the (signal_id → run_id) linkage, and
-/// rehydrate any missing NATS KV keys from the Postgres source of truth.
+/// rehydrate any missing NATS KV keys from the SQL source of truth.
 ///
 /// Called once per `TaskQueueRepoItem` with a `Some(originating_signal_id)`
 /// arriving on the conductor inbound relay arm, before the item is
 /// forwarded to NATS. The function is cheap when the linkage already
-/// exists (one PG UPDATE, one PG SELECT, N NATS GETs) and idempotent on
+/// exists (one repository linkage operation, one archive read, N NATS GETs) and idempotent on
 /// re-invocation.
 pub async fn link_and_rehydrate(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     signal_id: Uuid,
     workflow_instance_id: Uuid,
 ) -> Result<()> {
     // 1. Record the linkage. `mark_materialized` is a no-op when already set;
     //    no need for read-then-write.
-    signal_captures::mark_materialized(pool, signal_id, workflow_instance_id)
+    signal_captures::mark_materialized(repositories, signal_id, workflow_instance_id)
         .await
         .context("mark signal_captures materialized")?;
 
     // 2. Read the archived captures so we know which keys must exist in NATS.
-    let row = match signal_captures::read(pool, signal_id)
+    let row = match signal_captures::read(repositories, signal_id)
         .await
         .context("read signal_captures for rehydration")?
     {
@@ -90,7 +90,7 @@ pub async fn link_and_rehydrate(
 
     // 4. For every archived capture, check the NATS cache. If missing,
     //    write the envelope back from the row. A miss only happens when
-    //    a conductor restart cut between Postgres-write and NATS-write at
+    //    a conductor restart cut between SQL commit and NATS write at
     //    HTTP-receive time; the common case here is "all keys present"
     //    and the loop is a fast check.
     for cap in &row.captures {
@@ -128,13 +128,13 @@ pub async fn link_and_rehydrate(
 ///
 /// Returns the computed run id.
 pub async fn backfill_pending_schedule_linkage(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     signal_id: Uuid,
     workflow_id: Uuid,
     scheduled_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Uuid> {
     let run_id = derive_scheduled_workflow_instance_id(workflow_id, scheduled_at);
-    signal_captures::mark_materialized(pool, signal_id, run_id)
+    signal_captures::mark_materialized(repositories, signal_id, run_id)
         .await
         .context("back-fill pending-schedule linkage")?;
     Ok(run_id)

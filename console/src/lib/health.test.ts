@@ -10,7 +10,10 @@ import {
 } from './health';
 
 /** A full response with every row `healthy` unless overridden. */
-function response(over: Partial<Record<keyof HealthResponse, HealthStatus>> = {}): HealthResponse {
+function response(
+  over: Partial<Record<keyof HealthResponse, HealthStatus>> = {},
+  implementation: 'postgres' | 'sqlite' = 'postgres',
+): HealthResponse {
   const row = (key: string, status: HealthStatus) => ({
     status,
     detail: `${key}:${status}`,
@@ -19,7 +22,10 @@ function response(over: Partial<Record<keyof HealthResponse, HealthStatus>> = {}
   return {
     checked_at: '2026-07-15T14:23:40Z',
     api: row('api', over.api ?? 'healthy'),
-    postgres: row('postgres', over.postgres ?? 'healthy'),
+    data_plane_sql: {
+      ...row('data_plane_sql', over.data_plane_sql ?? 'healthy'),
+      implementation,
+    },
     nats_kv: row('nats_kv', over.nats_kv ?? 'healthy'),
     executors: row('executors', over.executors ?? 'healthy'),
     conductor: row('conductor', over.conductor ?? 'healthy'),
@@ -27,9 +33,12 @@ function response(over: Partial<Record<keyof HealthResponse, HealthStatus>> = {}
   };
 }
 
-const ok = (over?: Partial<Record<keyof HealthResponse, HealthStatus>>): HealthReading => ({
+const ok = (
+  over?: Partial<Record<keyof HealthResponse, HealthStatus>>,
+  implementation?: 'postgres' | 'sqlite',
+): HealthReading => ({
   ok: true,
-  response: response(over),
+  response: response(over, implementation),
 });
 const unreachable: HealthReading = { ok: false };
 
@@ -48,8 +57,21 @@ describe('reduceHealth — first reading adoption', () => {
   it('cascades immediately when the very first reading is unreachable', () => {
     const s = run(unreachable);
     expect(s.display?.api.status).toBe('unhealthy');
-    expect(s.display?.postgres.status).toBe('unhealthy');
+    expect(s.display?.data_plane_sql.status).toBe('unhealthy');
     expect(cardsDimmed(s.display)).toBe(true);
+  });
+
+  it('carries either selected SQL implementation through the same status path', () => {
+    const postgres = run(ok({ data_plane_sql: 'unhealthy' }, 'postgres'));
+    const sqlite = run(ok({ data_plane_sql: 'unhealthy' }, 'sqlite'));
+    expect(postgres.display?.data_plane_sql).toMatchObject({
+      status: 'unhealthy',
+      implementation: 'postgres',
+    });
+    expect(sqlite.display?.data_plane_sql).toMatchObject({
+      status: 'unhealthy',
+      implementation: 'sqlite',
+    });
   });
 });
 
@@ -98,7 +120,7 @@ describe('reduceHealth — API-gate cascade + debounce interaction', () => {
   it('a single unreachable blip does not cascade an established-healthy page', () => {
     const s = run(ok(), unreachable, ok());
     expect(s.display?.api.status).toBe('healthy');
-    expect(s.display?.postgres.status).toBe('healthy');
+    expect(s.display?.data_plane_sql.status).toBe('healthy');
     expect(cardsDimmed(s.display)).toBe(false);
   });
 
@@ -108,15 +130,15 @@ describe('reduceHealth — API-gate cascade + debounce interaction', () => {
     expect(s.display?.conductor.status).toBe('unhealthy');
     expect(s.display?.nats_kv.status).toBe('unhealthy');
     expect(s.display?.executors.status).toBe('unhealthy');
-    expect(s.display?.postgres.status).toBe('unhealthy');
+    expect(s.display?.data_plane_sql.status).toBe('unhealthy');
     expect(s.display?.control_plane.status).toBe('unhealthy');
     expect(cardsDimmed(s.display)).toBe(true);
   });
 
   it('reports every row below unhealthy when a reachable response has an unhealthy API', () => {
     // Reachable but API itself unhealthy — cascade still applies (first read adopts).
-    const s = run(ok({ api: 'unhealthy', postgres: 'healthy' }));
-    expect(s.display?.postgres.status).toBe('unhealthy');
+    const s = run(ok({ api: 'unhealthy', data_plane_sql: 'healthy' }));
+    expect(s.display?.data_plane_sql.status).toBe('unhealthy');
     expect(cardsDimmed(s.display)).toBe(true);
   });
 });

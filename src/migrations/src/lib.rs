@@ -1,19 +1,57 @@
-//! Conductor-only Postgres migration runner.
+//! Paired Postgres and SQLite data-plane migration runner.
 
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::migrate::Migrator;
-use sqlx::PgPool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{PgPool, SqlitePool};
+
+pub mod archive_repository;
+pub mod backend;
+pub mod definition_repository;
+pub mod encoding;
+pub mod event_repository;
+pub mod patch_repository;
+pub mod replay_repository;
+mod schema;
+pub mod signal_repository;
+
+pub use schema::{verify_postgres_schema, verify_sqlite_schema, SchemaVerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationTarget {
     Conductor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalMigrationIdentity {
+    pub version: i64,
+    pub name: &'static str,
+}
+
+pub const LOGICAL_MIGRATIONS: &[LogicalMigrationIdentity] = &[LogicalMigrationIdentity {
+    version: 1,
+    name: "current_conductor_schema",
+}];
+
+struct PairedMigrationSet {
+    postgres: Migrator,
+    sqlite: Migrator,
+}
+
+fn paired_migrations() -> &'static PairedMigrationSet {
+    static MIGRATIONS: PairedMigrationSet = PairedMigrationSet {
+        postgres: sqlx::migrate!("../conductor/migrations"),
+        sqlite: sqlx::migrate!("./sqlite"),
+    };
+    &MIGRATIONS
+}
+
 impl MigrationTarget {
-    fn migrator(self) -> &'static Migrator {
-        static CONDUCTOR: Migrator = sqlx::migrate!("../conductor/migrations");
-        &CONDUCTOR
+    fn postgres_migrator(self) -> &'static Migrator {
+        &paired_migrations().postgres
     }
 
     fn cli_name(self) -> &'static str {
@@ -28,15 +66,22 @@ impl std::fmt::Display for MigrationTarget {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("failed to apply {target} migrations: {source}")]
-pub struct MigrationError {
-    pub target: MigrationTarget,
-    #[source]
-    pub source: sqlx::migrate::MigrateError,
+pub enum MigrationError {
+    #[error(transparent)]
+    Registration(#[from] MigrationRegistrationError),
+    #[error("failed to apply {target} {backend} migrations: {source}")]
+    Apply {
+        target: MigrationTarget,
+        backend: &'static str,
+        #[source]
+        source: sqlx::migrate::MigrateError,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationsDriftError {
+    #[error(transparent)]
+    Registration(#[from] MigrationRegistrationError),
     #[error("{target} schema is behind: {have} of {want} migrations applied; next pending is {next_version} ({next_description}). Run `just migrate` (or `tickr migrate`) before starting this component.")]
     Behind {
         target: MigrationTarget,
@@ -52,6 +97,11 @@ pub enum MigrationsDriftError {
         version: i64,
         description: String,
     },
+    #[error("{target} has unregistered migration identity {version}")]
+    UnexpectedMigration {
+        target: MigrationTarget,
+        version: i64,
+    },
     #[error("failed to read applied migrations for {target}: {source}")]
     Query {
         target: MigrationTarget,
@@ -61,24 +111,83 @@ pub enum MigrationsDriftError {
 }
 
 pub async fn apply_target(target: MigrationTarget, pool: &PgPool) -> Result<(), MigrationError> {
+    validate_migration_registration()?;
     target
-        .migrator()
+        .postgres_migrator()
         .run(pool)
         .await
-        .map_err(|source| MigrationError { target, source })
+        .map_err(|source| MigrationError::Apply {
+            target,
+            backend: "postgres",
+            source,
+        })
+}
+
+pub async fn apply_sqlite(
+    target: MigrationTarget,
+    pool: &SqlitePool,
+) -> Result<(), MigrationError> {
+    validate_migration_registration()?;
+    paired_migrations()
+        .sqlite
+        .run(pool)
+        .await
+        .map_err(|source| MigrationError::Apply {
+            target,
+            backend: "sqlite",
+            source,
+        })
+}
+
+pub fn sqlite_writer_options(
+    url: &str,
+    create_if_missing: bool,
+) -> Result<SqliteConnectOptions, sqlx::Error> {
+    Ok(SqliteConnectOptions::from_str(url)?
+        .create_if_missing(create_if_missing)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5)))
 }
 
 pub async fn verify_current(
     target: MigrationTarget,
     pool: &PgPool,
 ) -> Result<(), MigrationsDriftError> {
-    let embedded: Vec<_> = target
-        .migrator()
+    validate_migration_registration()?;
+    let applied = applied_checksums(target, pool).await?;
+    verify_applied(target, target.postgres_migrator(), &applied)
+}
+
+pub async fn verify_sqlite_current(
+    target: MigrationTarget,
+    pool: &SqlitePool,
+) -> Result<(), MigrationsDriftError> {
+    validate_migration_registration()?;
+    let applied = applied_sqlite_checksums(target, pool).await?;
+    verify_applied(target, &paired_migrations().sqlite, &applied)
+}
+
+fn verify_applied(
+    target: MigrationTarget,
+    migrator: &Migrator,
+    applied: &HashMap<i64, Vec<u8>>,
+) -> Result<(), MigrationsDriftError> {
+    let embedded = migrator
         .iter()
         .filter(|migration| !migration.migration_type.is_down_migration())
-        .collect();
-    let applied = applied_checksums(target, pool).await?;
-
+        .collect::<Vec<_>>();
+    for version in applied.keys() {
+        if !embedded
+            .iter()
+            .any(|migration| migration.version == *version)
+        {
+            return Err(MigrationsDriftError::UnexpectedMigration {
+                target,
+                version: *version,
+            });
+        }
+    }
     for migration in &embedded {
         if let Some(recorded) = applied.get(&migration.version) {
             if recorded.as_slice() != migration.checksum.as_ref() {
@@ -90,7 +199,6 @@ pub async fn verify_current(
             }
         }
     }
-
     if applied.len() < embedded.len() {
         let next = embedded
             .iter()
@@ -108,6 +216,42 @@ pub async fn verify_current(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "logical migration registration must pair versions {expected:?}; postgres has {postgres:?}, sqlite has {sqlite:?}"
+)]
+pub struct MigrationRegistrationError {
+    expected: Vec<i64>,
+    postgres: Vec<i64>,
+    sqlite: Vec<i64>,
+}
+
+pub fn validate_migration_registration() -> Result<(), MigrationRegistrationError> {
+    let expected = LOGICAL_MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let postgres = migration_versions(&paired_migrations().postgres);
+    let sqlite = migration_versions(&paired_migrations().sqlite);
+    if postgres == expected && sqlite == expected {
+        Ok(())
+    } else {
+        Err(MigrationRegistrationError {
+            expected,
+            postgres,
+            sqlite,
+        })
+    }
+}
+
+fn migration_versions(migrator: &Migrator) -> Vec<i64> {
+    migrator
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+        .map(|migration| migration.version)
+        .collect()
+}
+
 async fn applied_checksums(
     target: MigrationTarget,
     pool: &PgPool,
@@ -119,6 +263,22 @@ async fn applied_checksums(
         {
             Ok(rows) => rows,
             Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => Vec::new(),
+            Err(source) => return Err(MigrationsDriftError::Query { target, source }),
+        };
+    Ok(rows.into_iter().collect())
+}
+
+async fn applied_sqlite_checksums(
+    target: MigrationTarget,
+    pool: &SqlitePool,
+) -> Result<HashMap<i64, Vec<u8>>, MigrationsDriftError> {
+    let rows: Vec<(i64, Vec<u8>)> =
+        match sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success = TRUE")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(sqlx::Error::Database(db)) if db.message().contains("no such table") => Vec::new(),
             Err(source) => return Err(MigrationsDriftError::Query { target, source }),
         };
     Ok(rows.into_iter().collect())

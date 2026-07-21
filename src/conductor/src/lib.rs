@@ -23,6 +23,7 @@ pub mod relay;
 pub mod replay_pipeline;
 pub mod replay_rehydration;
 pub mod replay_seed;
+pub mod repository;
 pub mod routing_enrichment;
 pub mod routing_split;
 pub mod signal_cancels;
@@ -34,7 +35,6 @@ pub mod submission_consumer;
 pub mod subscription_index;
 pub mod system_tasks;
 pub mod trigger_pipeline;
-pub mod version_resolver;
 pub mod waits_on_signal_lifecycle;
 pub mod wakeup_translator;
 

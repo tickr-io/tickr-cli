@@ -252,6 +252,29 @@ components:
       - signal_id
       - entries
       type: object
+    DataPlaneSqlHealth:
+      description: Public API contract.
+      properties:
+        detail:
+          type: string
+        detection_window:
+          type: string
+        implementation:
+          $ref: '#/components/schemas/DataPlaneSqlImplementation'
+        status:
+          $ref: '#/components/schemas/ComponentStatus'
+      required:
+      - implementation
+      - status
+      - detail
+      - detection_window
+      type: object
+    DataPlaneSqlImplementation:
+      description: Public API contract.
+      enum:
+      - postgres
+      - sqlite
+      type: string
     DayCounts:
       description: Public API contract.
       properties:
@@ -380,16 +403,16 @@ components:
           $ref: '#/components/schemas/ComponentHealth'
         control_plane:
           $ref: '#/components/schemas/ComponentHealth'
+        data_plane_sql:
+          $ref: '#/components/schemas/DataPlaneSqlHealth'
         executors:
           $ref: '#/components/schemas/ComponentHealth'
         nats_kv:
           $ref: '#/components/schemas/ComponentHealth'
-        postgres:
-          $ref: '#/components/schemas/ComponentHealth'
       required:
       - checked_at
       - api
-      - postgres
+      - data_plane_sql
       - nats_kv
       - executors
       - conductor

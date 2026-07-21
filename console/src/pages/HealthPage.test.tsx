@@ -9,7 +9,10 @@ import { useHealth } from '@/api/hooks';
 
 const mockUse = vi.mocked(useHealth);
 
-function display(over: Partial<Record<keyof HealthDisplay, HealthStatus>> = {}): HealthDisplay {
+function display(
+  over: Partial<Record<keyof HealthDisplay, HealthStatus>> = {},
+  implementation: 'postgres' | 'sqlite' = 'postgres',
+): HealthDisplay {
   const row = (key: keyof HealthDisplay, fallback: HealthStatus, detail: string) => ({
     status: over[key] ?? fallback,
     detail,
@@ -19,7 +22,10 @@ function display(over: Partial<Record<keyof HealthDisplay, HealthStatus>> = {}):
     conductor: row('conductor', 'healthy', 'command-plane-responsive'),
     nats_kv: row('nats_kv', 'healthy', 'kv.status() ok'),
     executors: row('executors', 'degraded', '3 alive · 3/4 slots'),
-    postgres: row('postgres', 'healthy', 'SELECT 1 ok'),
+    data_plane_sql: {
+      ...row('data_plane_sql', 'healthy', 'repository reachable; schema compatible'),
+      implementation,
+    },
     control_plane: row('control_plane', 'healthy', 'control plane up'),
   };
 }
@@ -59,14 +65,20 @@ describe('HealthPage', () => {
     expect(rows[0].textContent).toContain('3 alive · 3/4 slots');
   });
 
-  it('maps status → hue per row (healthy green, degraded amber)', () => {
-    setTail();
-    render(<HealthPage />);
-    const pg = document.querySelector('[data-row="postgres"]')!;
-    expect(within(pg as HTMLElement).getByText('healthy').className).toContain('bg-success');
-    const ex = document.querySelector('[data-row="executors"]')!;
-    expect(within(ex as HTMLElement).getByText('degraded').className).toContain('bg-warning');
-  });
+  it.each([
+    ['postgres', 'Postgres', 'healthy', 'bg-success'],
+    ['sqlite', 'SQLite', 'unhealthy', 'bg-destructive'],
+  ] as const)(
+    'renders the %s implementation and status from the backend-neutral row',
+    (implementation, label, status, hue) => {
+      setTail({ display: display({ data_plane_sql: status }, implementation) });
+      render(<HealthPage />);
+      const sql = document.querySelector('[data-row="data_plane_sql"]')!;
+      expect(within(sql as HTMLElement).getByText(label)).toBeInTheDocument();
+      expect(within(sql as HTMLElement).getByText(status).className).toContain(hue);
+      expect(document.querySelector('[data-row="postgres"]')).not.toBeInTheDocument();
+    },
+  );
 
   it('shows the endpoint checked_at as the last-checked time', () => {
     setTail();
@@ -82,7 +94,7 @@ describe('HealthPage', () => {
         conductor: 'unhealthy',
         nats_kv: 'unhealthy',
         executors: 'unhealthy',
-        postgres: 'unhealthy',
+        data_plane_sql: 'unhealthy',
         control_plane: 'unhealthy',
       }),
       reachable: false,

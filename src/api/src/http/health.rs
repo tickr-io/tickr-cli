@@ -8,34 +8,26 @@
 //! change, and a "recheck" is byte-for-byte the same work as a normal request —
 //! caching health would let a stale row lie about a component that just died.
 //!
-//! Three rows are honest on day one; each needs no new substrate:
-//! - **API self** — constant `healthy` whenever the handler runs. The cascade
-//!   rule "API unreachable ⇒ everything unhealthy" is expressed by the endpoint
-//!   simply not answering, so it is a UI concern, not a field here.
-//! - **Postgres** — a `SELECT 1` on the api crate's own pool.
-//! - **NATS JetStream KV** — a `kv.status()` reachability probe on the shared client.
+//! The selected Data-plane SQL row consumes the repository bundle already
+//! composed into the API process. Its repository-owned Health law performs a
+//! trivial read and verifies schema compatibility; only classified failure
+//! detail reaches the wire.
 //!
-//! Status **bands are derived, not tuned**: liveness-sourced rows added by later
-//! slices compute a key's age against the single `TICKR_LIVENESS_TIMEOUT_SECS`
-//! knob (healthy `< TTL/4`, degraded in the `TTL/4..TTL` slack window, unhealthy
-//! at expiry). The three rows here are instantaneous — their detection window is
-//! the request itself — but they carry the same per-row window string so the shape
-//! does not have to change when banded rows arrive.
-//!
-//! The response shape is intentionally extensible: later slices add the
-//! executor-pool, conductor, and control-plane rows as new named fields without
-//! reshaping these three.
+//! Status **bands are derived, not tuned**: the executor row computes key age
+//! against the single `TICKR_LIVENESS_TIMEOUT_SECS` knob (healthy `< TTL/4`,
+//! degraded in the `TTL/4..TTL` slack window, unhealthy at expiry). Every other
+//! row is instantaneous and carries the same per-row window field.
 
 use async_nats::jetstream;
 use async_nats::jetstream::kv::Operation;
 use async_nats::Client;
 use futures::StreamExt;
 use serde::Serialize;
-use sqlx::PgPool;
 use std::time::Duration;
 use utoipa::ToSchema;
 // Consume the writer slice's key schema + bucket name off the published
 // contract — never redefined here, so writer and reader can't drift.
+use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use tickr_proto::coord::{
     ComponentLivenessValue, COMPONENT_LIVENESS_BUCKET, DEFAULT_LIVENESS_TIMEOUT_SECS,
     LIVENESS_TIMEOUT_ENV,
@@ -100,15 +92,59 @@ impl ComponentHealth {
     }
 }
 
+/// Selected Data-plane SQL implementation reported only on the Health surface.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DataPlaneSqlImplementation {
+    Postgres,
+    Sqlite,
+}
+
+impl DataPlaneSqlImplementation {
+    fn from_repository(repositories: &ReadOnlyRepositoryBundle) -> Self {
+        match repositories.implementation() {
+            "postgres" => Self::Postgres,
+            "sqlite" => Self::Sqlite,
+            implementation => {
+                unreachable!("repository returned unknown SQL implementation `{implementation}`")
+            }
+        }
+    }
+}
+
+/// Backend-neutral selected SQL row. `implementation` is display metadata; the
+/// status law is identical for Postgres and SQLite.
+#[derive(Serialize, ToSchema, Debug, Clone)]
+pub struct DataPlaneSqlHealth {
+    pub implementation: DataPlaneSqlImplementation,
+    pub status: ComponentStatus,
+    pub detail: String,
+    pub detection_window: String,
+}
+
+impl DataPlaneSqlHealth {
+    fn instant(
+        implementation: DataPlaneSqlImplementation,
+        status: ComponentStatus,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            implementation,
+            status,
+            detail: detail.into(),
+            detection_window: INSTANT_WINDOW.to_string(),
+        }
+    }
+}
+
 /// The typed body of `GET /api/health`. Carries one global `checked_at` plus one
-/// `{status, detail, detection_window}` row per component. New rows are added as
-/// named fields by later slices; the existing three keep their shape.
+/// named row per component. Data-plane SQL adds selected implementation metadata.
 #[derive(Serialize, ToSchema, Debug, Clone)]
 pub struct HealthResponse {
     /// RFC 3339 instant the whole report was computed (all rows are fresh as of here).
     pub checked_at: String,
     pub api: ComponentHealth,
-    pub postgres: ComponentHealth,
+    pub data_plane_sql: DataPlaneSqlHealth,
     pub nats_kv: ComponentHealth,
     pub executors: ComponentHealth,
     pub conductor: ComponentHealth,
@@ -121,14 +157,22 @@ pub fn api_self() -> ComponentHealth {
     ComponentHealth::instant(ComponentStatus::Healthy, "handler reached; API answering")
 }
 
-/// The Postgres row — a `SELECT 1` on the api crate's own pool. Any error or
-/// timeout (unreachable DB, exhausted pool) ⇒ `unhealthy`.
-pub async fn check_postgres(pool: &PgPool) -> ComponentHealth {
-    match sqlx::query("SELECT 1").execute(pool).await {
-        Ok(_) => ComponentHealth::instant(ComponentStatus::Healthy, "SELECT 1 ok"),
-        Err(e) => {
-            ComponentHealth::instant(ComponentStatus::Unhealthy, format!("SELECT 1 failed: {e}"))
-        }
+/// The selected Data-plane SQL row. The repository owns both the trivial read
+/// and schema-compatibility law. Failure detail exposes only its shared
+/// classification, never the retained backend source.
+pub async fn check_data_plane_sql(repositories: &ReadOnlyRepositoryBundle) -> DataPlaneSqlHealth {
+    let implementation = DataPlaneSqlImplementation::from_repository(repositories);
+    match repositories.health_check().await {
+        Ok(()) => DataPlaneSqlHealth::instant(
+            implementation,
+            ComponentStatus::Healthy,
+            "repository reachable; schema compatible",
+        ),
+        Err(error) => DataPlaneSqlHealth::instant(
+            implementation,
+            ComponentStatus::Unhealthy,
+            format!("repository health check failed: {}", error.kind()),
+        ),
     }
 }
 
@@ -339,7 +383,7 @@ pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHe
 /// `ping_deadline` bounds the Conductor row's command-bus probe; the Control
 /// plane row's one HTTP hop is bounded by the `coordinator` client's own timeout.
 pub async fn build_health_report(
-    pool: &PgPool,
+    repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
     coordinator: &CoordinatorClient,
     ping_deadline: Duration,
@@ -347,7 +391,7 @@ pub async fn build_health_report(
     HealthResponse {
         checked_at: chrono::Utc::now().to_rfc3339(),
         api: api_self(),
-        postgres: check_postgres(pool).await,
+        data_plane_sql: check_data_plane_sql(repositories).await,
         nats_kv: check_nats_kv(nats).await,
         executors: check_executors(nats, liveness_timeout()).await,
         conductor: check_conductor(nats, ping_deadline).await,

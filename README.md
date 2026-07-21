@@ -109,6 +109,38 @@ Checkout-local overrides belong in ignored `.env.local`. The tracked `.envrc`
 contains loopback-only development defaults and is sourced by formation recipes,
 so prior `direnv allow` is optional.
 
+## Data-plane SQL storage
+
+The Conductor writes Data-plane SQL state and the API reads the same selected
+repository. Run `tickr migrate` with the same environment before starting either
+process.
+
+- **Postgres (default):** leave `TICKR_SQL_BACKEND` unset, or set it to
+  `postgres`, and set `TICKR_CONDUCTOR_POSTGRES_URL`. Postgres does not require
+  or interpret `TICKR_SQL_TOPOLOGY`.
+- **SQLite (single node):** set `TICKR_SQL_BACKEND=sqlite`,
+  `TICKR_SQL_TOPOLOGY=single-node`, and an explicit
+  `TICKR_CONDUCTOR_SQLITE_URL`, for example
+  `sqlite:///var/lib/tickr/data-plane.db`. Missing or different topology is
+  rejected before the Conductor starts consumers or the API starts serving.
+
+Place the SQLite file on durable storage local to the host. The migration
+command creates and migrates it; the API opens it read-only and never creates
+or repairs it. The supported formation has one Conductor writer and file-local
+API readers. Network filesystems, multiple Conductor writers, replication, and
+distributed SQLite are not supported.
+
+Restart the Conductor and API against the same file to retain definitions,
+terminal archives, Events, Signal audit state, Patches, replays, and Run
+calendar placement. `/api/health` reports the selected implementation and
+repository status under `data_plane_sql`.
+
+Operators own backup and restore. Coordinate backups with SQLite's WAL: stop
+SQL consumers cleanly or use a SQLite-aware online backup that includes
+committed WAL state. Copying only the main database file while a writer is
+active is not a valid backup. NATS JetStream and object storage remain separate
+durable systems and require their own backup policies.
+
 ## Development
 
 ```sh

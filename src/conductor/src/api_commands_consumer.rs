@@ -19,7 +19,6 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use prost::Message as _;
 use serde_json::Value;
-use sqlx::PgPool;
 use std::sync::Arc;
 use tickr_ctx::envelope::SignalSource;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +44,7 @@ pub const QUEUE_GROUP: &str = "tickr-conductor-api-commands";
 /// subject reached via `nats` inside the pipeline, not threaded here.)
 #[derive(Clone)]
 pub struct ApiCommandsState {
-    pub pg_pool: Arc<PgPool>,
+    pub definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     pub nats: NatsClient,
     pub relay_sender: Arc<dyn WakeupRelaySender>,
     /// Outbound seam for `PatchWorkflowInstance` envelopes — trait-carried so
@@ -184,7 +183,7 @@ async fn dispatch_patch(
     let patch_id = Uuid::new_v4();
 
     match process_patch(
-        &state.pg_pool,
+        state.definition_repository.as_ref(),
         state.patch_relay_sender.as_ref(),
         workflow_instance_id,
         patch_id,
@@ -323,7 +322,7 @@ async fn dispatch_replay(
         nats: state.nats.clone(),
     };
 
-    match process_replay(state.pg_pool.as_ref(), &sender, pipeline_req).await {
+    match process_replay(state.definition_repository.as_ref(), &sender, pipeline_req).await {
         Ok(ReplayIngress::Accepted {
             replay_instance_id,
             doomed,
@@ -387,7 +386,13 @@ async fn dispatch_register(
         nickel_source: req.nickel_source,
         namespace: req.namespace,
     };
-    match process_register(state.pg_pool.as_ref(), &state.nats, pipeline_req).await {
+    match process_register(
+        state.definition_repository.as_ref(),
+        &state.nats,
+        pipeline_req,
+    )
+    .await
+    {
         Ok(RegisterOutcome::Inserted {
             workflow_id,
             workflow_version,
@@ -522,7 +527,13 @@ async fn dispatch_trigger(
         name: req.name,
     };
 
-    let outcome = match process_trigger(state.pg_pool.as_ref(), &state.nats, pipeline_req).await {
+    let outcome = match process_trigger(
+        state.definition_repository.as_ref(),
+        &state.nats,
+        pipeline_req,
+    )
+    .await
+    {
         Ok(o) => o,
         Err(TriggerError::WorkflowNotFound { .. }) => {
             return error_response(
@@ -554,7 +565,7 @@ async fn dispatch_trigger(
         }
         Err(e @ TriggerError::WorkflowLookup(_))
         | Err(e @ TriggerError::Idempotency(_))
-        | Err(e @ TriggerError::PostgresWrite(_))
+        | Err(e @ TriggerError::RepositoryWrite(_))
         | Err(e @ TriggerError::NatsWrite(_)) => {
             return error_response(500, api::CommandErrorCode::Internal, e.to_string())
         }
@@ -632,7 +643,7 @@ async fn dispatch_wakeup(
     };
 
     match process_wakeup(
-        state.pg_pool.as_ref(),
+        state.definition_repository.as_ref(),
         &state.nats,
         state.relay_sender.as_ref(),
         &state.gate_index,
@@ -732,7 +743,13 @@ async fn dispatch_cancel(
         idempotency_key: req.idempotency_key,
     };
 
-    match process_cancel(state.pg_pool.as_ref(), &state.nats, pipeline_req).await {
+    match process_cancel(
+        state.definition_repository.as_ref(),
+        &state.nats,
+        pipeline_req,
+    )
+    .await
+    {
         Ok(CancelOutcome::Instance { signal_id }) => cancel_response(
             200,
             api::cancel_payload::Outcome::Instance(api::cancel_payload::Instance {

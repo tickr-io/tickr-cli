@@ -13,22 +13,20 @@
 //!   and deletes `signal_captures` rows whose `terminal_at` has aged past
 //!   the configurable grace window (default 24h). Idempotent: a row whose
 //!   NATS deletes failed on the first pass is re-tried by re-issuing the
-//!   deletes here, then the Postgres row goes.
+//!   deletes here, then the settled repository row goes.
 
 use anyhow::{Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
-use sqlx::PgPool;
 use std::time::Duration;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use uuid::Uuid;
-
-use crate::signal_captures;
 
 /// Per-tenant tickr-ctx bucket namespace. Mirrors the HTTP handler's value
 /// so deletes target the same bucket the writes landed in.
 const DEFAULT_CTX_NAMESPACE: &str = "default";
 
-/// Default time a terminal row lives in Postgres before the sweep deletes
-/// it. Keeps the audit trail visible long enough for post-mortem inspection
+/// Default time a terminal row remains queryable before the repository sweep
+/// deletes it. Keeps the audit trail visible long enough for post-mortem inspection
 /// without indefinite storage growth.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -45,13 +43,14 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// instrument; an empty list is a valid outcome (cron-fired runs and runs
 /// with no captures both produce zero linked rows).
 pub async fn on_workflow_terminal(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     workflow_instance_id: Uuid,
 ) -> Result<Vec<Uuid>> {
-    let rows = signal_captures::list_active_for_run(pool, workflow_instance_id)
+    let rows = repositories
+        .mark_signal_captures_terminal(workflow_instance_id)
         .await
-        .context("list active signal_captures for terminal run")?;
+        .context("settle Trigger-derived Event variables for terminal run")?;
 
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -63,29 +62,18 @@ pub async fn on_workflow_terminal(
 
     let mut touched = Vec::with_capacity(rows.len());
     for row in rows {
-        // Mark Postgres first. Even if the NATS deletes fail partially, the
-        // sweep can pick up the leftover keys later — but the row must be
-        // `terminal_at`-flipped so the sweep considers it at all.
-        signal_captures::mark_terminal(pool, row.signal_id)
-            .await
-            .context("mark signal_captures terminal during compaction hook")?;
-
-        // NATS deletes. Per capture, delete `<signal_id>/<name>`. Missing
-        // bucket is non-fatal — the cache is the working-set; Postgres is
-        // the source of truth.
         if let Some(kv) = kv_opt.as_ref() {
             let signal_prefix = sanitize_segment(&row.signal_id.to_string());
-            for cap in &row.captures {
-                let key = format!("{}/{}", signal_prefix, cap.name);
+            for name in row.capture_names() {
+                let key = format!("{}/{}", signal_prefix, name);
                 if let Err(e) = kv.delete(&key).await {
                     eprintln!(
                         "signal_captures_cleanup: NATS delete failed for {}/{}: {} (sweep will retry)",
-                        signal_prefix, cap.name, e
+                        signal_prefix, name, e
                     );
                 }
             }
         }
-
         touched.push(row.signal_id);
     }
 
@@ -95,16 +83,18 @@ pub async fn on_workflow_terminal(
 /// Grace-window sweep. Deletes `signal_captures` rows whose `terminal_at`
 /// is older than `grace`. Re-issues NATS deletes for any keys that didn't
 /// land on the first pass (the row carries enough state to know the keys).
-/// Returns the count of rows deleted from Postgres so a caller can emit
+/// Returns the count of rows deleted from the repository so a caller can emit
 /// telemetry.
 pub async fn sweep_expired(
-    pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     nats: &NatsClient,
     grace: chrono::Duration,
 ) -> Result<usize> {
-    let expired = signal_captures::list_expired_for_sweep(pool, grace)
+    let cutoff = chrono::Utc::now() - grace;
+    let expired = repositories
+        .expired_signal_captures(cutoff)
         .await
-        .context("list expired signal_captures rows for sweep")?;
+        .context("list expired Trigger-derived Event variables")?;
 
     if expired.is_empty() {
         return Ok(0);
@@ -115,26 +105,19 @@ pub async fn sweep_expired(
     let kv_opt = js.get_key_value(&bucket_name).await.ok();
 
     let mut deleted = 0usize;
-    for signal_id in expired {
-        // Idempotent NATS retry. Read the row first so we know which keys
-        // to delete; if the row is already gone, the sweep already ran for
-        // this signal_id and we're racing — bail out cleanly.
-        if let Some(row) = signal_captures::read(pool, signal_id)
-            .await
-            .context("read signal_captures row during sweep")?
-        {
-            if let Some(kv) = kv_opt.as_ref() {
-                let signal_prefix = sanitize_segment(&signal_id.to_string());
-                for cap in &row.captures {
-                    let key = format!("{}/{}", signal_prefix, cap.name);
-                    // Idempotent — delete on a missing key is a no-op for
-                    // NATS JetStream KV.
-                    let _ = kv.delete(&key).await;
-                }
+    for row in expired {
+        if let Some(kv) = kv_opt.as_ref() {
+            let signal_prefix = sanitize_segment(&row.signal_id.to_string());
+            for name in row.capture_names() {
+                let key = format!("{}/{}", signal_prefix, name);
+                let _ = kv.delete(&key).await;
             }
-            signal_captures::delete(pool, signal_id)
-                .await
-                .context("delete signal_captures row during sweep")?;
+        }
+        if repositories
+            .delete_expired_signal_captures(row.signal_id, cutoff)
+            .await
+            .context("delete expired Trigger-derived Event variables")?
+        {
             deleted += 1;
         }
     }
@@ -146,7 +129,7 @@ pub async fn sweep_expired(
 /// cadence and `grace` for the per-row age cutoff. The sweep continues
 /// until `shutdown` flips to `true`.
 pub fn spawn_periodic_sweep(
-    pool: std::sync::Arc<PgPool>,
+    repositories: std::sync::Arc<WriterRepositoryBundle>,
     nats: NatsClient,
     interval: Duration,
     grace: chrono::Duration,
@@ -160,7 +143,7 @@ pub fn spawn_periodic_sweep(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    match sweep_expired(pool.as_ref(), &nats, grace).await {
+                    match sweep_expired(repositories.as_ref(), &nats, grace).await {
                         Ok(0) => {} // idle
                         Ok(n) => println!("signal_captures sweep: deleted {} expired rows", n),
                         Err(e) => eprintln!("signal_captures sweep: error: {}", e),

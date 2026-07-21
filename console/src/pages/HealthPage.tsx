@@ -12,6 +12,7 @@ import {
   HEALTH_ROWS,
   HEALTH_SECTIONS,
   cardsDimmed,
+  healthRowName,
   type DisplayRow,
   type HealthDisplay,
   type HealthSection,
@@ -76,8 +77,13 @@ function SectionCard({
         <span className="text-sm font-semibold">{title}</span>
         <span className="text-xs text-muted-foreground">{caption}</span>
       </div>
-      {rows.map((r) => (
-        <HealthRow key={r.key} rowKey={r.key} name={r.name} row={display[r.key]} />
+      {rows.map((spec) => (
+        <HealthRow
+          key={spec.key}
+          rowKey={spec.key}
+          name={healthRowName(spec, display[spec.key])}
+          row={display[spec.key]}
+        />
       ))}
     </Card>
   );

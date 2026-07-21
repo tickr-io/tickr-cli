@@ -118,12 +118,14 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
         return;
     };
     set_dsl_path();
+    let repository =
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone());
 
     let src_a = wf_source("expr-a");
     let src_b = wf_source("expr-b");
 
     // First registration → Inserted at v1.
-    let (id, v1) = match process_register(&pool, &nats, req(&src_a))
+    let (id, v1) = match process_register(&repository, &nats, req(&src_a))
         .await
         .expect("register v1")
     {
@@ -137,7 +139,7 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
     assert_eq!(v1, 1, "first registration is version 1");
 
     // Byte-identical re-submission → NoOp at v1, no new row.
-    match process_register(&pool, &nats, req(&src_a))
+    match process_register(&repository, &nats, req(&src_a))
         .await
         .expect("register identical")
     {
@@ -148,7 +150,7 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
     }
 
     // Changed content (different nix_expression_path) → Inserted at v2.
-    match process_register(&pool, &nats, req(&src_b))
+    match process_register(&repository, &nats, req(&src_b))
         .await
         .expect("register changed")
     {
@@ -160,7 +162,7 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
 
     // Rollback-by-resubmit: the v1 content again. It matches v1's hash but
     // differs from the latest (v2), so it mints a new MAX+1 row at v3.
-    match process_register(&pool, &nats, req(&src_a))
+    match process_register(&repository, &nats, req(&src_a))
         .await
         .expect("register rollback")
     {
@@ -211,7 +213,7 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
     // Resubmit v3's content (expr-a) with a different display name → Refreshed at
     // v3 (content hash matches; cosmetic hash differs). No new row.
     match process_register(
-        &pool,
+        &repository,
         &nats,
         req(&wf_source_named("expr-a", "Renamed-Display")),
     )
@@ -263,7 +265,7 @@ async fn register_assigns_versions_noops_identical_and_rolls_back() {
         .await
         .expect("flip v3 BuildFailed");
     // Resubmit identical content → BuildRequeued at v3 (no bump).
-    match process_register(&pool, &nats, req(&wf_source("expr-a")))
+    match process_register(&repository, &nats, req(&wf_source("expr-a")))
         .await
         .expect("register on failed build")
     {

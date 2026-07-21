@@ -7,12 +7,10 @@
 //! applies the same idempotency cache the HTTP-trigger path uses, and
 //! forwards a wire `Signal` over the existing relay outbound channel.
 //!
-//! Slice scope (this file's first revision): the Trigger variant is wired
-//! end-to-end through the same captures-extraction + Postgres + NATS-KV
-//! pipeline the HTTP path already runs. Cancel and Wakeup variants parse
-//! successfully (so the envelope contract is stable for publishers) but
-//! the translator logs and acks them without forwarding — their consumer
-//! wiring lands in subsequent slices.
+//! Trigger and Wakeup reuse the SQL-backed Event-variable/audit repository
+//! plus NATS ctx working state. External Cancel is deliberately NATS-only:
+//! its idempotency bucket is its sole durable state, and a fresh envelope's
+//! only downstream effect is one relay forward.
 //!
 //! Tenant boundary is implicit via the NATS cluster — each tenant runs
 //! its own NATS, so the subject `tickr.external.signals` is single-tenant
@@ -28,11 +26,11 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tickr_ctx::envelope::SignalSource;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::signal as sp;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -430,10 +428,16 @@ pub async fn init_stream_and_consumer(nats: &NatsClient) -> Result<PullConsumer>
 /// `run_translator_with_sender` to inject a capturing sender.
 pub async fn run_translator(
     nats: NatsClient,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_translator_with_sender(nats, pg_pool, Arc::new(GlobalRelaySender), shutdown_token).await
+    run_translator_with_sender(
+        nats,
+        repositories,
+        Arc::new(GlobalRelaySender),
+        shutdown_token,
+    )
+    .await
 }
 
 /// Run the translator-loop with an explicit relay sender. Pulls messages
@@ -442,7 +446,7 @@ pub async fn run_translator(
 /// + acked without forwarding in this slice.
 pub async fn run_translator_with_sender(
     nats: NatsClient,
-    pg_pool: Arc<PgPool>,
+    repositories: Arc<WriterRepositoryBundle>,
     relay_sender: Arc<dyn RelaySender>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
@@ -470,7 +474,7 @@ pub async fn run_translator_with_sender(
                     Some(Ok(msg)) => {
                         let disposition = process_one(
                             &nats,
-                            pg_pool.as_ref(),
+                            repositories.as_ref(),
                             relay_sender.as_ref(),
                             &msg,
                         )
@@ -531,7 +535,7 @@ enum MessageDisposition {
 /// disposition the loop should apply to the NATS message.
 async fn process_one(
     nats: &NatsClient,
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     relay_sender: &dyn RelaySender,
     msg: &async_nats::jetstream::Message,
 ) -> MessageDisposition {
@@ -558,7 +562,7 @@ async fn process_one(
         } => {
             match process_trigger(
                 nats,
-                pg_pool,
+                repositories,
                 relay_sender,
                 idempotency_key,
                 workflow_id,
@@ -595,7 +599,8 @@ async fn process_one(
             name,
             target,
             payload,
-        } => match process_wakeup(nats, pg_pool, idempotency_key, name, target, payload).await {
+        } => match process_wakeup(nats, repositories, idempotency_key, name, target, payload).await
+        {
             Ok(disposition) => disposition,
             Err(e) => {
                 eprintln!("nats_ingress: wakeup processing failed: {}", e);
@@ -606,14 +611,14 @@ async fn process_one(
 }
 
 /// Process a parsed Trigger envelope. Delegates the workflow-lookup +
-/// captures-extraction + Postgres/NATS write + idempotency-cache
+/// captures-extraction + SQL-repository/NATS write + idempotency-cache
 /// orchestration to the shared `trigger_pipeline` module; this function is
 /// the NATS-transport adapter that translates between envelope shape and
 /// pipeline-Outcome, applies the counter increments specific to the NATS
 /// path, and handles relay forwarding with NAK-on-saturation semantics.
 async fn process_trigger(
     nats: &NatsClient,
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     relay_sender: &dyn RelaySender,
     idempotency_key: String,
     workflow_id: Uuid,
@@ -644,11 +649,11 @@ async fn process_trigger(
         name: None,
     };
 
-    let outcome = match crate::trigger_pipeline::process_trigger(pg_pool, nats, pipeline_req).await
-    {
-        Ok(o) => o,
-        Err(e) => return Err(anyhow!("{}", e)),
-    };
+    let outcome =
+        match crate::trigger_pipeline::process_trigger(repositories, nats, pipeline_req).await {
+            Ok(o) => o,
+            Err(e) => return Err(anyhow!("{}", e)),
+        };
 
     match outcome {
         crate::trigger_pipeline::TriggerOutcome::Fresh { signal, .. } => {
@@ -688,9 +693,9 @@ async fn process_trigger(
 
 /// Process a parsed Cancel envelope. Shares the idempotency-cache check
 /// with the Trigger path: Fresh forwards, Deduplicated short-circuits
-/// silently, Collision drops with the matching counter. Cancel has no
-/// captures pipeline and no PostgreSQL archive write, so relay forwarding is
-/// its only side effect.
+/// silently, Collision drops with the matching counter. Cancel receives no SQL
+/// repository and performs no audit, lookup, linkage, or cleanup operation.
+/// Its NATS idempotency claim is the sole durable side effect.
 async fn process_cancel(
     nats: &NatsClient,
     relay_sender: &dyn RelaySender,
@@ -798,7 +803,7 @@ async fn process_cancel(
 /// transport delivered it.
 async fn process_wakeup(
     nats: &NatsClient,
-    pg_pool: &PgPool,
+    repositories: &WriterRepositoryBundle,
     idempotency_key: String,
     name: String,
     target_value: Value,
@@ -819,7 +824,7 @@ async fn process_wakeup(
 
     let gate_index = crate::gate_index_lifecycle::gate_index();
     let outcome = crate::wakeup_translator::process_wakeup(
-        pg_pool,
+        repositories,
         nats,
         &crate::wakeup_translator::DefaultRelaySender,
         &gate_index,

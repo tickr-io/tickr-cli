@@ -158,9 +158,14 @@ async fn materialization_writes_the_ctx_graph_with_codes_and_version() {
     insert_workflow(&pool, &workflow).await;
 
     let run_id = Uuid::new_v4();
-    mirror_ctx_graph(&pool, &nats, run_id, workflow_id)
-        .await
-        .expect("mirror the ctx graph");
+    mirror_ctx_graph(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        &nats,
+        run_id,
+        workflow_id,
+    )
+    .await
+    .expect("mirror the ctx graph");
 
     let (envelope, ctx_graph) = read_ctx_graph(&nats, run_id)
         .await
@@ -234,16 +239,26 @@ async fn mirror_is_idempotent_across_repeated_dispatches() {
     insert_workflow(&pool, &workflow).await;
     let run_id = Uuid::new_v4();
 
-    mirror_ctx_graph(&pool, &nats, run_id, workflow_id)
-        .await
-        .expect("first mirror");
+    mirror_ctx_graph(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        &nats,
+        run_id,
+        workflow_id,
+    )
+    .await
+    .expect("first mirror");
     let (first, _) = read_ctx_graph(&nats, run_id)
         .await
         .expect("present after first");
 
-    mirror_ctx_graph(&pool, &nats, run_id, workflow_id)
-        .await
-        .expect("second mirror is a no-op");
+    mirror_ctx_graph(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        &nats,
+        run_id,
+        workflow_id,
+    )
+    .await
+    .expect("second mirror is a no-op");
     let (second, _) = read_ctx_graph(&nats, run_id).await.expect("still present");
 
     // The present-key short-circuit means the first write is retained verbatim.

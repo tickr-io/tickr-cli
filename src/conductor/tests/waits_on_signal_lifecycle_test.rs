@@ -9,7 +9,7 @@ mod common;
 use chrono::{DateTime, TimeZone, Utc};
 use tickr_conductor::subscription_index::SubscriptionIndex;
 use tickr_conductor::waits_on_signal_lifecycle::{
-    apply_workflow_state, rebuild_from_postgres, signal_subscription_index,
+    apply_workflow_state, rebuild_from_repository, signal_subscription_index,
 };
 use tickr_proto::codec::definition::definition_proto_to_json;
 use tickr_proto::workflow as wf;
@@ -150,7 +150,11 @@ async fn rebuild_from_postgres_loads_ready_workflows_only() {
     signal_subscription_index().unregister(workflow_id(&wf_ready));
     signal_subscription_index().unregister(workflow_id(&wf_failed));
 
-    let count = rebuild_from_postgres(&pool).await.expect("rebuild");
+    let count = rebuild_from_repository(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+    )
+    .await
+    .expect("rebuild");
     assert!(count >= 1, "at least the Ready workflow should rebuild");
     let idx = signal_subscription_index();
     let entries = idx.lookup("rebuild-paid");
@@ -224,7 +228,11 @@ async fn rebuild_registers_only_latest_live_version_per_id() {
 
     signal_subscription_index().unregister(id);
 
-    rebuild_from_postgres(&pool).await.expect("rebuild");
+    rebuild_from_repository(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+    )
+    .await
+    .expect("rebuild");
     let idx = signal_subscription_index();
     assert!(
         idx.lookup(&new_name).iter().any(|e| e.workflow_id == id),
@@ -257,7 +265,11 @@ async fn rebuild_skips_workflows_without_waits_on_signal_config() {
     insert_workflow_row(&pool, &plain, "Ready").await;
     signal_subscription_index().unregister(workflow_id(&plain));
 
-    let _ = rebuild_from_postgres(&pool).await.expect("rebuild");
+    let _ = rebuild_from_repository(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+    )
+    .await
+    .expect("rebuild");
     // No subscription should exist for this workflow_id. SubscriptionIndex
     // doesn't expose a "by workflow_id" scan, so we round-trip through
     // apply_workflow_state — which unregisters because there's no

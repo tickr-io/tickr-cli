@@ -186,8 +186,14 @@ async fn unsupported_command_is_forwarded_as_501() {
     // Real conductor subscriber. An empty-body envelope dispatches to the
     // unsupported-command arm no matter which command arms are wired.
     let cancel = CancellationToken::new();
+    let pool = Arc::new(pool);
+    let definition_repository = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        ),
+    );
     let state = tickr_conductor::api_commands_consumer::ApiCommandsState {
-        pg_pool: Arc::new(pool),
+        definition_repository,
         nats: nats.clone(),
         relay_sender: Arc::new(tickr_conductor::wakeup_translator::DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),

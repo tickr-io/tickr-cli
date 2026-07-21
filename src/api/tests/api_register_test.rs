@@ -135,8 +135,13 @@ async fn start_postgres() -> Option<(
 /// boot-ordering flake class the design accepts for the dev loop.
 async fn spawn_subscriber(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> CancellationToken {
     let cancel = CancellationToken::new();
+    let definition_repository = Arc::new(
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        ),
+    );
     let state = ApiCommandsState {
-        pg_pool: pool,
+        definition_repository,
         nats: nats.clone(),
         relay_sender: Arc::new(DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),
@@ -167,7 +172,16 @@ async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
         nats.clone(),
     ));
 
-    let state = tickr_api::http::routes::build_app_state(Arc::new(nats), pool, coordinator, logs);
+    let state = tickr_api::http::routes::build_app_state(
+        Arc::new(nats),
+        Arc::new(
+            tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(
+                pool.as_ref().clone(),
+            ),
+        ),
+        coordinator,
+        logs,
+    );
     let app = tickr_api::http::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await

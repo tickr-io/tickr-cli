@@ -243,7 +243,7 @@ function StorageIndicator({ storage }: { storage: InstanceSnapshot['storage'] })
       live
     </Badge>
   ) : (
-    <span className="font-mono text-xs text-muted-foreground">archived · Postgres</span>
+    <span className="font-mono text-xs text-muted-foreground">archived state</span>
   );
 }
 

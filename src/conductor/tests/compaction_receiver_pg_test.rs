@@ -13,6 +13,7 @@ use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tickr_conductor::system_tasks::persist_compaction_projection;
+use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_proto::archive as ap;
 use tickr_proto::instance::{AppliedPatchView, PatchOpView};
 use uuid::Uuid;
@@ -70,10 +71,11 @@ async fn persists_workflow_instance_and_task_instances_in_one_txn(
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = WriterRepositoryBundle::from_postgres_pool(pool.as_ref().clone());
     let projection = projection_with_tasks("Completed", 2);
     let wfi_id = Uuid::parse_str(&projection.id)?;
 
-    persist_compaction_projection(&pool, &projection, Some(Utc::now()), None).await?;
+    persist_compaction_projection(&repositories, &projection, Some(Utc::now()), None).await?;
 
     let wfi_count: i64 = sqlx::query("SELECT count(*) FROM workflow_instances WHERE id = $1")
         .bind(wfi_id)
@@ -122,10 +124,11 @@ async fn stored_projection_decodes_through_the_published_archive_codec(
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = WriterRepositoryBundle::from_postgres_pool(pool.as_ref().clone());
     let projection = received_projection("terminal_union_instance.json");
     let id = Uuid::parse_str(&projection.id)?;
 
-    persist_compaction_projection(&pool, &projection, Some(Utc::now()), None).await?;
+    persist_compaction_projection(&repositories, &projection, Some(Utc::now()), None).await?;
     let stored: serde_json::Value =
         sqlx::query("SELECT instance FROM workflow_instances WHERE id = $1")
             .bind(id)
@@ -150,12 +153,13 @@ async fn duplicate_delivery_is_idempotent_via_on_conflict() -> Result<(), Box<dy
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = WriterRepositoryBundle::from_postgres_pool(pool.as_ref().clone());
     let projection = projection_with_tasks("Failed", 1);
     let wfi_id = Uuid::parse_str(&projection.id)?;
     let ti_id = Uuid::parse_str(&projection.task_instances[0].id)?;
 
-    persist_compaction_projection(&pool, &projection, Some(Utc::now()), None).await?;
-    persist_compaction_projection(&pool, &projection, Some(Utc::now()), None).await?;
+    persist_compaction_projection(&repositories, &projection, Some(Utc::now()), None).await?;
+    persist_compaction_projection(&repositories, &projection, Some(Utc::now()), None).await?;
 
     let wfi_count: i64 = sqlx::query("SELECT count(*) FROM workflow_instances WHERE id = $1")
         .bind(wfi_id)
@@ -179,6 +183,7 @@ async fn stored_archive_excludes_cluster_provenance_without_removing_graph_slot_
         return Ok(());
     };
     let pool = Arc::new(pool);
+    let repositories = WriterRepositoryBundle::from_postgres_pool(pool.as_ref().clone());
     let mut projection = received_projection("terminal_union_instance.json");
     let graph_slot_id = Uuid::new_v4().to_string();
     projection.applied_patches.push(AppliedPatchView {
@@ -198,7 +203,7 @@ async fn stored_archive_excludes_cluster_provenance_without_removing_graph_slot_
         minted_map: Default::default(),
     });
     let id = Uuid::parse_str(&projection.id)?;
-    persist_compaction_projection(&pool, &projection, Some(Utc::now()), None).await?;
+    persist_compaction_projection(&repositories, &projection, Some(Utc::now()), None).await?;
 
     const FORBIDDEN: [&str; 6] = [
         "owned",

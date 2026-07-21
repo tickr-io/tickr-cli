@@ -98,10 +98,13 @@ async fn renamed_trigger_capture_extracts_new_name_on_next_trigger() {
     insert_version(&pool, &v1, "Ready", at(1)).await;
     insert_version(&pool, &v2, "Ready", at(2)).await;
 
-    let resolved = load_live_workflow_definition(&pool, id)
-        .await
-        .expect("resolver query")
-        .expect("a live version exists");
+    let resolved = load_live_workflow_definition(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        id,
+    )
+    .await
+    .expect("resolver query")
+    .expect("a live version exists");
     assert_eq!(
         resolved.version, 2,
         "the latest live version must be resolved, not an arbitrary row"
@@ -147,8 +150,10 @@ async fn renamed_trigger_capture_extracts_new_name_on_next_trigger() {
             envelope: e.envelope.clone(),
         })
         .collect();
+    let repositories =
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone());
     tickr_conductor::signal_captures::insert(
-        &pool,
+        &repositories,
         signal_id,
         id,
         Some(resolved.version),
@@ -157,14 +162,13 @@ async fn renamed_trigger_capture_extracts_new_name_on_next_trigger() {
     .await
     .expect("insert signal_captures row");
 
-    let (stamped,): (Option<i64>,) =
-        sqlx::query_as("SELECT workflow_version FROM signal_captures WHERE signal_id = $1")
-            .bind(signal_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read stamped workflow_version");
+    let stamped = repositories
+        .signal_captures(signal_id)
+        .await
+        .expect("read stamped workflow_version")
+        .expect("capture record");
     assert_eq!(
-        stamped,
+        stamped.workflow_version,
         Some(resolved.version),
         "the persisted capture row must stamp the live version the extraction resolved"
     );
@@ -186,10 +190,13 @@ async fn building_version_above_live_ready_is_not_selected() {
     insert_version(&pool, &live, "Ready", at(1)).await;
     insert_version(&pool, &building, "Building", at(2)).await;
 
-    let resolved = load_live_workflow_definition(&pool, id)
-        .await
-        .expect("resolver query")
-        .expect("a live version exists");
+    let resolved = load_live_workflow_definition(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        id,
+    )
+    .await
+    .expect("resolver query")
+    .expect("a live version exists");
     assert_eq!(
         resolved.version, 1,
         "the live Ready version must win over a higher mid-Building one"
@@ -210,9 +217,12 @@ async fn no_live_version_resolves_to_none() {
     let building = workflow_with_trigger_capture(id, 1, "candidate");
     insert_version(&pool, &building, "Building", at(1)).await;
 
-    let resolved = load_live_workflow_definition(&pool, id)
-        .await
-        .expect("resolver query");
+    let resolved = load_live_workflow_definition(
+        &tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(pool.clone()),
+        id,
+    )
+    .await
+    .expect("resolver query");
     assert!(
         resolved.is_none(),
         "with no live version the resolver returns None rather than a Building row"
