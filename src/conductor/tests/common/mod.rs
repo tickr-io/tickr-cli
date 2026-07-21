@@ -19,11 +19,11 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
-/// Base connection string (no database) for the shared Postgres. Overridable
-/// via `TICKR_TEST_PG_URL`; defaults to the instance the setup script starts.
+/// Base connection string (no database) for the disposable PostgreSQL instance
+/// that `just test` starts. Direct Cargo invocations must provide it explicitly.
 fn admin_base() -> String {
     std::env::var("TICKR_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55432".to_string())
+        .expect("TICKR_TEST_PG_URL is required; run `just test` or set an isolated PostgreSQL URL")
 }
 
 /// Owns a per-test database on the shared Postgres and drops it when the test

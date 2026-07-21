@@ -1,0 +1,20 @@
+# Disposable PostgreSQL for `just test`. It deliberately has no fixed host port,
+# bind mount, or production Compose project name, so a worktree verifier cannot
+# alter a developer's tickr-cli-dev formation.
+services:
+  db:
+    image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
+    environment:
+      POSTGRES_USER: ${TICKR_DEV_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${TICKR_DEV_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TICKR_DEV_POSTGRES_USER:-postgres} -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    ports:
+      - "127.0.0.1::5432"
+    security_opt:
+      - no-new-privileges:true

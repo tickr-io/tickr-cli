@@ -248,12 +248,8 @@ verify:
     echo "verify: ok"
 
 test *args:
-    # Integration coverage is mandatory: start the shared Postgres and fail
-    # instead of silently accepting infrastructure skips.
     docker info >/dev/null
-    just infra-up
-    just _wait-db
-    bash -c 'source .envrc; exec cargo test --locked --workspace {{args}} -- --test-threads=1'
+    scripts/test_with_isolated_postgres.sh {{args}}
 
 dsl-check file:
     nickel export {{file}} --format json -I dsl
