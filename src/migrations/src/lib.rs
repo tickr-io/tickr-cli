@@ -75,6 +75,10 @@ pub const LOGICAL_MIGRATIONS: &[LogicalMigrationIdentity] = &[
         version: 10,
         name: "local_compaction_staging",
     },
+    LogicalMigrationIdentity {
+        version: 11,
+        name: "workflow_calendar_replay_indexes",
+    },
 ];
 
 struct PairedMigrationSet {
