@@ -297,8 +297,8 @@ pub async fn run_compaction_drain(
                             }
                             Err(e) => {
                                 eprintln!(
-                                    "compaction_drain: archival failed for {}: {} (NAK; queue redelivers)",
-                                    wfi_id, e
+                                    "compaction_drain: archival failed for {}: {e:#} (NAK; queue redelivers)",
+                                    wfi_id
                                 );
                                 if let Err(e) = msg
                                     .ack_with(jetstream::AckKind::Nak(None))

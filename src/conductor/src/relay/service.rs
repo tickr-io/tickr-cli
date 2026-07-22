@@ -10,6 +10,7 @@ use futures::StreamExt;
 use once_cell::sync::Lazy;
 use prost::Message;
 use std::sync::Arc;
+use std::time::Duration;
 use tickr_proto::codec::compaction::decode_envelope;
 use tickr_proto::coord::{
     parse_liveness_key, LIVENESS_BUCKET, LIVENESS_MARKER_CONSUMER, LIVENESS_MARKER_TTL,
@@ -31,6 +32,10 @@ use uuid::Uuid;
 // Global channel for sending relay messages
 static RELAY_TX: Lazy<Arc<Mutex<Option<mpsc::Sender<ConductorRelayMessage>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+
+/// Prevent a durable definition-lookup fault from hot-looping its JetStream
+/// message and exhausting local log storage before an Operator can repair it.
+const LOOKUP_INTEGRITY_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Inject the relay-tx slot directly. Production sets it via `run_streaming`
 /// once the gRPC stream is established; integration tests that don't want
@@ -521,12 +526,13 @@ pub async fn drain_task_events(
         // event). Forwarding a completion without a routing variable the task
         // actually produced would silently strand any loop gated on it, so
         // both genuine faults fail closed: a lookup-integrity fault is NAK'd
-        // back to the durable queue (loud on every redelivery, recoverable
-        // once the fault is fixed), and an emitted-but-dropped declared
-        // variable — deterministic, so redelivery can never enrich it — is
-        // escalated to a conductor-minted terminal task failure. A bag-read
-        // failure is surfaced loudly and the un-enriched event forwarded, so
-        // task completion is never dropped on a routing-var bug.
+        // back to the durable queue after a bounded delay, recoverable once
+        // the fault is fixed without creating a hot redelivery loop; and an
+        // emitted-but-dropped declared variable — deterministic, so redelivery
+        // can never enrich it — is escalated to a conductor-minted terminal
+        // task failure. A bag-read failure is surfaced loudly and the
+        // un-enriched event forwarded, so task completion is never dropped on
+        // a routing-var bug.
         match crate::routing_enrichment::enrich_completed_task_event(
             definition_repository.as_ref(),
             &nats,
@@ -537,10 +543,12 @@ pub async fn drain_task_events(
             Ok(()) => {}
             Err(e @ crate::routing_enrichment::EnrichmentError::LookupIntegrity { .. }) => {
                 eprintln!(
-                    "routing-variable enrichment failed for task {:?}: {} (fail closed: not forwarding; NAK for redelivery)",
+                    "routing-variable enrichment failed for task {:?}: {} (fail closed: not forwarding; delayed redelivery)",
                     task_event.task_instance_id, e
                 );
-                let _ = msg.ack_with(jetstream::AckKind::Nak(None)).await;
+                let _ = msg
+                    .ack_with(jetstream::AckKind::Nak(Some(LOOKUP_INTEGRITY_RETRY_DELAY)))
+                    .await;
                 continue;
             }
             Err(e @ crate::routing_enrichment::EnrichmentError::SplitStageDrop { .. }) => {
