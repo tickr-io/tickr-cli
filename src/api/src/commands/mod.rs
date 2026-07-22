@@ -1,10 +1,11 @@
-//! API-side command bus: the thin write surface that forwards UI/agent write
-//! requests to the conductor over NATS core request/reply.
+//! API-side Command bus: the thin write surface that forwards UI and agent
+//! mutations to the Conductor.
 //!
-//! `client` owns the transport (encode the proto envelope, `nats.request(...)`
-//! with the per-command deadline, decode the reply, map transport failures to
-//! HTTP responses). The per-command HTTP handlers in `http::routes` build the
-//! request envelope from the parsed body and render the typed reply payload
-//! into today's HTTP body shape.
+//! `client` selects distributed NATS Core or bounded local request/reply while
+//! retaining one protobuf and failure contract. `local` owns the private
+//! in-process transport used by Tickr Lite. Per-command HTTP handlers build the
+//! request envelope and render the typed response without observing the
+//! selected transport.
 
 pub mod client;
+pub mod local;

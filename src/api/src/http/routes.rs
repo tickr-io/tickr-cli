@@ -1,13 +1,14 @@
 //! HTTP routes for the tickr API component.
 
 use crate::commands::client::{
-    bus_error_response, public_error_message, send_command, BusError, CommandDeadlines,
+    bus_error_response, public_error_message, BusError, CommandBus, CommandDeadlines,
 };
 use anyhow::Result;
 use async_nats::Client;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, Request, State},
     http::{header, StatusCode},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -59,9 +60,10 @@ struct TenantInfoResponse {
 /// only the selected read-only repository operation bundle.
 #[derive(Clone)]
 pub struct AppState {
-    // Live log batches + the command-bus transport for write requests. Read by
-    // the logs handler and the write handlers.
-    nats: Arc<Client>,
+    // Present only in the distributed formation; Tickr Lite selects local
+    // query roles and must never open a NATS connection.
+    nats: Option<Arc<Client>>,
+    command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
     // HTTP client to the coordinator for live-state subqueries. Separate from
     // any relay so UI query load can't head-of-line block system comms.
@@ -71,25 +73,74 @@ pub struct AppState {
     logs: Arc<super::logs_resolver::LogsResolver>,
     // Per-command deadlines for write requests forwarded over the command bus.
     deadlines: CommandDeadlines,
+    // Tickr Lite publishes this only after complete formation admission.
+    lite_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    console_root: Option<Arc<std::path::PathBuf>>,
+    executor_fleet: Option<tickr_executor::local_pickup::LocalExecutorFleetStatus>,
+    // Immutable, location-free projection of the admitted formation descriptor.
+    lite_formation: Option<super::health::ResolvedFormationHealth>,
 }
 
 /// Hello endpoint — `GET /`. Names the API component so an operator hitting the
 /// port directly can tell which binary answered.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/", responses((status = 200, body = HelloResponse)))]
-async fn hello_handler() -> Json<HelloResponse> {
+async fn hello_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(root) = &state.console_root {
+        return serve_console_file(root, "index.html").await;
+    }
     Json(HelloResponse {
         message: "Hello from Tickr API".to_string(),
     })
+    .into_response()
+}
+
+fn readiness_status(ready: bool) -> StatusCode {
+    if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+fn lite_admits_request(path: &str, ready: bool) -> bool {
+    ready || path == "/api/health" || !path.starts_with("/api/")
+}
+
+async fn lite_admission_guard(
+    State(ready): State<Arc<std::sync::atomic::AtomicBool>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !lite_admits_request(
+        request.uri().path(),
+        ready.load(std::sync::atomic::Ordering::Acquire),
+    ) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Tickr Lite is not ready"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Readiness probe — `GET /health`. A real readiness signal for operators,
 /// distinct from the marginal hello. Returns `{"status": "ok"}` once the
 /// server is accepting connections.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/health", responses((status = 200, body = ReadinessResponse)))]
-async fn health_handler() -> Json<ReadinessResponse> {
-    Json(ReadinessResponse {
-        status: "ok".to_string(),
-    })
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ready = state
+        .lite_ready
+        .as_ref()
+        .map(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+        .unwrap_or(true);
+    let status = readiness_status(ready);
+    (
+        status,
+        Json(ReadinessResponse {
+            status: if ready { "ok" } else { "not_ready" }.to_string(),
+        }),
+    )
 }
 
 /// Handler for `GET /api/health` — the operator health surface. The selected
@@ -100,15 +151,38 @@ async fn health_handler() -> Json<ReadinessResponse> {
 async fn api_health_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<super::health::HealthResponse> {
-    Json(
-        super::health::build_health_report(
+    let report = if let Some(nats) = state.nats.as_deref() {
+        super::health::build_health_report_with_command_bus(
             &state.repositories,
-            &state.nats,
+            nats,
+            &state.command_bus,
             &state.coordinator,
             state.deadlines.ping,
         )
-        .await,
-    )
+        .await
+    } else {
+        super::health::build_lite_health_report(
+            &state.repositories,
+            &state.command_bus,
+            &state.coordinator,
+            state
+                .executor_fleet
+                .as_ref()
+                .expect("Tickr Lite AppState carries Executor fleet status"),
+            state
+                .lite_formation
+                .as_ref()
+                .expect("Tickr Lite AppState carries resolved formation health"),
+            state
+                .lite_ready
+                .as_ref()
+                .expect("Tickr Lite AppState carries readiness")
+                .load(std::sync::atomic::Ordering::Acquire),
+            state.deadlines.ping,
+        )
+        .await
+    };
+    Json(report)
 }
 
 /// Handler for `GET /api/tenant`. Reflects the env-bound tenant this component
@@ -1315,7 +1389,13 @@ async fn get_instance_context_handler(
     }
     prefixes.extend(gate_sids.iter().cloned());
 
-    match super::ctx_reader::read_live_entries(&state.nats, &prefixes).await {
+    let Some(nats) = state.nats.as_deref() else {
+        return public_http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live context is not available until the local scope projection is composed",
+        );
+    };
+    match super::ctx_reader::read_live_entries(nats, &prefixes).await {
         Ok(entries) => {
             let groups = super::ctx_reader::classify_entries(
                 &entries,
@@ -1571,7 +1651,11 @@ async fn register_handler(
             },
         )),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.register).await {
+    match state
+        .command_bus
+        .send(request, state.deadlines.register)
+        .await
+    {
         Ok(resp) => render_register(resp),
         Err(e) => bus_error_response(e),
     }
@@ -1748,7 +1832,11 @@ async fn trigger_handler(
             },
         )),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.trigger).await {
+    match state
+        .command_bus
+        .send(request, state.deadlines.trigger)
+        .await
+    {
         Ok(resp) => render_trigger(resp, req.scheduled_at),
         Err(e) => bus_error_response(e),
     }
@@ -1883,7 +1971,11 @@ async fn wakeup_handler(
             idempotency_key,
         })),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.wakeup).await {
+    match state
+        .command_bus
+        .send(request, state.deadlines.wakeup)
+        .await
+    {
         Ok(resp) => render_wakeup(resp),
         Err(e) => bus_error_response(e),
     }
@@ -1986,7 +2078,7 @@ async fn patch_instance_handler(
             nickel_source: req.nickel_source,
         })),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.patch).await {
+    match state.command_bus.send(request, state.deadlines.patch).await {
         Ok(resp) => render_patch(resp),
         Err(e) => bus_error_response(e),
     }
@@ -2164,7 +2256,11 @@ async fn replay_instance_handler(
             inputs,
         })),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.replay).await {
+    match state
+        .command_bus
+        .send(request, state.deadlines.replay)
+        .await
+    {
         Ok(resp) => render_replay(resp),
         Err(e) => bus_error_response(e),
     }
@@ -2442,7 +2538,11 @@ async fn run_cancel(
             idempotency_key,
         })),
     };
-    match send_command(state.nats.as_ref(), request, state.deadlines.cancel).await {
+    match state
+        .command_bus
+        .send(request, state.deadlines.cancel)
+        .await
+    {
         Ok(resp) => render_cancel(resp),
         Err(e) => bus_error_response(e),
     }
@@ -2751,12 +2851,25 @@ async fn list_task_instance_events_handler(
     }
 }
 
-/// Stateless top-level routes (hello + health). These need no `AppState`, so
-/// tests can exercise them without a repository or NATS.
+/// Top-level hello and readiness routes.
 pub fn meta_router() -> Router {
     Router::new()
-        .route("/", get(hello_handler))
-        .route("/health", get(health_handler))
+        .route(
+            "/",
+            get(|| async {
+                Json(HelloResponse {
+                    message: "Hello from Tickr API".to_owned(),
+                })
+            }),
+        )
+        .route(
+            "/health",
+            get(|| async {
+                Json(ReadinessResponse {
+                    status: "ok".to_owned(),
+                })
+            }),
+        )
 }
 
 /// Build the documented router before application state is supplied. Each
@@ -2840,6 +2953,41 @@ fn neutralize_descriptions(value: &mut serde_json::Value) {
     }
 }
 
+async fn serve_console_file(root: &std::path::Path, requested: &str) -> Response {
+    let requested = std::path::Path::new(requested);
+    if requested.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let candidate = root.join(requested);
+    let path = if candidate.is_file() {
+        candidate
+    } else {
+        root.join("index.html")
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let content_type = match path.extension().and_then(|extension| extension.to_str()) {
+                Some("html") => "text/html; charset=utf-8",
+                Some("js") => "text/javascript; charset=utf-8",
+                Some("css") => "text/css; charset=utf-8",
+                Some("svg") => "image/svg+xml",
+                Some("json") => "application/json",
+                Some("png") => "image/png",
+                _ => "application/octet-stream",
+            };
+            ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Serialize the generated document deterministically for the committed
 /// Console input. Exactly one trailing newline is retained.
 pub fn openapi_yaml() -> Result<String> {
@@ -2853,20 +3001,64 @@ pub fn openapi_yaml() -> Result<String> {
     Ok(yaml)
 }
 
-/// Construct an `AppState` from its component parts. Public so tests can build
-/// the router against a curated state.
+/// Construct distributed `AppState` with the existing NATS Core Command path.
 pub fn build_app_state(
     nats: Arc<Client>,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
     coordinator: Arc<super::coordinator_client::CoordinatorClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
 ) -> Arc<AppState> {
+    let command_bus = CommandBus::nats(nats.as_ref().clone());
+    build_app_state_with_command_bus(nats, command_bus, repositories, coordinator, logs)
+}
+
+/// Construct `AppState` with an explicitly selected Command bus.
+///
+/// Tickr Lite supplies a bounded local bus here while retaining the verified
+/// read-only repository role for public queries.
+pub fn build_app_state_with_command_bus(
+    nats: Arc<Client>,
+    command_bus: CommandBus,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    logs: Arc<super::logs_resolver::LogsResolver>,
+) -> Arc<AppState> {
     Arc::new(AppState {
-        nats,
+        nats: Some(nats),
+        command_bus,
         repositories,
         coordinator,
         logs,
         deadlines: CommandDeadlines::default(),
+        lite_ready: None,
+        console_root: None,
+        executor_fleet: None,
+        lite_formation: None,
+    })
+}
+
+/// Construct Tickr Lite `AppState` without a distributed coordination client.
+pub fn build_lite_app_state(
+    command_bus: CommandBus,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    logs: Arc<super::logs_resolver::LogsResolver>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    console_root: std::path::PathBuf,
+    executor_fleet: tickr_executor::local_pickup::LocalExecutorFleetStatus,
+    formation: super::health::ResolvedFormationHealth,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        nats: None,
+        command_bus,
+        repositories,
+        coordinator,
+        logs,
+        deadlines: CommandDeadlines::default(),
+        lite_ready: Some(ready),
+        console_root: Some(Arc::new(console_root)),
+        executor_fleet: Some(executor_fleet),
+        lite_formation: Some(formation),
     })
 }
 
@@ -2883,6 +3075,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             async move { Json((*document).clone()) }
         }),
     )
+}
+
+/// Add the Console's client-side routes without changing the documented API
+/// surface. Unknown paths fall back to `index.html` for SPA navigation.
+pub fn build_lite_router(state: Arc<AppState>) -> Router {
+    let console_root = state
+        .console_root
+        .clone()
+        .expect("Tickr Lite AppState carries Console assets");
+    let ready = state
+        .lite_ready
+        .clone()
+        .expect("Tickr Lite AppState carries its readiness gate");
+    build_router(state)
+        .fallback(get(move |OriginalUri(uri): OriginalUri| {
+            let console_root = console_root.clone();
+            async move {
+                serve_console_file(&console_root, uri.path().trim_start_matches('/')).await
+            }
+        }))
+        .layer(from_fn_with_state(ready, lite_admission_guard))
 }
 
 /// Start the API HTTP server with the configured routes.
@@ -2938,14 +3151,27 @@ pub async fn start_http_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        logs_error_response, order_upcoming, public_http_error, run_name_within_cap,
-        PatchAcceptedResponse, PatchAcceptedStatus, PatchRejectedResponse, PatchRejectedStatus,
-        PatchStatusResponse, RegisterQueuedResponse, RegisterQueuedStatus, RegisterSettledResponse,
-        RegisterSettledStatus, ReplayBody, TenantInfoResponse, TriggerBody, RUN_NAME_MAX_CHARS,
+        lite_admits_request, logs_error_response, order_upcoming, public_http_error,
+        readiness_status, run_name_within_cap, PatchAcceptedResponse, PatchAcceptedStatus,
+        PatchRejectedResponse, PatchRejectedStatus, PatchStatusResponse, RegisterQueuedResponse,
+        RegisterQueuedStatus, RegisterSettledResponse, RegisterSettledStatus, ReplayBody,
+        TenantInfoResponse, TriggerBody, RUN_NAME_MAX_CHARS,
     };
     use crate::http::{dto::UpcomingInstanceResponse, logs_resolver::LogsError};
     use axum::{body::to_bytes, http::StatusCode};
     use uuid::Uuid;
+
+    #[test]
+    fn lite_readiness_blocks_api_work_until_admission() {
+        assert_eq!(readiness_status(false), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!lite_admits_request("/api/workflows/register", false));
+        assert!(!lite_admits_request("/api/workflows/id/trigger", false));
+        assert!(lite_admits_request("/health", false));
+        assert!(lite_admits_request("/api/health", false));
+        assert!(lite_admits_request("/", false));
+        assert!(lite_admits_request("/api/workflows/register", true));
+        assert_eq!(readiness_status(true), StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn public_http_errors_redact_5xx_and_preserve_4xx_detail() {

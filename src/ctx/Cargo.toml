@@ -18,6 +18,7 @@ path = "src/main.rs"
 tickr_proto = { workspace = true }
 
 async-nats = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

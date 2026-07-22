@@ -1,5 +1,7 @@
 #![cfg(not(madsim))]
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -8,6 +10,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tickr::data_directory::DataDirectory;
 use tickr_migrations::{
     sqlite_writer_options, verify_sqlite_current, verify_sqlite_schema, MigrationTarget,
 };
@@ -33,6 +36,20 @@ fn run_sqlite_migration(path: &Path) -> Output {
         )
         .output()
         .expect("invoke `tickr migrate` for SQLite")
+}
+
+fn run_tickr_lite_migration(path: &Path) -> Output {
+    let mut command = migrate_command();
+    command
+        .args(["--formation", "tickr-lite"])
+        .env("TICKR_SQL_BACKEND", "sqlite")
+        .env("TICKR_SQL_TOPOLOGY", "single-node")
+        .env(
+            "TICKR_CONDUCTOR_SQLITE_URL",
+            format!("sqlite://{}", path.display()),
+        )
+        .output()
+        .expect("invoke Tickr Lite offline migration")
 }
 
 #[tokio::test]
@@ -107,9 +124,31 @@ fn sqlite_configuration_is_rejected_before_a_file_is_created() {
     );
 }
 
+#[test]
+fn sqlite_migration_contends_on_the_runtime_data_directory_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path().join("tickr.db");
+    let runtime_lease = DataDirectory::admit(directory.path()).unwrap();
+    let output = run_sqlite_migration(&path);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already exclusively locked"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !path.exists(),
+        "lock contender created SQLite state before admission"
+    );
+    drop(runtime_lease);
+    assert!(run_sqlite_migration(&path).status.success());
+}
+
 #[tokio::test]
 async fn sqlite_migrate_subcommand_is_repeatable_and_reopenable() {
     let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let path = directory.path().join("tickr.db");
     for _ in 0..2 {
         let output = run_sqlite_migration(&path);
@@ -132,4 +171,25 @@ async fn sqlite_migrate_subcommand_is_repeatable_and_reopenable() {
         .unwrap();
     verify_sqlite_schema(&pool).await.unwrap();
     pool.close().await;
+}
+
+#[test]
+fn tickr_lite_offline_migration_installs_and_verifies_the_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path().join("tickr.db");
+    for _ in 0..2 {
+        let output = run_tickr_lite_migration(&path);
+        assert!(
+            output.status.success(),
+            "Tickr Lite migration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let manifest = directory.path().join("formation-manifest.json");
+    assert!(manifest.is_file());
+    assert_eq!(
+        fs::metadata(manifest).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

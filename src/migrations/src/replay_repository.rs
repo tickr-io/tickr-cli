@@ -29,6 +29,7 @@ const REPLAY_STATUSES: &[&str] = &[
     STATUS_VERSION_UNRESOLVABLE,
 ];
 const TERMINAL_WORKFLOW_STATES: &[&str] = &["Completed", "Failed"];
+const MAX_REPLAY_LEASE_BATCH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayLifecycleStatus {
@@ -162,9 +163,58 @@ pub enum ReplaySettlementOutcome {
     Absent,
 }
 
+/// Bounded stable-selection request for Tickr Lite replay recovery.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayLeaseRequest<'a> {
+    pub owner: &'a str,
+    pub now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub eligible_before: DateTime<Utc>,
+    pub limit: usize,
+}
+
+/// One committed replay row and the lease that exclusively authorizes its
+/// ordinary local drive attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeasedReplay {
+    pub row: ReplayLifecycleRow,
+    pub lease_owner: String,
+    pub lease_token: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+/// A bounded recovery scan isolates corrupt rows instead of blocking healthy
+/// replay identities selected in the same transaction.
+#[derive(Debug)]
+pub enum ReplayLeaseCandidate {
+    Ready(LeasedReplay),
+    Corrupt {
+        identity: String,
+        error: RepositoryError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeasedReplaySettlementOutcome {
+    Settled(ReplaySettlementOutcome),
+    LeaseLost,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("corrupt stored replay value: {0}")]
 struct CorruptReplay(String);
+
+#[derive(Debug, thiserror::Error)]
+enum ReplayLeaseError {
+    #[error("replay lifecycle leases require SQLite")]
+    RequiresSqlite,
+    #[error("replay lifecycle lease owner must contain 1 to 128 bytes")]
+    InvalidOwner,
+    #[error("replay lifecycle lease expiry must be later than acquisition time")]
+    InvalidExpiry,
+    #[error("replay lifecycle lease batch must contain 1 to {MAX_REPLAY_LEASE_BATCH} rows")]
+    InvalidLimit,
+}
 
 impl WriterRepositoryBundle {
     /// Compose the selected terminal archive and pinned definition reads.
@@ -248,6 +298,43 @@ impl WriterRepositoryBundle {
         }
     }
 
+    /// Lease committed replay rows in durable stable order for Tickr Lite.
+    pub async fn lease_replays(
+        &self,
+        request: ReplayLeaseRequest<'_>,
+    ) -> Result<Vec<ReplayLeaseCandidate>, RepositoryError> {
+        validate_replay_lease_request(request)?;
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(replay_lease_error(ReplayLeaseError::RequiresSqlite)),
+            BackendPool::Sqlite(pool) => lease_replays_sqlite(pool, request).await,
+        }
+    }
+
+    /// Commit `Materializing → Released` only while this exact lease is live.
+    pub async fn settle_leased_replay_released(
+        &self,
+        lease: &LeasedReplay,
+        now: DateTime<Utc>,
+    ) -> Result<LeasedReplaySettlementOutcome, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(replay_lease_error(ReplayLeaseError::RequiresSqlite)),
+            BackendPool::Sqlite(pool) => {
+                settle_leased_replay_released_sqlite(pool, lease, now).await
+            }
+        }
+    }
+
+    /// Release a failed local drive without acknowledging its durable row.
+    pub async fn release_replay_lease(
+        &self,
+        lease: &LeasedReplay,
+    ) -> Result<bool, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(replay_lease_error(ReplayLeaseError::RequiresSqlite)),
+            BackendPool::Sqlite(pool) => release_replay_lease_sqlite(pool, lease).await,
+        }
+    }
+
     /// Stable scan of rows eligible for replay re-drive.
     pub async fn unsettled_replays_before(
         &self,
@@ -273,6 +360,23 @@ impl ReadOnlyRepositoryBundle {
             BackendPool::Sqlite(pool) => replays_for_source_sqlite(pool, source_instance_id).await,
         }
     }
+}
+
+fn validate_replay_lease_request(request: ReplayLeaseRequest<'_>) -> Result<(), RepositoryError> {
+    if request.owner.is_empty() || request.owner.len() > 128 {
+        return Err(replay_lease_error(ReplayLeaseError::InvalidOwner));
+    }
+    if request.expires_at <= request.now {
+        return Err(replay_lease_error(ReplayLeaseError::InvalidExpiry));
+    }
+    if !(1..=MAX_REPLAY_LEASE_BATCH).contains(&request.limit) {
+        return Err(replay_lease_error(ReplayLeaseError::InvalidLimit));
+    }
+    Ok(())
+}
+
+fn replay_lease_error(error: ReplayLeaseError) -> RepositoryError {
+    RepositoryError::new(RepositoryErrorKind::Configuration, error)
 }
 
 async fn replay_source_postgres(
@@ -794,7 +898,9 @@ async fn settle_replay_released_postgres(
 ) -> Result<ReplaySettlementOutcome, RepositoryError> {
     let updated = sqlx::query(
         "UPDATE workflow_replays SET status = 'Released', outcome = 'released', \
-         updated_at = now() WHERE replay_instance_id = $1 AND status = 'Materializing'",
+         updated_at = now(), lease_owner = NULL, lease_token = NULL, \
+         lease_expires_at = NULL \
+         WHERE replay_instance_id = $1 AND status = 'Materializing'",
     )
     .bind(replay_instance_id)
     .execute(pool)
@@ -813,7 +919,9 @@ async fn settle_replay_released_sqlite(
 ) -> Result<ReplaySettlementOutcome, RepositoryError> {
     let updated = sqlx::query(
         "UPDATE workflow_replays SET status = 'Released', outcome = 'released', \
-         updated_at = ?2 WHERE replay_instance_id = ?1 AND status = 'Materializing'",
+         updated_at = ?2, lease_owner = NULL, lease_token = NULL, \
+         lease_expires_at = NULL \
+         WHERE replay_instance_id = ?1 AND status = 'Materializing'",
     )
     .bind(encode_uuid(replay_instance_id))
     .bind(encode_timestamp(Utc::now()))
@@ -825,6 +933,118 @@ async fn settle_replay_released_sqlite(
         return Ok(ReplaySettlementOutcome::Released);
     }
     classify_settlement(lifecycle_sqlite(pool, replay_instance_id).await?)
+}
+
+async fn lease_replays_sqlite(
+    pool: &SqlitePool,
+    request: ReplayLeaseRequest<'_>,
+) -> Result<Vec<ReplayLeaseCandidate>, RepositoryError> {
+    let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
+    let encoded_now = encode_timestamp(request.now);
+    let rows: Vec<SqliteLifecycleTuple> = sqlx::query_as(&format!(
+        "SELECT {ROW_COLUMNS} FROM workflow_replays \
+         WHERE status = 'Materializing' AND updated_at <= ?1 \
+           AND (lease_expires_at IS NULL OR lease_expires_at <= ?2) \
+         ORDER BY updated_at ASC, replay_instance_id ASC LIMIT ?3"
+    ))
+    .bind(encode_timestamp(request.eligible_before))
+    .bind(&encoded_now)
+    .bind(request.limit as i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(repository_sqlx_error)?;
+
+    let encoded_expiry = encode_timestamp(request.expires_at);
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let identity = row.0.clone();
+        let lease_token = Uuid::new_v4();
+        let updated = sqlx::query(
+            "UPDATE workflow_replays \
+             SET lease_owner = ?2, lease_token = ?3, lease_expires_at = ?4 \
+             WHERE replay_instance_id = ?1 AND status = 'Materializing' \
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?5)",
+        )
+        .bind(&identity)
+        .bind(request.owner)
+        .bind(encode_uuid(lease_token))
+        .bind(&encoded_expiry)
+        .bind(&encoded_now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(corrupt_value(CorruptReplay(format!(
+                "selected replay lifecycle {identity} was not leaseable"
+            ))));
+        }
+        candidates.push(match row_from_sqlite(row) {
+            Ok(row) => ReplayLeaseCandidate::Ready(LeasedReplay {
+                row,
+                lease_owner: request.owner.to_owned(),
+                lease_token,
+                lease_expires_at: request.expires_at,
+            }),
+            Err(error) => ReplayLeaseCandidate::Corrupt { identity, error },
+        });
+    }
+    transaction.commit().await.map_err(repository_sqlx_error)?;
+    Ok(candidates)
+}
+
+async fn settle_leased_replay_released_sqlite(
+    pool: &SqlitePool,
+    lease: &LeasedReplay,
+    now: DateTime<Utc>,
+) -> Result<LeasedReplaySettlementOutcome, RepositoryError> {
+    let updated = sqlx::query(
+        "UPDATE workflow_replays \
+         SET status = 'Released', outcome = 'released', updated_at = ?5, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+         WHERE replay_instance_id = ?1 AND status = 'Materializing' \
+           AND lease_owner = ?2 AND lease_token = ?3 AND lease_expires_at > ?4",
+    )
+    .bind(encode_uuid(lease.row.replay_instance_id))
+    .bind(&lease.lease_owner)
+    .bind(encode_uuid(lease.lease_token))
+    .bind(encode_timestamp(now))
+    .bind(encode_timestamp(now))
+    .execute(pool)
+    .await
+    .map_err(repository_sqlx_error)?
+    .rows_affected();
+    if updated == 1 {
+        return Ok(LeasedReplaySettlementOutcome::Settled(
+            ReplaySettlementOutcome::Released,
+        ));
+    }
+    Ok(
+        match lifecycle_sqlite(pool, lease.row.replay_instance_id).await? {
+            Some(row) if row.status == STATUS_MATERIALIZING => {
+                LeasedReplaySettlementOutcome::LeaseLost
+            }
+            lifecycle => LeasedReplaySettlementOutcome::Settled(classify_settlement(lifecycle)?),
+        },
+    )
+}
+
+async fn release_replay_lease_sqlite(
+    pool: &SqlitePool,
+    lease: &LeasedReplay,
+) -> Result<bool, RepositoryError> {
+    Ok(sqlx::query(
+        "UPDATE workflow_replays \
+         SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+         WHERE replay_instance_id = ?1 AND lease_owner = ?2 AND lease_token = ?3",
+    )
+    .bind(encode_uuid(lease.row.replay_instance_id))
+    .bind(&lease.lease_owner)
+    .bind(encode_uuid(lease.lease_token))
+    .execute(pool)
+    .await
+    .map_err(repository_sqlx_error)?
+    .rows_affected()
+        == 1)
 }
 
 fn classify_settlement(

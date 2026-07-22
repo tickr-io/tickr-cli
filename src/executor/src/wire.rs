@@ -39,6 +39,38 @@ pub struct DispatchedTask {
     pub gate_signal_ids_ambient: HashSet<Uuid>,
 }
 
+/// Encode the execution slice onto the published dispatch contract.
+///
+/// The local relay normally stages server-authored bytes verbatim. This inverse
+/// keeps durable recovery and crash-law tests on the production wire shape.
+pub fn encode_dispatch(task: &DispatchedTask) -> Vec<u8> {
+    tc::TaskDispatch {
+        task_instance_id: task.task_instance_id.to_string(),
+        task_id: task.task_id.to_string(),
+        workflow_instance_id: task.workflow_instance_id.to_string(),
+        workflow_id: task.workflow_id.to_string(),
+        name: task.name.clone(),
+        nix_expression_path: task.nix_expression_path.clone(),
+        nix_args: task.nix_args.clone(),
+        outputs: task.outputs.clone(),
+        inputs: task.inputs.clone(),
+        secrets: task.secrets.clone(),
+        originating_signal_id: task.originating_signal_id.map(|id| id.to_string()),
+        gate_signal_ids: task
+            .gate_signal_ids
+            .iter()
+            .map(|(name, id)| (name.clone(), id.to_string()))
+            .collect(),
+        gate_signal_ids_ambient: task
+            .gate_signal_ids_ambient
+            .iter()
+            .map(Uuid::to_string)
+            .collect(),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 /// Decode a dispatched task off the published `TaskDispatch` contract. The
 /// conductor republishes the server-authored bytes verbatim onto the dispatch
 /// work queue; the executor reconstructs the execution slice here.
@@ -117,10 +149,26 @@ pub fn encode_task_event(task: &DispatchedTask, executor_id: Uuid, kind: EmitKin
     .encode_to_vec()
 }
 
+/// Encode the Conductor-authored liveness verdict on the unchanged published
+/// TaskEvent family. The executor identity is absent because the owner is gone.
+pub fn encode_unhealthy_task_event(task: &DispatchedTask) -> Vec<u8> {
+    tc::TaskEvent {
+        task_instance_id: task.task_instance_id.to_string(),
+        task_id: task.task_id.to_string(),
+        workflow_instance_id: task.workflow_instance_id.to_string(),
+        workflow_id: task.workflow_id.to_string(),
+        executor_id: None,
+        kind: Some(tc::task_event::Kind::Unhealthy(
+            tc::task_event::Unhealthy {},
+        )),
+    }
+    .encode_to_vec()
+}
+
 /// A cancel-request the executor handles: kill a cancelled task's in-flight
 /// process group. Carries the ids the executor needs to find the running task
 /// and author its ack.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CancelRequest {
     pub task_instance_id: Uuid,
     pub workflow_instance_id: Uuid,

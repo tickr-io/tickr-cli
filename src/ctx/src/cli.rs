@@ -21,7 +21,7 @@ use crate::store::{Store, MAX_VALUE_SIZE};
 #[derive(Parser, Debug)]
 #[command(
     name = "tickr-ctx",
-    about = "Inter-task context store for tickr workflows (NATS JetStream KV)"
+    about = "Inter-task context store for tickr workflows"
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -202,12 +202,9 @@ async fn capture(scope: Scope, args: CaptureArgs) -> Result<i32> {
         return Ok(4);
     }
 
-    let store = Store::open(&scope.bucket()).await?;
+    let store = Store::open(&scope).await?;
     let key = scope.key(&args.key);
-    store.kv.put(key, bytes.into()).await.map_err(|e| {
-        // Surface NATS errors via the main wrapper -> exit 5.
-        anyhow!("nats kv put failed: {}", e)
-    })?;
+    store.put(key, bytes).await?;
     Ok(0)
 }
 
@@ -249,7 +246,7 @@ fn read_capture_value(args: &CaptureArgs) -> Result<(&'static str, serde_json::V
 }
 
 async fn get(scope: Scope, args: GetArgs) -> Result<i32> {
-    let store = Store::open(&scope.bucket()).await?;
+    let store = Store::open(&scope).await?;
     // Strict-source declarations bypass the ambient resolver:
     // `--signal` reads `<trigger_signal_id>/<name>` directly. No
     // flag means walk three scopes via the ambient resolver. The
@@ -292,12 +289,8 @@ async fn get(scope: Scope, args: GetArgs) -> Result<i32> {
     probes.extend(gate_keys.iter().cloned());
     probes.push(run_key.clone());
     for key in &probes {
-        match store.kv.get(key).await {
-            Ok(Some(b)) => {
-                hits.insert(key.clone(), b.to_vec());
-            }
-            Ok(None) => {}
-            Err(e) => return Err(anyhow!("nats kv get failed: {}", e)),
+        if let Some(bytes) = store.get(key).await? {
+            hits.insert(key.clone(), bytes);
         }
     }
 
@@ -372,11 +365,7 @@ fn finish_get(args: GetArgs, bytes: Vec<u8>) -> Result<i32> {
 }
 
 async fn get_explicit_key(_scope: Scope, args: GetArgs, store: Store, key: String) -> Result<i32> {
-    let entry = match store.kv.get(&key).await {
-        Ok(Some(b)) => Some(b),
-        Ok(None) => None,
-        Err(e) => return Err(anyhow!("nats kv get failed: {}", e)),
-    };
+    let entry = store.get(&key).await?;
 
     let bytes: Vec<u8> = match (entry, &args.wait) {
         (Some(b), _) => b.to_vec(),
@@ -423,53 +412,34 @@ async fn get_explicit_key(_scope: Scope, args: GetArgs, store: Store, key: Strin
 }
 
 async fn ls(scope: Scope, args: LsArgs) -> Result<i32> {
-    let store = Store::open(&scope.bucket()).await?;
-    let mut keys = store
-        .kv
-        .keys()
-        .await
-        .map_err(|e| anyhow!("nats kv keys failed: {}", e))?;
-
+    let store = Store::open(&scope).await?;
     let run_prefix = format!("{}/", crate::scope::sanitize_segment(&scope.run_id));
     let user_prefix = args.prefix.as_deref().unwrap_or("");
+    let prefix = format!("{run_prefix}{user_prefix}");
 
-    while let Some(k) = keys.next().await {
-        let k = k.map_err(|e| anyhow!("nats kv keys stream failed: {}", e))?;
-        if !k.starts_with(&run_prefix) {
-            continue;
-        }
-        let inner = &k[run_prefix.len()..];
-        if !inner.starts_with(user_prefix) {
-            continue;
-        }
-        // Look up envelope to surface `<redacted>` for secrets.
-        match store.kv.get(&k).await {
-            Ok(Some(bytes)) => {
-                let label = match serde_json::from_slice::<Envelope>(&bytes) {
-                    Ok(e) if e.secret => "<redacted>".to_string(),
-                    Ok(e) => e.kind,
-                    Err(_) => "<unparseable>".to_string(),
-                };
-                println!("{}\t{}", inner, label);
-            }
-            Ok(None) | Err(_) => println!("{}\t<gone>", inner),
-        }
+    for key in store.keys(&prefix).await? {
+        let inner = &key[run_prefix.len()..];
+        let label = match store.get(&key).await? {
+            Some(bytes) => match serde_json::from_slice::<Envelope>(&bytes) {
+                Ok(envelope) if envelope.secret => "<redacted>".to_string(),
+                Ok(envelope) => envelope.kind,
+                Err(_) => "<unparseable>".to_string(),
+            },
+            None => "<gone>".to_string(),
+        };
+        println!("{}\t{}", inner, label);
     }
     Ok(0)
 }
 
 async fn tail(scope: Scope, args: TailArgs) -> Result<i32> {
-    let store = Store::open(&scope.bucket()).await?;
+    let store = Store::open(&scope).await?;
     let run_prefix = format!("{}/", crate::scope::sanitize_segment(&scope.run_id));
     let user_prefix = args.prefix.as_deref().unwrap_or("");
 
-    let mut watch = store
-        .kv
-        .watch_all()
-        .await
-        .map_err(|e| anyhow!("nats kv watch failed: {}", e))?;
+    let mut watch = store.watch_all().await?;
     while let Some(item) = watch.next().await {
-        let entry = item.map_err(|e| anyhow!("nats kv watch stream failed: {}", e))?;
+        let entry = item?;
         if !entry.key.starts_with(&run_prefix) {
             continue;
         }
@@ -478,8 +448,8 @@ async fn tail(scope: Scope, args: TailArgs) -> Result<i32> {
             continue;
         }
         let label = match serde_json::from_slice::<Envelope>(&entry.value) {
-            Ok(e) if e.secret => "<redacted>".to_string(),
-            Ok(e) => format!("{} {}b", e.kind, entry.value.len()),
+            Ok(envelope) if envelope.secret => "<redacted>".to_string(),
+            Ok(envelope) => format!("{} {}b", envelope.kind, entry.value.len()),
             Err(_) => "<unparseable>".to_string(),
         };
         println!("{:?}\t{}\t{}", entry.operation, inner, label);
@@ -488,64 +458,48 @@ async fn tail(scope: Scope, args: TailArgs) -> Result<i32> {
 }
 
 async fn rm(scope: Scope, args: RmArgs) -> Result<i32> {
-    let store = Store::open(&scope.bucket()).await?;
+    let store = Store::open(&scope).await?;
     let key = scope.key(&args.key);
-    store
-        .kv
-        .delete(&key)
-        .await
-        .map_err(|e| anyhow!("nats kv delete failed: {}", e))?;
+    store.delete(&key).await?;
     Ok(0)
 }
 
 async fn export(scope: Scope, args: ExportArgs) -> Result<i32> {
-    let store = Store::open(&scope.bucket()).await?;
-    let mut keys = store
-        .kv
-        .keys()
-        .await
-        .map_err(|e| anyhow!("nats kv keys failed: {}", e))?;
+    let store = Store::open(&scope).await?;
     let run_prefix = format!("{}/", crate::scope::sanitize_segment(&scope.run_id));
 
     let mut entries: Vec<(String, Envelope)> = Vec::new();
-    while let Some(k) = keys.next().await {
-        let k = k.map_err(|e| anyhow!("nats kv keys stream failed: {}", e))?;
-        if !k.starts_with(&run_prefix) {
-            continue;
-        }
-        let inner = k[run_prefix.len()..].to_string();
-        if let Ok(Some(bytes)) = store.kv.get(&k).await {
-            if let Ok(env) = serde_json::from_slice::<Envelope>(&bytes) {
-                entries.push((inner, env));
+    for key in store.keys(&run_prefix).await? {
+        let inner = key[run_prefix.len()..].to_string();
+        if let Some(bytes) = store.get(&key).await? {
+            if let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) {
+                entries.push((inner, envelope));
             }
         }
     }
 
     match args.format.as_str() {
         "dotenv" => {
-            for (k, env) in &entries {
-                if env.secret {
-                    eprintln!("# skipping secret: {}", k);
+            for (key, envelope) in &entries {
+                if envelope.secret {
+                    eprintln!("# skipping secret: {}", key);
                     continue;
                 }
-                let v = String::from_utf8_lossy(&env.render()?).into_owned();
-                // Conservative: single-quote the value so spaces/special-chars
-                // survive a `source`. Embedded single quotes are escaped.
-                let escaped = v.replace('\'', "'\\''");
-                println!("{}='{}'", k, escaped);
+                let value = String::from_utf8_lossy(&envelope.render()?).into_owned();
+                let escaped = value.replace('\'', "'\\''");
+                println!("{}='{}'", key, escaped);
             }
         }
         "json" => {
-            let mut obj = serde_json::Map::new();
-            for (k, env) in &entries {
-                if env.secret {
-                    continue;
+            let mut object = serde_json::Map::new();
+            for (key, envelope) in &entries {
+                if !envelope.secret {
+                    object.insert(key.clone(), envelope.value.clone());
                 }
-                obj.insert(k.clone(), env.value.clone());
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::Value::Object(obj))?
+                serde_json::to_string_pretty(&serde_json::Value::Object(object))?
             );
         }
         other => {
@@ -580,13 +534,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 }
 
 async fn wait_for_key(store: &Store, key: &str, timeout: Duration) -> Result<Option<Vec<u8>>> {
-    use async_nats::jetstream::kv::Operation;
-
-    let mut watch = store
-        .kv
-        .watch(key)
-        .await
-        .map_err(|e| anyhow!("nats kv watch failed: {}", e))?;
+    let mut watch = store.watch_key(key).await?;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
 
@@ -594,11 +542,11 @@ async fn wait_for_key(store: &Store, key: &str, timeout: Duration) -> Result<Opt
         tokio::select! {
             _ = &mut deadline => return Ok(None),
             item = watch.next() => match item {
-                Some(Ok(entry)) if entry.operation == Operation::Put => {
-                    return Ok(Some(entry.value.to_vec()));
+                Some(Ok(entry)) if entry.operation == crate::store::StoreOperation::Put => {
+                    return Ok(Some(entry.value));
                 }
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(anyhow!("nats kv watch stream failed: {}", e)),
+                Some(Err(error)) => return Err(error),
                 None => return Ok(None),
             },
         }

@@ -1,17 +1,15 @@
-//! Conductor side of the API command bus.
+//! Conductor side of the API Command bus.
 //!
-//! One queue-group subscriber on the single subject `tickr.api.commands` —
-//! the subject names the API<->conductor relationship rather than each verb.
-//! Each inbound message is an encoded `ApiCommandRequest`; the subscriber
-//! decodes it, dispatches by `oneof` variant to the matching pipeline
-//! function, and replies on the message's reply inbox with an encoded
-//! `ApiCommandResponse` carrying the HTTP-equivalent `status_code` plus
-//! exactly one `payload` variant.
+//! Both distributed NATS Core and Tickr Lite local request/reply carry an
+//! encoded `ApiCommandRequest` into the shared dispatcher and receive an
+//! encoded `ApiCommandResponse` with the HTTP-equivalent `status_code` and
+//! exactly one typed payload. The distributed adapter binds one queue-group
+//! subscriber on `tickr.api.commands`; the local adapter is called by the sole
+//! Conductor-owned writer.
 //!
-//! Processing is serial — each command is `.await`ed inline in the receive
-//! loop, matching the precedent in `build_pipeline::worker` and
-//! `nats_ingress`. The known cost (an in-flight register head-of-line-blocks a
-//! queued trigger) is accepted for the single-tenant MVP.
+//! Both adapters process Commands serially. An in-flight long Command can
+//! therefore head-of-line-block later requests, but every mutation passes
+//! through one ordered writer boundary.
 
 use anyhow::Result;
 use async_nats::Client as NatsClient;
@@ -29,7 +27,7 @@ use crate::gate_index::GateIndex;
 use crate::wakeup_translator::WakeupRelaySender;
 use tickr_proto::tickr_api as api;
 
-/// The single subject all four command kinds travel on.
+/// The single distributed subject all Command kinds travel on.
 pub const COMMAND_SUBJECT: &str = "tickr.api.commands";
 
 /// Queue group the conductor binds. One conductor per tenant today; the group
@@ -52,6 +50,102 @@ pub struct ApiCommandsState {
     /// `relay_sender`.
     pub patch_relay_sender: Arc<dyn crate::patch_pipeline::PatchRelaySender>,
     pub gate_index: GateIndex,
+}
+
+/// Tickr Lite's command dependencies. The API still exchanges the production
+/// Command envelopes; only the selected role implementations differ.
+#[derive(Clone)]
+pub struct LiteApiCommandsState {
+    pub definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    pub relay_sender: Arc<dyn WakeupRelaySender>,
+    pub patch_relay_sender: Arc<dyn crate::patch_pipeline::PatchRelaySender>,
+    pub replay_relay_sender: Arc<dyn crate::replay_pipeline::ReplayRelaySender>,
+    pub signal_applied_notifications:
+        Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
+    pub gate_index: GateIndex,
+}
+
+/// Shared dependency view for the transport-independent Command dispatcher.
+pub trait ApiCommandDispatchState {
+    fn repositories(&self) -> &Arc<tickr_migrations::backend::WriterRepositoryBundle>;
+    fn nats(&self) -> Option<&NatsClient>;
+    fn relay_sender(&self) -> &Arc<dyn WakeupRelaySender>;
+    fn patch_relay_sender(&self) -> &Arc<dyn crate::patch_pipeline::PatchRelaySender>;
+    fn replay_relay_sender(&self) -> Option<&Arc<dyn crate::replay_pipeline::ReplayRelaySender>>;
+    fn signal_applied_notifications(
+        &self,
+    ) -> Option<
+        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
+    >;
+    fn gate_index(&self) -> &GateIndex;
+}
+
+impl ApiCommandDispatchState for ApiCommandsState {
+    fn repositories(&self) -> &Arc<tickr_migrations::backend::WriterRepositoryBundle> {
+        &self.definition_repository
+    }
+
+    fn nats(&self) -> Option<&NatsClient> {
+        Some(&self.nats)
+    }
+
+    fn relay_sender(&self) -> &Arc<dyn WakeupRelaySender> {
+        &self.relay_sender
+    }
+
+    fn patch_relay_sender(&self) -> &Arc<dyn crate::patch_pipeline::PatchRelaySender> {
+        &self.patch_relay_sender
+    }
+
+    fn replay_relay_sender(&self) -> Option<&Arc<dyn crate::replay_pipeline::ReplayRelaySender>> {
+        None
+    }
+
+    fn signal_applied_notifications(
+        &self,
+    ) -> Option<
+        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
+    > {
+        None
+    }
+
+    fn gate_index(&self) -> &GateIndex {
+        &self.gate_index
+    }
+}
+
+impl ApiCommandDispatchState for LiteApiCommandsState {
+    fn repositories(&self) -> &Arc<tickr_migrations::backend::WriterRepositoryBundle> {
+        &self.definition_repository
+    }
+
+    fn nats(&self) -> Option<&NatsClient> {
+        None
+    }
+
+    fn relay_sender(&self) -> &Arc<dyn WakeupRelaySender> {
+        &self.relay_sender
+    }
+
+    fn patch_relay_sender(&self) -> &Arc<dyn crate::patch_pipeline::PatchRelaySender> {
+        &self.patch_relay_sender
+    }
+
+    fn replay_relay_sender(&self) -> Option<&Arc<dyn crate::replay_pipeline::ReplayRelaySender>> {
+        Some(&self.replay_relay_sender)
+    }
+
+    fn signal_applied_notifications(
+        &self,
+    ) -> Option<
+        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
+    > {
+        Some(&self.signal_applied_notifications)
+    }
+
+    fn gate_index(&self) -> &GateIndex {
+        &self.gate_index
+    }
 }
 
 /// Bind the queue-group subscriber and process commands serially until the
@@ -95,8 +189,7 @@ async fn process_one(state: &ApiCommandsState, msg: async_nats::Message) {
         return;
     };
 
-    let response = handle(state, &msg.payload).await;
-    let bytes = response.encode_to_vec();
+    let bytes = handle_local_request(state, &msg.payload).await;
     if let Err(e) = state.nats.publish(reply, bytes.into()).await {
         eprintln!("api_commands_consumer: failed to publish reply: {}", e);
         return;
@@ -110,7 +203,7 @@ async fn process_one(state: &ApiCommandsState, msg: async_nats::Message) {
 
 /// Decode the envelope and dispatch by command kind. A malformed envelope is a
 /// 400 with a `BAD_REQUEST` error payload — the API renders it as a 400.
-async fn handle(state: &ApiCommandsState, payload: &[u8]) -> api::ApiCommandResponse {
+async fn handle(state: &impl ApiCommandDispatchState, payload: &[u8]) -> api::ApiCommandResponse {
     let request = match api::ApiCommandRequest::decode(payload) {
         Ok(r) => r,
         Err(e) => {
@@ -134,6 +227,13 @@ async fn handle(state: &ApiCommandsState, payload: &[u8]) -> api::ApiCommandResp
     }
 }
 
+/// Dispatch one encoded production Command envelope without selecting a
+/// transport. Tickr Lite's sole local writer calls this entry point; the
+/// distributed subscriber above calls the same path before publishing to NATS.
+pub async fn handle_local_request(state: &impl ApiCommandDispatchState, payload: &[u8]) -> Vec<u8> {
+    handle(state, payload).await.encode_to_vec()
+}
+
 /// Reply to a Ping with a side-effect-free 200 ack. The Ping is an explicit
 /// "does the command consumer answer" probe — a dedicated variant rather than a
 /// reuse of a read command, so it touches no state. It powers the health
@@ -154,7 +254,7 @@ fn dispatch_ping() -> api::ApiCommandResponse {
 /// row. Everything after ingress is asynchronous: the reply only carries the
 /// minted `patch_id` the submitter polls the lifecycle row by.
 async fn dispatch_patch(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::PatchRequest,
 ) -> api::ApiCommandResponse {
     use crate::patch_pipeline::{parse_patch_document, process_patch, PatchError, PatchIngress};
@@ -183,8 +283,8 @@ async fn dispatch_patch(
     let patch_id = Uuid::new_v4();
 
     match process_patch(
-        state.definition_repository.as_ref(),
-        state.patch_relay_sender.as_ref(),
+        state.repositories().as_ref(),
+        state.patch_relay_sender().as_ref(),
         workflow_instance_id,
         patch_id,
         parsed,
@@ -203,9 +303,9 @@ async fn dispatch_patch(
             // publish failure leaves the row at `Building` — loud and
             // pollable — while the server's stall-TTL backstop bounds the
             // instance's wait.
-            if !build_jobs.is_empty() {
+            if let (Some(nats), false) = (state.nats(), build_jobs.is_empty()) {
                 if let Err(e) =
-                    crate::patch_pipeline::publish_patch_build_jobs(&state.nats, &build_jobs).await
+                    crate::patch_pipeline::publish_patch_build_jobs(nats, &build_jobs).await
                 {
                     eprintln!(
                         "patch {} build-job publish failed: {} (row stays Building)",
@@ -251,11 +351,12 @@ async fn dispatch_patch(
 /// archive inside `process_replay` — this arm only decodes the constrained
 /// request shape (which has no field able to carry a seed) and maps outcomes.
 async fn dispatch_replay(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::ReplayRequest,
 ) -> api::ApiCommandResponse {
     use crate::replay_pipeline::{
-        process_replay, DefaultReplayRelaySender, ReplayError, ReplayIngress, ReplayRequest as PReq,
+        process_replay, DefaultReplayRelaySender, ReplayError, ReplayIngress, ReplayRelaySender,
+        ReplayRequest as PReq,
     };
 
     let source_instance_id = match Uuid::parse_str(&req.source_instance_id) {
@@ -316,13 +417,20 @@ async fn dispatch_replay(
         inputs,
     };
 
-    // The seed's ctx re-hydration writes NATS KV; the default sender carries a
-    // NATS client for it and relays Signals over the global channel.
-    let sender = DefaultReplayRelaySender {
-        nats: state.nats.clone(),
+    let distributed_sender;
+    let sender: &dyn ReplayRelaySender = if let Some(sender) = state.replay_relay_sender() {
+        sender.as_ref()
+    } else {
+        distributed_sender = DefaultReplayRelaySender {
+            nats: state
+                .nats()
+                .expect("distributed Command state carries NATS")
+                .clone(),
+        };
+        &distributed_sender
     };
 
-    match process_replay(state.definition_repository.as_ref(), &sender, pipeline_req).await {
+    match process_replay(state.repositories().as_ref(), sender, pipeline_req).await {
         Ok(ReplayIngress::Accepted {
             replay_instance_id,
             doomed,
@@ -375,24 +483,23 @@ async fn dispatch_replay(
 /// The error `Display` strings are the exact HTTP messages today's handler
 /// returns; the API renders them into register's historical body shape.
 async fn dispatch_register(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::RegisterRequest,
 ) -> api::ApiCommandResponse {
     use crate::register_pipeline::{
-        process_register, RegisterError, RegisterOutcome, RegisterRequest,
+        process_register, process_register_local, RegisterError, RegisterOutcome, RegisterRequest,
     };
 
     let pipeline_req = RegisterRequest {
         nickel_source: req.nickel_source,
         namespace: req.namespace,
     };
-    match process_register(
-        state.definition_repository.as_ref(),
-        &state.nats,
-        pipeline_req,
-    )
-    .await
-    {
+    let result = if let Some(nats) = state.nats() {
+        process_register(state.repositories().as_ref(), nats, pipeline_req).await
+    } else {
+        process_register_local(state.repositories().as_ref(), pipeline_req).await
+    };
+    match result {
         Ok(RegisterOutcome::Inserted {
             workflow_id,
             workflow_version,
@@ -465,7 +572,7 @@ async fn dispatch_register(
 /// over the relay on `Fresh`, and maps outcomes / errors to the HTTP-equivalent
 /// status the API forwards verbatim.
 async fn dispatch_trigger(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::TriggerRequest,
 ) -> api::ApiCommandResponse {
     use crate::trigger_pipeline::{
@@ -527,13 +634,13 @@ async fn dispatch_trigger(
         name: req.name,
     };
 
-    let outcome = match process_trigger(
-        state.definition_repository.as_ref(),
-        &state.nats,
-        pipeline_req,
-    )
-    .await
-    {
+    let result = if let Some(nats) = state.nats() {
+        process_trigger(state.repositories().as_ref(), nats, pipeline_req).await
+    } else {
+        crate::trigger_pipeline::process_trigger_local(state.repositories().as_ref(), pipeline_req)
+            .await
+    };
+    let outcome = match result {
         Ok(o) => o,
         Err(TriggerError::WorkflowNotFound { .. }) => {
             return error_response(
@@ -575,7 +682,7 @@ async fn dispatch_trigger(
         TriggerOutcome::Fresh { signal_id, signal } => {
             // The HTTP trigger path blocks on the relay send and surfaces a
             // failure as 503; mirror that here.
-            if let Err(e) = state.relay_sender.send(&signal).await {
+            if let Err(e) = state.relay_sender().send(&signal).await {
                 return error_response(
                     503,
                     api::CommandErrorCode::Unavailable,
@@ -617,7 +724,7 @@ async fn dispatch_trigger(
 /// passes the subscriber state's `gate_index` and `relay_sender` through, the
 /// same handles the HTTP wakeup handler uses.
 async fn dispatch_wakeup(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::WakeupRequest,
 ) -> api::ApiCommandResponse {
     use crate::wakeup_translator::{process_wakeup, WakeupOutcome, WakeupRequest as PReq};
@@ -642,15 +749,25 @@ async fn dispatch_wakeup(
         idempotency_key: req.idempotency_key,
     };
 
-    match process_wakeup(
-        state.definition_repository.as_ref(),
-        &state.nats,
-        state.relay_sender.as_ref(),
-        &state.gate_index,
-        pipeline_req,
-    )
-    .await
-    {
+    let result = if let Some(nats) = state.nats() {
+        process_wakeup(
+            state.repositories().as_ref(),
+            nats,
+            state.relay_sender().as_ref(),
+            state.gate_index(),
+            pipeline_req,
+        )
+        .await
+    } else {
+        crate::wakeup_translator::process_wakeup_local(
+            state.repositories().as_ref(),
+            state.relay_sender().as_ref(),
+            state.gate_index(),
+            pipeline_req,
+        )
+        .await
+    };
+    match result {
         Ok(WakeupOutcome::Fresh {
             signal_id,
             matched_workflows,
@@ -690,7 +807,7 @@ async fn dispatch_wakeup(
 /// check, the ByTag register-before-forward ordering, the `SignalApplied`
 /// await, and the audit-row write.
 async fn dispatch_cancel(
-    state: &ApiCommandsState,
+    state: &impl ApiCommandDispatchState,
     req: api::CancelRequest,
 ) -> api::ApiCommandResponse {
     use crate::cancel_pipeline::{
@@ -743,13 +860,20 @@ async fn dispatch_cancel(
         idempotency_key: req.idempotency_key,
     };
 
-    match process_cancel(
-        state.definition_repository.as_ref(),
-        &state.nats,
-        pipeline_req,
-    )
-    .await
-    {
+    let result = if let Some(nats) = state.nats() {
+        process_cancel(state.repositories().as_ref(), nats, pipeline_req).await
+    } else {
+        crate::cancel_pipeline::process_cancel_local(
+            state.repositories().as_ref(),
+            state
+                .signal_applied_notifications()
+                .expect("Tickr Lite Command state carries SignalApplied notifications")
+                .as_ref(),
+            pipeline_req,
+        )
+        .await
+    };
+    match result {
         Ok(CancelOutcome::Instance { signal_id }) => cancel_response(
             200,
             api::cancel_payload::Outcome::Instance(api::cancel_payload::Instance {

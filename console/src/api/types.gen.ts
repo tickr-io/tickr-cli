@@ -664,6 +664,14 @@ export interface components {
             live_data_available: boolean;
         };
         /** @description Public API contract. */
+        CommandPathHealth: {
+            detail: string;
+            detection_window: string;
+            implementation: components["schemas"]["HealthRoleImplementation"];
+            protocol: components["schemas"]["HealthProtocolIdentity"];
+            status: components["schemas"]["ComponentStatus"];
+        };
+        /** @description Public API contract. */
         ComponentHealth: {
             detail: string;
             detection_window: string;
@@ -729,6 +737,30 @@ export interface components {
             seq: number;
             ts: string;
         };
+        /** @description Public API contract. */
+        ExecutorHealth: {
+            configured_process_slots?: number | null;
+            detail: string;
+            detection_window: string;
+            in_flight_count?: number | null;
+            observed_executors?: number | null;
+            status: components["schemas"]["ComponentStatus"];
+        };
+        /** @description Public API contract. */
+        FormationHealth: {
+            detail: string;
+            detection_window: string;
+            /** Format: int32 */
+            executor_count: number;
+            final_logs: components["schemas"]["HealthFinalLogStore"];
+            profile: components["schemas"]["HealthFormationProfile"];
+            roles: components["schemas"]["HealthResolvedRole"][];
+            sql: components["schemas"]["DataPlaneSqlImplementation"];
+            status: components["schemas"]["ComponentStatus"];
+            substrates: components["schemas"]["HealthSubstrateSelection"];
+            topology: components["schemas"]["HealthFormationTopology"];
+            writer_topology: components["schemas"]["HealthWriterTopology"];
+        };
         GateView: {
             captures: string[];
             /** Format: int64 */
@@ -750,17 +782,71 @@ export interface components {
             note?: string | null;
             target?: null | components["schemas"]["CancelTargetBody"];
         };
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthCoordinationRole: "command_bus" | "task_dispatch" | "task_events" | "task_cancellation" | "compaction_staging" | "lifecycle_work" | "log_staging" | "scope_store" | "ingress_idempotency_store" | "liveness_watchdog" | "signal_applied_notifier" | "executor_fleet_status" | "event_ingress";
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthFinalLogStore: "local_files";
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthFormationProfile: "tickr_lite";
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthFormationTopology: "single_node";
+        /** @description Public API contract. */
+        HealthProtocolIdentity: {
+            name: string;
+            /** Format: int32 */
+            version: number;
+        };
+        /** @description Public API contract. */
+        HealthResolvedRole: {
+            implementation: components["schemas"]["HealthRoleImplementation"];
+            protocol: components["schemas"]["HealthProtocolIdentity"];
+            role: components["schemas"]["HealthCoordinationRole"];
+        };
         /** @description Public API contract. */
         HealthResponse: {
             api: components["schemas"]["ComponentHealth"];
             /** @description Public API contract. */
             checked_at: string;
+            command_path?: null | components["schemas"]["CommandPathHealth"];
             conductor: components["schemas"]["ComponentHealth"];
             control_plane: components["schemas"]["ComponentHealth"];
             data_plane_sql: components["schemas"]["DataPlaneSqlHealth"];
-            executors: components["schemas"]["ComponentHealth"];
+            executors: components["schemas"]["ExecutorHealth"];
+            formation?: null | components["schemas"]["FormationHealth"];
+            local_coordination?: null | components["schemas"]["ComponentHealth"];
             nats_kv: components["schemas"]["ComponentHealth"];
+            readiness?: null | components["schemas"]["ReadinessHealth"];
         };
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthRoleImplementation: "local_request_reply" | "local_sqlite" | "local_journal" | "local_notification" | "local_observation" | "disabled";
+        /** @description Public API contract. */
+        HealthSubstrateSelection: {
+            nats: boolean;
+            object_store: boolean;
+            postgres: boolean;
+            redis: boolean;
+            sqlite: boolean;
+        };
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        HealthWriterTopology: "conductor_owned";
         /** @description Public API contract. */
         HelloResponse: {
             message: string;
@@ -875,6 +961,13 @@ export interface components {
         /** @description Public API contract. */
         PathCancelBody: {
             note?: string | null;
+        };
+        /** @description Public API contract. */
+        ReadinessHealth: {
+            detail: string;
+            detection_window: string;
+            ready: boolean;
+            status: components["schemas"]["ComponentStatus"];
         };
         /** @description Public API contract. */
         ReadinessResponse: {

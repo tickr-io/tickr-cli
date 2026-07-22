@@ -19,10 +19,15 @@
 
 pub mod executor;
 pub mod job;
+pub mod local;
 pub mod worker;
 
 pub use executor::{BuildExecutor, BuildOutcome, NixBuildExecutor, TestBuildExecutor};
 pub use job::TaskBuildJob;
+pub use local::{
+    definition_build_notifications, start_local_definition_build_worker,
+    DefinitionBuildNotificationStream, DefinitionBuildNotifier, LocalDefinitionBuildWorkerConfig,
+};
 pub use worker::start_build_worker;
 
 /// NATS subject the per-task build pipeline ships jobs over.

@@ -33,6 +33,17 @@ pub struct ArchiveTerminalWorkflowInput<'a> {
     pub archived_at: DateTime<Utc>,
 }
 
+/// Durable completion evidence coupled to a staged local Compaction archive.
+#[derive(Debug, Clone)]
+pub struct LocalCompactionArchiveCompletion {
+    pub workflow_instance_id: Uuid,
+    pub payload_digest: String,
+    pub scope_id: Uuid,
+    pub scope_digest: String,
+    pub final_log_references: Value,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Compaction enrichment linked to one terminal Workflow instance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArchiveRunInfo {
@@ -109,8 +120,32 @@ impl WriterRepositoryBundle {
         validate_input(input.projection)?;
         match &self.pool {
             BackendPool::Postgres(pool) => archive_postgres(pool, input).await,
-            BackendPool::Sqlite(pool) => archive_sqlite(pool, input).await,
+            BackendPool::Sqlite(pool) => archive_sqlite(pool, input, None).await,
         }
+    }
+
+    /// Archive a staged Tickr Lite Compaction and mark its staging record
+    /// complete in the same SQLite transaction. The caller may only purge
+    /// logs, scope values, and envelope bytes after this returns successfully.
+    pub async fn archive_staged_local_compaction(
+        &self,
+        input: ArchiveTerminalWorkflowInput<'_>,
+        completion: LocalCompactionArchiveCompletion,
+    ) -> Result<(), RepositoryError> {
+        validate_input(input.projection)?;
+        let projection_id = Uuid::parse_str(&input.projection.id).map_err(invalid_input)?;
+        if projection_id != completion.workflow_instance_id {
+            return Err(invalid_input(CorruptArchive(
+                "staged Compaction identity does not match archive projection".to_owned(),
+            )));
+        }
+        let BackendPool::Sqlite(pool) = &self.pool else {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Configuration,
+                CorruptArchive("local Compaction archive requires SQLite".to_owned()),
+            ));
+        };
+        archive_sqlite(pool, input, Some(completion)).await
     }
 }
 
@@ -775,6 +810,7 @@ async fn archive_postgres(
 async fn archive_sqlite(
     pool: &SqlitePool,
     input: ArchiveTerminalWorkflowInput<'_>,
+    completion: Option<LocalCompactionArchiveCompletion>,
 ) -> Result<(), RepositoryError> {
     let projection = input.projection;
     let instance_id = Uuid::parse_str(&projection.id).map_err(invalid_input)?;
@@ -871,6 +907,40 @@ async fn archive_sqlite(
     .execute(&mut *tx)
     .await
     .map_err(repository_sqlx_error)?;
+
+    if let Some(completion) = completion {
+        sqlx::query(
+            "UPDATE signal_captures SET terminal_at = ?2 \
+             WHERE materialized_run_id = ?1 AND terminal_at IS NULL",
+        )
+        .bind(encode_uuid(completion.workflow_instance_id))
+        .bind(encode_timestamp(completion.completed_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_sqlx_error)?;
+
+        let completed = sqlx::query(
+            "UPDATE local_compaction_staging \
+             SET state = 'complete', scope_id = ?3, scope_digest = ?4, \
+                 final_log_references = ?5, completed_at = ?6 \
+             WHERE workflow_instance_id = ?1 AND payload_digest = ?2 AND state = 'staged'",
+        )
+        .bind(encode_uuid(completion.workflow_instance_id))
+        .bind(&completion.payload_digest)
+        .bind(encode_uuid(completion.scope_id))
+        .bind(&completion.scope_digest)
+        .bind(encode_json(&completion.final_log_references))
+        .bind(encode_timestamp(completion.completed_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if completed.rows_affected() != 1 {
+            return Err(invalid_input(CorruptArchive(
+                "staged Compaction record is missing, complete, or has different payload bytes"
+                    .to_owned(),
+            )));
+        }
+    }
 
     tx.commit().await.map_err(repository_sqlx_error)
 }

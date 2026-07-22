@@ -1436,3 +1436,370 @@ async fn try_run_streaming(
     println!("Streaming session completed.");
     Ok(())
 }
+
+/// Tickr Lite's local coordination boundary for messages arriving from the
+/// Control plane. The relay keeps the published protobuf contracts while the
+/// supervisor supplies durable local role implementations.
+#[async_trait::async_trait]
+pub trait LiteRelayRoles: Send + Sync {
+    /// Bind this relay cycle's outbound channel and resume durable outbound
+    /// drains. A reconnect replaces only the transport; staged work remains.
+    async fn relay_connected(
+        &self,
+        relay_tx: mpsc::Sender<ConductorRelayMessage>,
+        cycle: CancellationToken,
+    );
+
+    /// Durably stage one TaskDispatch before the relay reports Delivered.
+    async fn stage_task_dispatch(&self, payload: &[u8]) -> Result<()>;
+
+    /// Fence and forward one server-authored task cancellation locally.
+    async fn stage_task_cancellation(&self, payload: &[u8]) -> Result<()>;
+
+    /// Durably stage one Compaction and return its published acknowledgement.
+    async fn stage_compaction(&self, payload: &[u8]) -> Result<ConductorRelayMessage>;
+
+    /// Wake an in-process waiter for one materialized ByTag cancellation.
+    fn signal_applied(&self, signal_id: Uuid);
+}
+
+/// Run the existing cross-plane relay with Tickr Lite's local Data-plane
+/// coordination roles. Connection failures retain the distributed relay's
+/// bounded retry behavior and never reinterpret local durable state.
+pub async fn run_streaming_lite(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    roles: Arc<dyn LiteRelayRoles>,
+) -> Result<()> {
+    run_streaming_lite_at(
+        shutdown_token,
+        definition_repository,
+        roles,
+        tickr_proto::config::coordinator_relay_url(),
+        TenantId::from_env().to_string(),
+    )
+    .await
+}
+
+async fn run_streaming_lite_at(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    roles: Arc<dyn LiteRelayRoles>,
+    relay_url: String,
+    tenant_id: String,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    const INITIAL_BACKOFF_MS: u64 = 250;
+    const MAX_BACKOFF_MS: u64 = 5_000;
+    const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
+
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+    loop {
+        if shutdown_token.is_cancelled() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        match try_run_streaming_lite(
+            shutdown_token.clone(),
+            Arc::clone(&definition_repository),
+            &relay_url,
+            &tenant_id,
+            Arc::clone(&roles),
+        )
+        .await
+        {
+            Ok(()) if shutdown_token.is_cancelled() => return Ok(()),
+            Ok(()) => eprintln!("Tickr Lite relay stream ended; reconnecting..."),
+            Err(error) => {
+                eprintln!("Tickr Lite relay error: {error}; reconnecting in {backoff_ms}ms...")
+            }
+        }
+        if started.elapsed() >= STABLE_THRESHOLD {
+            backoff_ms = INITIAL_BACKOFF_MS;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = shutdown_token.cancelled() => return Ok(()),
+        }
+        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+    }
+}
+
+async fn try_run_streaming_lite(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    relay_url: &str,
+    tenant_id: &str,
+    roles: Arc<dyn LiteRelayRoles>,
+) -> Result<()> {
+    let channel = Channel::from_shared(relay_url.to_owned())?
+        .connect()
+        .await?;
+    let mut client = ConductorRelayServiceClient::new(channel);
+    let (tx, rx) = mpsc::channel::<ConductorRelayMessage>(32);
+    init_relay_tx(tx.clone()).await;
+
+    let cycle = CancellationToken::new();
+    let _cycle_guard = cycle.clone().drop_guard();
+    roles.relay_connected(tx.clone(), cycle.clone()).await;
+
+    let outbound = tokio_stream::once(ConductorRelayMessage {
+        entity_type: 0,
+        payload: Vec::new(),
+        tenant_id: Some(tenant_id.to_owned()),
+    })
+    .chain(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let response = client.stream_conductor_relay(outbound).await?;
+    let mut inbound = response.into_inner();
+
+    tokio::select! {
+        result = async {
+            while let Some(message) = inbound.next().await {
+                let message = message?;
+                match EntityType::try_from(message.entity_type) {
+                    Ok(EntityType::TaskQueueItem) => {
+                        let dispatch = tc::TaskDispatch::decode(&message.payload[..])?;
+                        roles.stage_task_dispatch(&message.payload).await?;
+                        let delivered = tc::TaskEvent {
+                            task_instance_id: dispatch.task_instance_id,
+                            task_id: dispatch.task_id,
+                            workflow_instance_id: dispatch.workflow_instance_id,
+                            workflow_id: dispatch.workflow_id,
+                            executor_id: None,
+                            kind: Some(tc::task_event::Kind::Delivered(
+                                tc::task_event::Delivered {},
+                            )),
+                        };
+                        tx.send(ConductorRelayMessage {
+                            entity_type: EntityType::TaskEvent as i32,
+                            payload: delivered.encode_to_vec(),
+                            tenant_id: None,
+                        }).await.map_err(|error| anyhow::anyhow!(
+                            "send local Delivered event: {error}"
+                        ))?;
+                    }
+                    Ok(EntityType::CancelTask) => {
+                        roles.stage_task_cancellation(&message.payload).await?;
+                    }
+                    Ok(EntityType::Compaction) => {
+                        let acknowledgement = roles.stage_compaction(&message.payload).await?;
+                        tx.send(acknowledgement).await.map_err(|error| anyhow::anyhow!(
+                            "send local Compaction acknowledgement: {error}"
+                        ))?;
+                    }
+                    Ok(EntityType::CancelPrecondition) => {
+                        if let Ok(cancel) = tc::CancelPrecondition::decode(&message.payload[..]) {
+                            if let (Ok(workflow_instance_id), Ok(edge_id)) = (
+                                Uuid::parse_str(&cancel.workflow_instance_id),
+                                Uuid::parse_str(&cancel.edge_id),
+                            ) {
+                                crate::gate_index_lifecycle::gate_index()
+                                    .unregister(workflow_instance_id, edge_id);
+                            }
+                        }
+                    }
+                    Ok(EntityType::DispatchPrecondition) => {
+                        if let Ok(precondition) =
+                            tc::DispatchPrecondition::decode(&message.payload[..])
+                        {
+                            if let (Ok(workflow_instance_id), Ok(edge_id)) = (
+                                Uuid::parse_str(&precondition.workflow_instance_id),
+                                Uuid::parse_str(&precondition.edge_id),
+                            ) {
+                                crate::gate_index_lifecycle::gate_index().register(
+                                    workflow_instance_id,
+                                    edge_id,
+                                    &precondition.signal_name,
+                                    precondition.predicate.as_deref(),
+                                    precondition.captures_spec,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(EntityType::SignalApplied) => {
+                        let applied = sp::SignalApplied::decode(&message.payload[..])?;
+                        roles.signal_applied(Uuid::parse_str(&applied.signal_id)?);
+                    }
+                    Ok(EntityType::PatchOutcome) => {
+                        let outcome = pp::PatchOutcome::decode(&message.payload[..])?;
+                        crate::patch_pipeline::correlate_outcome(
+                            definition_repository.as_ref(),
+                            &outcome,
+                        )
+                        .await?;
+                    }
+                    Ok(other) => {
+                        println!("Tickr Lite relay received unexpected entity type: {other:?}");
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Tickr Lite relay received invalid entity type {}: {error:?}",
+                            message.entity_type
+                        );
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        } => result?,
+        _ = shutdown_token.cancelled() => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(test, not(madsim)))]
+mod lite_relay_tests {
+    use super::*;
+    use crate::proto::conductor_relay_service_server::{
+        ConductorRelayService, ConductorRelayServiceServer,
+    };
+    use futures::Stream;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tickr_migrations::backend::{RepositoryFactory, WriterRepositoryBundle};
+    use tickr_migrations::{apply_sqlite, sqlite_writer_options, MigrationTarget};
+    use tickr_proto::config::DataPlaneSql;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{Request, Response, Status, Streaming};
+
+    type RelayStream =
+        Pin<Box<dyn Stream<Item = Result<ConductorRelayMessage, Status>> + Send + 'static>>;
+
+    #[derive(Clone)]
+    struct TestRelay {
+        connections: Arc<AtomicUsize>,
+        outage: CancellationToken,
+    }
+
+    #[tonic::async_trait]
+    impl ConductorRelayService for TestRelay {
+        type StreamConductorRelayStream = RelayStream;
+
+        async fn stream_conductor_relay(
+            &self,
+            _request: Request<Streaming<ConductorRelayMessage>>,
+        ) -> Result<Response<Self::StreamConductorRelayStream>, Status> {
+            self.connections.fetch_add(1, Ordering::Release);
+            let (tx, rx) = mpsc::channel(1);
+            let outage = self.outage.clone();
+            tokio::spawn(async move {
+                outage.cancelled().await;
+                drop(tx);
+            });
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
+    }
+
+    struct NoopRoles;
+
+    #[async_trait::async_trait]
+    impl LiteRelayRoles for NoopRoles {
+        async fn relay_connected(
+            &self,
+            _relay_tx: mpsc::Sender<ConductorRelayMessage>,
+            _cycle: CancellationToken,
+        ) {
+        }
+
+        async fn stage_task_dispatch(&self, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_task_cancellation(&self, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_compaction(&self, _payload: &[u8]) -> Result<ConductorRelayMessage> {
+            Ok(ConductorRelayMessage::default())
+        }
+
+        fn signal_applied(&self, _signal_id: Uuid) {}
+    }
+
+    async fn definition_repository() -> (TempDir, Arc<WriterRepositoryBundle>) {
+        let directory = TempDir::new().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("relay.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlite_writer_options(&url, true).unwrap())
+            .await
+            .unwrap();
+        apply_sqlite(MigrationTarget::Conductor, &pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let writer = RepositoryFactory::new(DataPlaneSql::Sqlite { url })
+            .open_writer()
+            .await
+            .unwrap();
+        (directory, Arc::new(writer))
+    }
+
+    async fn start_relay(
+        address: std::net::SocketAddr,
+        connections: Arc<AtomicUsize>,
+        outage: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ConductorRelayServiceServer::new(TestRelay {
+                    connections,
+                    outage,
+                }))
+                .serve(address)
+                .await
+                .unwrap();
+        })
+    }
+
+    async fn await_connections(connections: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while connections.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lite_relay_survives_outage_and_reconnects() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let relay_url = format!("http://{address}");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let first_outage = CancellationToken::new();
+        let first_server =
+            start_relay(address, Arc::clone(&connections), first_outage.clone()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!first_server.is_finished(), "test relay failed to start");
+        let (_directory, repository) = definition_repository().await;
+        let shutdown = CancellationToken::new();
+        let relay = tokio::spawn(run_streaming_lite_at(
+            shutdown.clone(),
+            repository,
+            Arc::new(NoopRoles),
+            relay_url,
+            "test-tenant".to_owned(),
+        ));
+
+        await_connections(&connections, 1).await;
+        first_outage.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first_server.abort();
+        first_server.await.unwrap_err();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!relay.is_finished(), "a relay outage must not fail Lite");
+
+        let second_server =
+            start_relay(address, Arc::clone(&connections), CancellationToken::new()).await;
+        await_connections(&connections, 2).await;
+        shutdown.cancel();
+        relay.await.unwrap().unwrap();
+        second_server.abort();
+    }
+}

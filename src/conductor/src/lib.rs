@@ -26,6 +26,7 @@ pub mod replay_seed;
 pub mod repository;
 pub mod routing_enrichment;
 pub mod routing_split;
+pub mod signal_applied_notifier;
 pub mod signal_cancels;
 pub mod signal_captures;
 pub mod signal_captures_cleanup;

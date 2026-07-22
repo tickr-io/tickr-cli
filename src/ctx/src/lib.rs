@@ -5,5 +5,6 @@
 
 pub mod ambient;
 pub mod envelope;
+pub mod local;
 pub mod scope;
 pub mod store;
