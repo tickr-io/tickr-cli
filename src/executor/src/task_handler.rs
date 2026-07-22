@@ -72,10 +72,9 @@ fn build_run_command(task: &DispatchedTask) -> Vec<String> {
 /// `TICKR_TRIGGER_SIGNAL_ID` is what `tickr-ctx`'s scope resolver consults
 /// when an input declaration says it comes from the trigger payload — the
 /// reader path picks `<signal_id>/<name>` instead of `<run_id>/<name>`.
-fn build_nix_env(
+pub fn build_task_environment(
     task: &DispatchedTask,
     ns: &str,
-    nats_url: &str,
     originating_signal_id: Option<Uuid>,
     gate_signal_ids: &HashMap<String, Uuid>,
     gate_signal_ids_ambient: &std::collections::HashSet<Uuid>,
@@ -98,7 +97,6 @@ fn build_nix_env(
         "TICKR_WORKFLOW_ID".to_string(),
         task.workflow_id.to_string(),
     );
-    env.insert("TICKR_NATS_URL".to_string(), nats_url.to_string());
     env.insert("TICKR_OUTPUTS".to_string(), task.outputs.join(","));
     env.insert("TICKR_INPUTS".to_string(), task.inputs.join(","));
     env.insert("TICKR_SECRETS".to_string(), task.secrets.join(","));
@@ -166,6 +164,25 @@ fn build_nix_env(
     env
 }
 
+fn build_nix_env(
+    task: &DispatchedTask,
+    ns: &str,
+    nats_url: &str,
+    originating_signal_id: Option<Uuid>,
+    gate_signal_ids: &HashMap<String, Uuid>,
+    gate_signal_ids_ambient: &std::collections::HashSet<Uuid>,
+) -> HashMap<String, String> {
+    let mut environment = build_task_environment(
+        task,
+        ns,
+        originating_signal_id,
+        gate_signal_ids,
+        gate_signal_ids_ambient,
+    );
+    environment.insert("TICKR_NATS_URL".to_owned(), nats_url.to_owned());
+    environment
+}
+
 /// Grace period between SIGTERM and SIGKILL when tearing down an in-flight task
 /// process group on executor shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -173,7 +190,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Grace period between SIGTERM and SIGKILL when killing a task on an operator
 /// cancel-request. Shorter than shutdown's — a cancel is a deliberate "stop
 /// this now", so we escalate to SIGKILL faster.
-const CANCEL_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// The executor's cancel bookkeeping, shared across the dispatch-drain and
 /// cancel-drain loops behind one lock so a pickup and a cancel-request can never
@@ -266,7 +283,11 @@ fn signal_group(pgid: Option<i32>, sig: nix::sys::signal::Signal) -> bool {
 /// could be signalled after its pid was reaped and recycled onto an unrelated
 /// process. Signalling the group (not the bare child) takes the whole
 /// `nix → bash → …` tree down together.
-async fn teardown_own_group(pgid: Option<i32>, child: &mut Child, grace: Duration) -> TaskExit {
+pub(crate) async fn teardown_own_group(
+    pgid: Option<i32>,
+    child: &mut Child,
+    grace: Duration,
+) -> TaskExit {
     #[cfg(unix)]
     {
         use nix::sys::signal::Signal;

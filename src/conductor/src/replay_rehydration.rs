@@ -493,6 +493,25 @@ pub async fn apply_rehydration(
     Ok(())
 }
 
+/// Build Tickr Lite's ordered scope values for one replay re-hydration. The
+/// local scope transaction commits carried keys, shadows, and the sentinel
+/// atomically before the caller relays the release Signal.
+pub fn local_rehydration_values(plan: &RehydrationPlan) -> Result<Vec<CarriedKey>> {
+    let mut values = Vec::with_capacity(plan.carried.len() + plan.shadowed.len() + 1);
+    values.extend(plan.carried.iter().cloned());
+    values.extend(plan.shadowed.iter().cloned());
+    let sentinel = build_sentinel_envelope(
+        plan.replay_signal_id,
+        plan.carried_count,
+        &plan.key_list_sha256,
+    );
+    values.push(CarriedKey {
+        name: HYDRATION_SENTINEL_KEY.to_owned(),
+        bytes: serde_json::to_vec(&sentinel).context("serialize hydration sentinel")?,
+    });
+    Ok(values)
+}
+
 /// Convenience: open the ctx bucket and apply a plan. Used by the conductor
 /// ingress that drives a born-Stalled replay to release.
 pub async fn apply_rehydration_via_nats(
@@ -506,13 +525,15 @@ pub async fn apply_rehydration_via_nats(
 }
 
 /// The thin conductor→server release command that lifts a born-Stalled replay's
-/// birth-time Stall via the idempotent `resume_instance`. The caller sends this
-/// only after [`apply_rehydration`] returns Ok — release rides on the sentinel
-/// having landed. A dedicated command, never a zero-op patch: provenance must
-/// not lie about what mutated the run.
+/// birth-time Stall via the idempotent `resume_instance`. Its signal identity
+/// is derived from the durable replay identity so a crash after relay forwarding
+/// retries the same published command rather than minting a second effect. The
+/// caller sends this only after [`apply_rehydration`] returns Ok — release rides
+/// on the sentinel having landed. A dedicated command, never a zero-op patch:
+/// provenance must not lie about what mutated the run.
 pub fn release_signal(replay_run_id: Uuid) -> sp::Signal {
     sp::Signal {
-        signal_id: Uuid::new_v4().to_string(),
+        signal_id: Uuid::new_v5(&replay_run_id, b"release").to_string(),
         idempotency_key: None,
         variant: Some(sp::signal::Variant::Resume(sp::Resume {
             workflow_instance_id: replay_run_id.to_string(),

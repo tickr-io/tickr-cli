@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_roles_are_file_backed_bounded_and_read_only_after_reopen() {
+    async fn sqlite_writer_is_single_connection_and_concurrent_api_role_stays_read_only() {
         let (_directory, url) = migrated_sqlite().await;
         let factory = RepositoryFactory::new(DataPlaneSql::Sqlite { url });
         let writer = factory.open_writer().await.unwrap();
@@ -571,7 +571,6 @@ mod tests {
         let duplicate = repository_sqlx_error(duplicate);
         assert_eq!(duplicate.kind(), RepositoryErrorKind::ConstraintConflict);
         assert!(duplicate.source().is_some());
-        writer.close().await;
 
         let reader = factory.open_read_only().await.unwrap();
         assert_eq!(reader.metadata().role, RepositoryRole::ReadOnly);
@@ -617,6 +616,7 @@ mod tests {
             .is_err());
         reader.verify_schema().await.unwrap();
         reader.probe().await.unwrap();
+        writer.close().await;
         reader.close().await;
     }
 

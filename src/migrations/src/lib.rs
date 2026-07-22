@@ -10,13 +10,16 @@ use sqlx::{PgPool, SqlitePool};
 
 pub mod archive_repository;
 pub mod backend;
+pub mod compaction_repository;
 pub mod definition_repository;
 pub mod encoding;
 pub mod event_repository;
 pub mod patch_repository;
 pub mod replay_repository;
 mod schema;
+pub mod scope_repository;
 pub mod signal_repository;
+pub mod task_pickup_repository;
 
 pub use schema::{verify_postgres_schema, verify_sqlite_schema, SchemaVerificationError};
 
@@ -31,10 +34,48 @@ pub struct LogicalMigrationIdentity {
     pub name: &'static str,
 }
 
-pub const LOGICAL_MIGRATIONS: &[LogicalMigrationIdentity] = &[LogicalMigrationIdentity {
-    version: 1,
-    name: "current_conductor_schema",
-}];
+pub const LOGICAL_MIGRATIONS: &[LogicalMigrationIdentity] = &[
+    LogicalMigrationIdentity {
+        version: 1,
+        name: "current_conductor_schema",
+    },
+    LogicalMigrationIdentity {
+        version: 2,
+        name: "definition_build_leases",
+    },
+    LogicalMigrationIdentity {
+        version: 3,
+        name: "definition_submission_leases",
+    },
+    LogicalMigrationIdentity {
+        version: 4,
+        name: "patch_lifecycle_leases",
+    },
+    LogicalMigrationIdentity {
+        version: 5,
+        name: "replay_lifecycle_leases",
+    },
+    LogicalMigrationIdentity {
+        version: 6,
+        name: "local_task_pickups",
+    },
+    LogicalMigrationIdentity {
+        version: 7,
+        name: "local_task_terminal_outcomes",
+    },
+    LogicalMigrationIdentity {
+        version: 8,
+        name: "local_task_cancellation_fences",
+    },
+    LogicalMigrationIdentity {
+        version: 9,
+        name: "tickr_ctx_scope_store",
+    },
+    LogicalMigrationIdentity {
+        version: 10,
+        name: "local_compaction_staging",
+    },
+];
 
 struct PairedMigrationSet {
     postgres: Migrator,

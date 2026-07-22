@@ -189,6 +189,26 @@ components:
       - instances
       - live_data_available
       type: object
+    CommandPathHealth:
+      description: Public API contract.
+      properties:
+        detail:
+          type: string
+        detection_window:
+          type: string
+        implementation:
+          $ref: '#/components/schemas/HealthRoleImplementation'
+        protocol:
+          $ref: '#/components/schemas/HealthProtocolIdentity'
+        status:
+          $ref: '#/components/schemas/ComponentStatus'
+      required:
+      - implementation
+      - protocol
+      - status
+      - detail
+      - detection_window
+      type: object
     ComponentHealth:
       description: Public API contract.
       properties:
@@ -323,6 +343,77 @@ components:
       - event_type
       - payload
       type: object
+    ExecutorHealth:
+      description: Public API contract.
+      properties:
+        configured_process_slots:
+          minimum: 0
+          type:
+          - integer
+          - 'null'
+        detail:
+          type: string
+        detection_window:
+          type: string
+        in_flight_count:
+          minimum: 0
+          type:
+          - integer
+          - 'null'
+        observed_executors:
+          minimum: 0
+          type:
+          - integer
+          - 'null'
+        status:
+          $ref: '#/components/schemas/ComponentStatus'
+      required:
+      - status
+      - detail
+      - detection_window
+      type: object
+    FormationHealth:
+      description: Public API contract.
+      properties:
+        detail:
+          type: string
+        detection_window:
+          type: string
+        executor_count:
+          format: int32
+          minimum: 0
+          type: integer
+        final_logs:
+          $ref: '#/components/schemas/HealthFinalLogStore'
+        profile:
+          $ref: '#/components/schemas/HealthFormationProfile'
+        roles:
+          items:
+            $ref: '#/components/schemas/HealthResolvedRole'
+          type: array
+        sql:
+          $ref: '#/components/schemas/DataPlaneSqlImplementation'
+        status:
+          $ref: '#/components/schemas/ComponentStatus'
+        substrates:
+          $ref: '#/components/schemas/HealthSubstrateSelection'
+        topology:
+          $ref: '#/components/schemas/HealthFormationTopology'
+        writer_topology:
+          $ref: '#/components/schemas/HealthWriterTopology'
+      required:
+      - profile
+      - topology
+      - sql
+      - final_logs
+      - writer_topology
+      - executor_count
+      - substrates
+      - roles
+      - status
+      - detail
+      - detection_window
+      type: object
     GateView:
       properties:
         captures:
@@ -391,6 +482,65 @@ components:
           - type: 'null'
           - $ref: '#/components/schemas/CancelTargetBody'
       type: object
+    HealthCoordinationRole:
+      description: Public API contract.
+      enum:
+      - command_bus
+      - task_dispatch
+      - task_events
+      - task_cancellation
+      - compaction_staging
+      - lifecycle_work
+      - log_staging
+      - scope_store
+      - ingress_idempotency_store
+      - liveness_watchdog
+      - signal_applied_notifier
+      - executor_fleet_status
+      - event_ingress
+      type: string
+    HealthFinalLogStore:
+      description: Public API contract.
+      enum:
+      - local_files
+      type: string
+    HealthFormationProfile:
+      description: Public API contract.
+      enum:
+      - tickr_lite
+      type: string
+    HealthFormationTopology:
+      description: Public API contract.
+      enum:
+      - single_node
+      type: string
+    HealthProtocolIdentity:
+      description: Public API contract.
+      properties:
+        name:
+          type: string
+        version:
+          format: int32
+          minimum: 0
+          type: integer
+      required:
+      - name
+      - version
+      type: object
+    HealthResolvedRole:
+      description: Public API contract.
+      properties:
+        implementation:
+          $ref: '#/components/schemas/HealthRoleImplementation'
+        protocol:
+          $ref: '#/components/schemas/HealthProtocolIdentity'
+        role:
+          $ref: '#/components/schemas/HealthCoordinationRole'
+      required:
+      - role
+      - implementation
+      - protocol
+      type: object
     HealthResponse:
       description: Public API contract.
       properties:
@@ -399,6 +549,10 @@ components:
         checked_at:
           description: Public API contract.
           type: string
+        command_path:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CommandPathHealth'
         conductor:
           $ref: '#/components/schemas/ComponentHealth'
         control_plane:
@@ -406,9 +560,21 @@ components:
         data_plane_sql:
           $ref: '#/components/schemas/DataPlaneSqlHealth'
         executors:
-          $ref: '#/components/schemas/ComponentHealth'
+          $ref: '#/components/schemas/ExecutorHealth'
+        formation:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FormationHealth'
+        local_coordination:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ComponentHealth'
         nats_kv:
           $ref: '#/components/schemas/ComponentHealth'
+        readiness:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReadinessHealth'
       required:
       - checked_at
       - api
@@ -418,6 +584,41 @@ components:
       - conductor
       - control_plane
       type: object
+    HealthRoleImplementation:
+      description: Public API contract.
+      enum:
+      - local_request_reply
+      - local_sqlite
+      - local_journal
+      - local_notification
+      - local_observation
+      - disabled
+      type: string
+    HealthSubstrateSelection:
+      description: Public API contract.
+      properties:
+        nats:
+          type: boolean
+        object_store:
+          type: boolean
+        postgres:
+          type: boolean
+        redis:
+          type: boolean
+        sqlite:
+          type: boolean
+      required:
+      - sqlite
+      - postgres
+      - nats
+      - redis
+      - object_store
+      type: object
+    HealthWriterTopology:
+      description: Public API contract.
+      enum:
+      - conductor_owned
+      type: string
     HelloResponse:
       description: Public API contract.
       properties:
@@ -736,6 +937,23 @@ components:
           type:
           - string
           - 'null'
+      type: object
+    ReadinessHealth:
+      description: Public API contract.
+      properties:
+        detail:
+          type: string
+        detection_window:
+          type: string
+        ready:
+          type: boolean
+        status:
+          $ref: '#/components/schemas/ComponentStatus'
+      required:
+      - ready
+      - status
+      - detail
+      - detection_window
       type: object
     ReadinessResponse:
       description: Public API contract.

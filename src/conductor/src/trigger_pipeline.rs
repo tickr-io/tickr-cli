@@ -133,6 +133,23 @@ pub async fn process_trigger(
     nats: &NatsClient,
     req: TriggerRequest,
 ) -> Result<TriggerOutcome, TriggerError> {
+    process_trigger_with_working_set(repositories, Some(nats), req).await
+}
+
+/// Tickr Lite Trigger ingress keeps the SQL capture archive and published
+/// Signal shape while omitting the profile-disabled NATS working-set cache.
+pub async fn process_trigger_local(
+    repositories: &WriterRepositoryBundle,
+    req: TriggerRequest,
+) -> Result<TriggerOutcome, TriggerError> {
+    process_trigger_with_working_set(repositories, None, req).await
+}
+
+async fn process_trigger_with_working_set(
+    repositories: &WriterRepositoryBundle,
+    nats: Option<&NatsClient>,
+    req: TriggerRequest,
+) -> Result<TriggerOutcome, TriggerError> {
     let inputs_provided = req.inputs.is_some();
     let payload = req.inputs.unwrap_or(Value::Object(Default::default()));
     let input_hash = canonical_json::hash(Some(&req.hash_payload));
@@ -168,7 +185,7 @@ pub async fn process_trigger(
     // 4. Idempotency cache. Only consulted when a producer-supplied key
     //    is present. The check_or_insert is atomic against concurrent
     //    retries on the same key.
-    if let Some(key) = req.idempotency_key.as_deref() {
+    if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
         let bucket = idempotency::open_bucket(nats)
             .await
             .map_err(TriggerError::Idempotency)?;
@@ -176,9 +193,7 @@ pub async fn process_trigger(
             .await
             .map_err(TriggerError::Idempotency)?;
         match outcome {
-            idempotency::CacheOutcome::Fresh => {
-                // Fall through to captures + persistence.
-            }
+            idempotency::CacheOutcome::Fresh => {}
             idempotency::CacheOutcome::DeduplicatedSameHash { original_signal_id } => {
                 return Ok(TriggerOutcome::Deduplicated { original_signal_id });
             }
@@ -259,10 +274,11 @@ pub async fn process_trigger(
         }
     }
 
-    // 7. NATS KV captures write — working-set cache.
-    write_captures_to_nats(nats, signal_id, &extracted)
-        .await
-        .map_err(TriggerError::NatsWrite)?;
+    if let Some(nats) = nats {
+        write_captures_to_nats(nats, signal_id, &extracted)
+            .await
+            .map_err(TriggerError::NatsWrite)?;
+    }
 
     // 8. Construct the wire Signal. Producer-supplied key carries onto the
     //    wire so server-side audit logs correlate retries. The transport

@@ -4111,12 +4111,20 @@ name = "tickr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "chrono",
  "clap",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "testcontainers-modules",
  "tickr_api",
  "tickr_conductor",
+ "tickr_ctx",
  "tickr_executor",
  "tickr_migrations",
  "tickr_proto",
@@ -4124,6 +4132,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4132,6 +4141,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "axum 0.8.9",
  "chrono",
  "chrono-tz",
@@ -4151,6 +4161,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tickr_conductor",
  "tickr_ctx",
+ "tickr_executor",
  "tickr_migrations",
  "tickr_proto",
  "tokio",
@@ -4211,6 +4222,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "bincode",
  "chrono",
  "clap",
  "futures-util",

@@ -1,15 +1,13 @@
 syntax = "proto3";
 
-// Command contract between the API component and the conductor. The single
-// subject `tickr.api.commands` names the API<->conductor relationship rather
-// than each verb; the request envelope discriminates the command kind. The
-// package is deliberately separate from `tickr` so neither crate depends on
-// the other for message shape — both generate from this file via tickr_proto.
-//
-// Message-only: there is no gRPC service block. The transport is NATS core
-// request/reply, so the API encodes `ApiCommandRequest` with prost and ships
-// the bytes as a NATS request; the conductor replies with an encoded
-// `ApiCommandResponse`.
+// Command contract between the API component and the Conductor. The request
+// envelope discriminates the command kind while the selected formation owns
+// transport: distributed formations use NATS Core request/reply on the single
+// `tickr.api.commands` subject; Tickr Lite uses bounded local request/reply to
+// the sole Conductor-owned writer. Both paths carry these exact bytes.
+// The package is deliberately separate from `tickr` so neither crate depends
+// on the other for message shape — both generate from this file via
+// tickr_proto.
 package tickr.api;
 
 // One request from the API to the conductor. Exactly one `body` variant is

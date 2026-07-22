@@ -105,6 +105,23 @@ pub async fn process_register(
     nats: &NatsClient,
     req: RegisterRequest,
 ) -> Result<RegisterOutcome, RegisterError> {
+    process_register_with_notifier(repositories, Some(nats), req).await
+}
+
+/// Tickr Lite registration uses the same durable transaction; its local build
+/// worker scans committed leases, so no external queue notification is needed.
+pub async fn process_register_local(
+    repositories: &WriterRepositoryBundle,
+    req: RegisterRequest,
+) -> Result<RegisterOutcome, RegisterError> {
+    process_register_with_notifier(repositories, None, req).await
+}
+
+async fn process_register_with_notifier(
+    repositories: &WriterRepositoryBundle,
+    nats: Option<&NatsClient>,
+    req: RegisterRequest,
+) -> Result<RegisterOutcome, RegisterError> {
     let tenant = TenantId::from_env();
     let workflow = match timeout(
         NICKEL_EVAL_TIMEOUT,
@@ -137,7 +154,9 @@ pub async fn process_register(
             tasks,
         } => {
             let task_count = tasks.len();
-            publish_build_tasks(nats, tasks).await;
+            if let Some(nats) = nats {
+                publish_build_tasks(nats, tasks).await;
+            }
             Ok(RegisterOutcome::Inserted {
                 workflow_id,
                 workflow_version,
@@ -165,7 +184,9 @@ pub async fn process_register(
             tasks,
         } => {
             let task_count = tasks.len();
-            publish_build_tasks(nats, tasks).await;
+            if let Some(nats) = nats {
+                publish_build_tasks(nats, tasks).await;
+            }
             Ok(RegisterOutcome::BuildRequeued {
                 workflow_id,
                 workflow_version,

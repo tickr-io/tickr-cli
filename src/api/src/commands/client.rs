@@ -1,12 +1,13 @@
-//! Command-bus client. Encodes an `ApiCommandRequest`, ships it on
-//! `tickr.api.commands` via NATS core request/reply with a per-command
-//! deadline, and decodes the `ApiCommandResponse`. Transport failures (no
-//! responder, deadline expired, undecodable reply) are mapped to synthesized
-//! HTTP responses here; a reply that decodes is handed back to the
-//! per-command handler, which forwards the conductor's `status_code` verbatim.
+//! Formation-selected Command-bus client. Encodes an `ApiCommandRequest`,
+//! sends it over distributed NATS Core or bounded local request/reply with a
+//! per-command deadline, and decodes the `ApiCommandResponse`. Transport
+//! failures map to synthesized HTTP responses; a decoded reply is handed to
+//! the per-command handler, which forwards the Conductor's `status_code`
+//! verbatim.
 
 use std::time::Duration;
 
+use super::local::{bounded, LocalCommandBus, LocalCommandBusConfig, LocalCommandWriter};
 use async_nats::Client;
 use axum::{
     http::StatusCode,
@@ -23,9 +24,43 @@ use tickr_proto::tickr_api::{
 /// API<->conductor relationship rather than the verb.
 pub const COMMAND_SUBJECT: &str = "tickr.api.commands";
 
-/// Per-command request deadlines. The API's HTTP timeout equals the NATS
-/// deadline (no nested timeouts); the floors differ because the four commands
-/// have genuinely different latency profiles. Defaults are the hard values;
+/// API-side Command bus selected by the resolved formation.
+///
+/// Both transports carry the same production protobuf envelopes and expose
+/// the same deadline, availability, malformed-reply, and payload-limit
+/// outcomes. Transport internals are not visible to HTTP handlers.
+#[derive(Clone)]
+pub enum CommandBus {
+    Nats(Client),
+    Local(LocalCommandBus),
+}
+
+impl CommandBus {
+    pub fn nats(client: Client) -> Self {
+        Self::Nats(client)
+    }
+
+    /// Construct the Tickr Lite Command bus and its sole Conductor writer.
+    pub fn local(config: LocalCommandBusConfig) -> (Self, LocalCommandWriter) {
+        let (client, writer) = bounded(config);
+        (Self::Local(client), writer)
+    }
+
+    pub async fn send(
+        &self,
+        request: ApiCommandRequest,
+        deadline: Duration,
+    ) -> Result<ApiCommandResponse, BusError> {
+        match self {
+            Self::Nats(client) => send_command(client, request, deadline).await,
+            Self::Local(client) => client.request(request, deadline).await,
+        }
+    }
+}
+
+/// Per-command request deadlines. The API's HTTP timeout equals the selected
+/// transport deadline; the floors differ because the commands have genuinely
+/// different latency profiles. Defaults are the hard values;
 /// an operator override seam can replace this struct without touching call
 /// sites.
 #[derive(Clone, Copy, Debug)]
@@ -69,15 +104,14 @@ impl Default for CommandDeadlines {
 /// as an `ErrorPayload`.
 #[derive(Debug)]
 pub enum BusError {
-    /// NATS broker unreachable or no subscriber on the subject. -> 503.
+    /// The selected transport or its Conductor responder is unavailable. -> 503.
     Unavailable,
     /// The conductor didn't reply within the deadline. -> 504.
     Timeout,
     /// A reply arrived but didn't decode as `ApiCommandResponse`. -> 502.
     Malformed,
-    /// The encoded command exceeded the broker's max payload (validated
-    /// client-side from the server's advertised limit before send). Reachable
-    /// on register, which carries raw Nickel source. -> 413.
+    /// The encoded command exceeded the selected transport's payload limit.
+    /// Reachable on register and Patch, which carry raw Nickel source. -> 413.
     TooLarge,
 }
 
@@ -112,6 +146,17 @@ pub async fn send_command(
     }
 }
 
+/// Issue a side-effect-free Ping over the selected Command bus.
+pub async fn ping_command_bus(
+    command_bus: &CommandBus,
+    deadline: Duration,
+) -> Result<(), BusError> {
+    let request = ApiCommandRequest {
+        body: Some(api_command_request::Body::Ping(PingRequest {})),
+    };
+    command_bus.send(request, deadline).await.map(|_| ())
+}
+
 /// Issue a side-effect-free `Ping` over the command bus and report whether the
 /// command consumer answered within `deadline`. This is a dedicated variant, not
 /// a reuse of a read command, so the probe touches no state — an explicit "does
@@ -121,12 +166,7 @@ pub async fn send_command(
 /// while the broker link is up). It asserts only that the command consumer
 /// answers — NOT that the relay loop is live (a relay-liveness check is deferred).
 pub async fn ping_conductor(nats: &Client, deadline: Duration) -> Result<(), BusError> {
-    let request = ApiCommandRequest {
-        body: Some(api_command_request::Body::Ping(PingRequest {})),
-    };
-    // Any decoded reply proves the consumer answered — that is the whole claim
-    // of a command-plane-responsive check; the payload variant is not inspected.
-    send_command(nats, request, deadline).await.map(|_| ())
+    ping_command_bus(&CommandBus::nats(nats.clone()), deadline).await
 }
 
 /// Render a transport failure into its synthesized HTTP response. These are

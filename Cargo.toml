@@ -91,6 +91,7 @@ tickr_proto = { workspace = true }
 tickr_conductor = { workspace = true }
 tickr_api = { workspace = true }
 tickr_executor = { workspace = true }
+tickr_ctx = { workspace = true }
 tokio = { version = "1", features = ["full", "tracing"] }
 tokio-util = { workspace = true }
 clap = { workspace = true }
@@ -98,10 +99,18 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = "1.0"
 sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
+prost = { workspace = true }
 
 [features]
 madsim = ["tickr_conductor/madsim", "tickr_api/madsim"]

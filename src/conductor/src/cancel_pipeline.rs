@@ -264,3 +264,98 @@ pub async fn process_cancel(
         Ok(CancelOutcome::Instance { signal_id })
     }
 }
+
+/// Tickr Lite cancellation uses the in-process materialization notification and
+/// keeps the same Signal and audit shapes. The profile declares the ingress
+/// idempotency store disabled, so no NATS cache is consulted.
+pub async fn process_cancel_local(
+    repositories: &WriterRepositoryBundle,
+    notifications: &tokio::sync::Mutex<
+        crate::signal_applied_notifier::SignalAppliedNotificationStream,
+    >,
+    req: CancelRequest,
+) -> Result<CancelOutcome, CancelError> {
+    use crate::signal_applied_notifier::SignalAppliedReconciliationWake;
+
+    let signal_id = Uuid::new_v4();
+    let target_json = serde_json::to_value(&req.target)
+        .map_err(|error| CancelError::SerializeTarget(error.into()))?;
+    let wire_target = match &req.target {
+        CancelTargetBody::Instance {
+            workflow_instance_id,
+            node_id,
+        } => sp::target::Addressing::Instance(sp::target::Instance {
+            workflow_instance_id: workflow_instance_id.to_string(),
+            node_id: node_id.map(|node| node.to_string()),
+        }),
+        CancelTargetBody::ByTag { filter } => sp::target::Addressing::ByTag(sp::target::ByTag {
+            filter: filter.clone(),
+        }),
+    };
+    let signal = sp::Signal {
+        signal_id: signal_id.to_string(),
+        idempotency_key: req.idempotency_key.clone(),
+        variant: Some(sp::signal::Variant::Cancel(sp::Cancel {
+            target: Some(sp::Target {
+                addressing: Some(wire_target),
+            }),
+            reason: Some(sp::CancelReason {
+                reason: Some(sp::cancel_reason::Reason::UserRequested(
+                    sp::cancel_reason::UserRequested { actor: None },
+                )),
+            }),
+            note: req.note.clone(),
+        })),
+    };
+
+    let is_bytag = matches!(req.target, CancelTargetBody::ByTag { .. });
+    let mut notification_stream = if is_bytag {
+        Some(notifications.lock().await)
+    } else {
+        None
+    };
+    crate::relay::send_signal(&signal)
+        .await
+        .map_err(CancelError::RelayUnreachable)?;
+
+    let applied_count = if let Some(stream) = notification_stream.as_mut() {
+        let deadline = tokio::time::Instant::now() + SIGNAL_APPLIED_DEADLINE;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(CancelError::ByTagTimeout { signal_id });
+            }
+            match stream.next_reconciliation(remaining).await {
+                SignalAppliedReconciliationWake::Notification(notification)
+                    if notification.signal_id == signal_id =>
+                {
+                    break 0;
+                }
+                SignalAppliedReconciliationWake::Notification(_) => continue,
+                SignalAppliedReconciliationWake::Deadline => {
+                    return Err(CancelError::ByTagTimeout { signal_id });
+                }
+            }
+        }
+    } else {
+        1
+    };
+
+    let row = SignalCancelRow {
+        signal_id,
+        applied_count,
+        target: target_json,
+        note: req.note,
+    };
+    if let Err(error) = crate::signal_cancels::insert(repositories, &row).await {
+        eprintln!("cancel pipeline: signal_cancels persist failed: {error}");
+    }
+    if is_bytag {
+        Ok(CancelOutcome::ByTag {
+            signal_id,
+            instances_matched: applied_count.max(0) as u32,
+        })
+    } else {
+        Ok(CancelOutcome::Instance { signal_id })
+    }
+}

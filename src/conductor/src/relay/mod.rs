@@ -19,3 +19,4 @@ pub use service::send_workflow_registration;
 pub use service::task_event_consumer;
 pub use service::try_send_signal;
 pub use service::TrySendOutcome;
+pub use service::{run_streaming_lite, LiteRelayRoles};
