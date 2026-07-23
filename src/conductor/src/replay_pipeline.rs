@@ -70,6 +70,8 @@ use crate::replay_rehydration::{
 };
 use crate::replay_seed::{default_resume_from, mint_replay_seed, ReplayReject};
 
+pub mod local;
+
 /// How often the re-drive loop scans for unsettled rows, and how long a row
 /// must sit untouched before it is re-driven. `updated_at` is the backoff
 /// anchor: every re-drive attempt bumps it, so a row is re-driven at most once
@@ -357,11 +359,7 @@ pub async fn process_replay(
 /// release the born-Stall, and settle the row `Released`. Every step is
 /// idempotent under redelivery, so a re-drive of a partially-driven row
 /// converges.
-async fn drive(
-    repositories: &WriterRepositoryBundle,
-    sender: &dyn ReplayRelaySender,
-    inputs: &DriveInputs,
-) -> Result<()> {
+async fn perform_drive_effects(sender: &dyn ReplayRelaySender, inputs: &DriveInputs) -> Result<()> {
     // Relay the Trigger first: the release Resume must arrive after the
     // instance exists, and the relay is an ordered stream.
     sender.send(&inputs.trigger).await?;
@@ -385,6 +383,15 @@ async fn drive(
             .send(&release_signal(inputs.replay_instance_id))
             .await?;
     }
+    Ok(())
+}
+
+async fn drive(
+    repositories: &WriterRepositoryBundle,
+    sender: &dyn ReplayRelaySender,
+    inputs: &DriveInputs,
+) -> Result<()> {
+    perform_drive_effects(sender, inputs).await?;
 
     match repositories
         .settle_replay_released(inputs.replay_instance_id)

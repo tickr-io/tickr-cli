@@ -11,6 +11,7 @@
 mod ambient;
 mod cli;
 mod envelope;
+mod local;
 mod scope;
 mod store;
 
@@ -23,11 +24,13 @@ async fn main() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("tickr-ctx: {:#}", e);
-            // Default error mapping: anyhow chain whose root mentions NATS
-            // gets mapped to 5; everything else to 2. Subcommands return
-            // their own specific code via Ok(code) when they want precision.
-            if format!("{:#}", e).to_lowercase().contains("nats") {
+            // Transport loss remains the existing transient exit 5. Typed
+            // local identity and bound refusals use the contract-failure exit.
+            let message = format!("{:#}", e).to_lowercase();
+            if message.contains("nats") || message.contains("endpoint unavailable") {
                 5
+            } else if message.contains("identity rejected") || message.contains("bound exceeded") {
+                4
             } else {
                 2
             }

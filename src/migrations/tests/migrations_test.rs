@@ -17,7 +17,7 @@ use tickr_migrations::encoding::{
 use tickr_migrations::{
     apply_sqlite, apply_target, sqlite_writer_options, validate_migration_registration,
     verify_current, verify_postgres_schema, verify_sqlite_current, verify_sqlite_schema,
-    MigrationTarget, MigrationsDriftError, SchemaVerificationError,
+    MigrationTarget, MigrationsDriftError, SchemaVerificationError, LOGICAL_MIGRATIONS,
 };
 use uuid::Uuid;
 
@@ -90,7 +90,7 @@ async fn conductor_postgres_migrations_are_fresh_repeatable_and_verified() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, LOGICAL_MIGRATIONS.last().unwrap().version);
 }
 
 #[tokio::test]
@@ -266,7 +266,7 @@ async fn sqlite_migration_reopens_without_identity_or_data_drift() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, LOGICAL_MIGRATIONS.last().unwrap().version);
 }
 
 #[tokio::test]

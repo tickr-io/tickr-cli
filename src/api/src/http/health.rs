@@ -33,6 +33,7 @@ use tickr_proto::coord::{
     LIVENESS_TIMEOUT_ENV,
 };
 
+use crate::commands::client::{ping_command_bus, CommandBus};
 use crate::http::coordinator_client::CoordinatorClient;
 
 /// The KV bucket the health surface probes for JetStream reachability. Later
@@ -74,20 +75,6 @@ impl ComponentHealth {
             status,
             detail: detail.into(),
             detection_window: INSTANT_WINDOW.to_string(),
-        }
-    }
-
-    /// A banded row: its `detection_window` is the liveness slack it waits out
-    /// before a red row would have flipped, not the request itself.
-    fn windowed(
-        status: ComponentStatus,
-        detail: impl Into<String>,
-        detection_window: impl Into<String>,
-    ) -> Self {
-        Self {
-            status,
-            detail: detail.into(),
-            detection_window: detection_window.into(),
         }
     }
 }
@@ -137,8 +124,207 @@ impl DataPlaneSqlHealth {
     }
 }
 
-/// The typed body of `GET /api/health`. Carries one global `checked_at` plus one
-/// named row per component. Data-plane SQL adds selected implementation metadata.
+/// Health-surface identity for the admitted formation profile.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthFormationProfile {
+    TickrLite,
+}
+
+/// Health-surface identity for the admitted process topology.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthFormationTopology {
+    SingleNode,
+}
+
+/// Health-surface identity for the selected final Log store.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthFinalLogStore {
+    LocalFiles,
+}
+
+/// Health-surface identity for the selected SQL-writer topology.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthWriterTopology {
+    ConductorOwned,
+}
+
+/// Coordination roles carried by the resolved formation descriptor.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCoordinationRole {
+    CommandBus,
+    TaskDispatch,
+    TaskEvents,
+    TaskCancellation,
+    CompactionStaging,
+    LifecycleWork,
+    LogStaging,
+    ScopeStore,
+    IngressIdempotencyStore,
+    LivenessWatchdog,
+    SignalAppliedNotifier,
+    ExecutorFleetStatus,
+    EventIngress,
+}
+
+/// Concrete role implementation selected during formation resolution.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthRoleImplementation {
+    LocalRequestReply,
+    LocalSqlite,
+    LocalJournal,
+    LocalNotification,
+    LocalObservation,
+    Disabled,
+}
+
+/// Stable identity for one selected coordination protocol.
+#[derive(Serialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct HealthProtocolIdentity {
+    pub name: String,
+    pub version: u16,
+}
+
+/// One role from the immutable resolved formation descriptor.
+#[derive(Serialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct HealthResolvedRole {
+    pub role: HealthCoordinationRole,
+    pub implementation: HealthRoleImplementation,
+    pub protocol: HealthProtocolIdentity,
+}
+
+/// Explicit substrate selection. `false` means absent by formation design, not
+/// an unreachable dependency.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthSubstrateSelection {
+    pub sqlite: bool,
+    pub postgres: bool,
+    pub nats: bool,
+    pub redis: bool,
+    pub object_store: bool,
+}
+
+/// Immutable, backend-location-free projection of the admitted descriptor.
+#[derive(Debug, Clone)]
+pub struct ResolvedFormationHealth {
+    pub profile: HealthFormationProfile,
+    pub topology: HealthFormationTopology,
+    pub sql: DataPlaneSqlImplementation,
+    pub final_logs: HealthFinalLogStore,
+    pub writer_topology: HealthWriterTopology,
+    pub executor_count: u16,
+    pub substrates: HealthSubstrateSelection,
+    pub roles: Vec<HealthResolvedRole>,
+}
+
+/// Formation identity plus its current `LiteSupervisor` availability state.
+#[derive(Serialize, ToSchema, Debug, Clone)]
+pub struct FormationHealth {
+    pub profile: HealthFormationProfile,
+    pub topology: HealthFormationTopology,
+    pub sql: DataPlaneSqlImplementation,
+    pub final_logs: HealthFinalLogStore,
+    pub writer_topology: HealthWriterTopology,
+    pub executor_count: u16,
+    pub substrates: HealthSubstrateSelection,
+    pub roles: Vec<HealthResolvedRole>,
+    pub status: ComponentStatus,
+    pub detail: String,
+    pub detection_window: String,
+}
+
+impl ResolvedFormationHealth {
+    fn observed(&self, status: ComponentStatus, detail: impl Into<String>) -> FormationHealth {
+        FormationHealth {
+            profile: self.profile,
+            topology: self.topology,
+            sql: self.sql,
+            final_logs: self.final_logs,
+            writer_topology: self.writer_topology,
+            executor_count: self.executor_count,
+            substrates: self.substrates,
+            roles: self.roles.clone(),
+            status,
+            detail: detail.into(),
+            detection_window: INSTANT_WINDOW.to_string(),
+        }
+    }
+}
+
+/// Top-level readiness as owned by `LiteSupervisor`.
+#[derive(Serialize, ToSchema, Debug, Clone)]
+pub struct ReadinessHealth {
+    pub ready: bool,
+    pub status: ComponentStatus,
+    pub detail: String,
+    pub detection_window: String,
+}
+
+/// Command-path observation with its resolved implementation and protocol.
+#[derive(Serialize, ToSchema, Debug, Clone)]
+pub struct CommandPathHealth {
+    pub implementation: HealthRoleImplementation,
+    pub protocol: HealthProtocolIdentity,
+    pub status: ComponentStatus,
+    pub detail: String,
+    pub detection_window: String,
+}
+
+/// Executor observation with machine-readable configured and in-flight counts.
+#[derive(Serialize, ToSchema, Debug, Clone)]
+pub struct ExecutorHealth {
+    pub status: ComponentStatus,
+    pub detail: String,
+    pub detection_window: String,
+    pub observed_executors: Option<usize>,
+    pub configured_process_slots: Option<usize>,
+    pub in_flight_count: Option<usize>,
+}
+
+impl ExecutorHealth {
+    fn instant(
+        status: ComponentStatus,
+        detail: impl Into<String>,
+        observed_executors: usize,
+        configured_process_slots: usize,
+        in_flight_count: usize,
+    ) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            detection_window: INSTANT_WINDOW.to_string(),
+            observed_executors: Some(observed_executors),
+            configured_process_slots: Some(configured_process_slots),
+            in_flight_count: Some(in_flight_count),
+        }
+    }
+
+    fn windowed(
+        status: ComponentStatus,
+        detail: impl Into<String>,
+        detection_window: impl Into<String>,
+        observed_executors: usize,
+        configured_process_slots: usize,
+        in_flight_count: usize,
+    ) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            detection_window: detection_window.into(),
+            observed_executors: Some(observed_executors),
+            configured_process_slots: Some(configured_process_slots),
+            in_flight_count: Some(in_flight_count),
+        }
+    }
+}
+
+/// The typed body of `GET /api/health`. Existing component rows remain stable;
+/// Tickr Lite adds formation, readiness, and local-role observations.
 #[derive(Serialize, ToSchema, Debug, Clone)]
 pub struct HealthResponse {
     /// RFC 3339 instant the whole report was computed (all rows are fresh as of here).
@@ -146,9 +332,17 @@ pub struct HealthResponse {
     pub api: ComponentHealth,
     pub data_plane_sql: DataPlaneSqlHealth,
     pub nats_kv: ComponentHealth,
-    pub executors: ComponentHealth,
+    pub executors: ExecutorHealth,
     pub conductor: ComponentHealth,
     pub control_plane: ComponentHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formation: Option<FormationHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_coordination: Option<ComponentHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_path: Option<CommandPathHealth>,
 }
 
 /// The API-self row. Reaching this code means the request got through the
@@ -247,7 +441,7 @@ fn window_label(timeout: Duration) -> String {
 /// ⇒ healthy; keys exist but all sit in the `TTL/4..TTL` slack window ⇒ degraded;
 /// no non-expired key (zero fleet) ⇒ unhealthy. Saturation `X/Y` is detail text,
 /// never a band driver.
-pub async fn check_executors(nats: &Client, timeout: Duration) -> ComponentHealth {
+pub async fn check_executors(nats: &Client, timeout: Duration) -> ExecutorHealth {
     let window = window_label(timeout);
     let detection_window = format!("liveness window {window}");
     let ages = collect_executor_ages(nats, timeout).await;
@@ -268,7 +462,7 @@ pub async fn check_executors(nats: &Client, timeout: Duration) -> ComponentHealt
         None => ComponentStatus::Unhealthy,
     };
 
-    ComponentHealth::windowed(status, detail, detection_window)
+    ExecutorHealth::windowed(status, detail, detection_window, n_alive, total, used)
 }
 
 /// One counted executor key: its `{cap, in_flight}` value and its age at read time.
@@ -318,20 +512,11 @@ async fn collect_executor_ages(nats: &Client, timeout: Duration) -> Vec<Executor
     out
 }
 
-/// The Conductor row — a **command-plane-responsive** check over the existing
-/// api→conductor NATS request/reply command bus. It issues a side-effect-free
-/// `Ping` command (a dedicated variant, not a reuse of a read command, so the
-/// probe touches no state) and maps the result: a reply within `deadline` ⇒
-/// `healthy`; `NoResponders` or timeout — a wedged or absent command consumer,
-/// even while the broker link is up — ⇒ `unhealthy`.
-///
-/// This asserts only that the command consumer answers, **not** that the relay
-/// loop is live: a relay-liveness check is deferred, and the command-bus ping
-/// stands in for it in v1. The detail labels the row accordingly. The check is
-/// instantaneous (a red row recovers on the very next request), so its detection
-/// window is the request itself.
-pub async fn check_conductor(nats: &Client, deadline: Duration) -> ComponentHealth {
-    match crate::commands::client::ping_conductor(nats, deadline).await {
+/// The Conductor row — a command-plane-responsive check over the selected
+/// Command bus. It issues a side-effect-free `Ping` and maps any unavailable,
+/// timeout, or malformed-reply outcome to `unhealthy`.
+pub async fn check_command_bus(command_bus: &CommandBus, deadline: Duration) -> ComponentHealth {
+    match ping_command_bus(command_bus, deadline).await {
         Ok(()) => ComponentHealth::instant(
             ComponentStatus::Healthy,
             "command-plane-responsive: consumer answered Ping",
@@ -341,6 +526,11 @@ pub async fn check_conductor(nats: &Client, deadline: Duration) -> ComponentHeal
             format!("command-plane-responsive: no answer to Ping ({e:?})"),
         ),
     }
+}
+
+/// Distributed-formation compatibility wrapper for the NATS Core Command bus.
+pub async fn check_conductor(nats: &Client, deadline: Duration) -> ComponentHealth {
+    check_command_bus(&CommandBus::nats(nats.clone()), deadline).await
 }
 
 /// The Control plane row — one HTTP hop to the coordinator's `/api/internal/health`
@@ -378,13 +568,29 @@ pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHe
     }
 }
 
-/// Assemble the full report, computing every row fresh. `checked_at` stamps the
-/// instant the report was built; the rows are all observed as of that instant.
-/// `ping_deadline` bounds the Conductor row's command-bus probe; the Control
-/// plane row's one HTTP hop is bounded by the `coordinator` client's own timeout.
+/// Assemble the distributed formation's report.
 pub async fn build_health_report(
     repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
+    coordinator: &CoordinatorClient,
+    ping_deadline: Duration,
+) -> HealthResponse {
+    build_health_report_with_command_bus(
+        repositories,
+        nats,
+        &CommandBus::nats(nats.clone()),
+        coordinator,
+        ping_deadline,
+    )
+    .await
+}
+
+/// Assemble a report with the formation-selected Command bus. NATS remains an
+/// independent input for the distributed KV and Executor rows.
+pub async fn build_health_report_with_command_bus(
+    repositories: &ReadOnlyRepositoryBundle,
+    nats: &Client,
+    command_bus: &CommandBus,
     coordinator: &CoordinatorClient,
     ping_deadline: Duration,
 ) -> HealthResponse {
@@ -394,7 +600,106 @@ pub async fn build_health_report(
         data_plane_sql: check_data_plane_sql(repositories).await,
         nats_kv: check_nats_kv(nats).await,
         executors: check_executors(nats, liveness_timeout()).await,
-        conductor: check_conductor(nats, ping_deadline).await,
+        conductor: check_command_bus(command_bus, ping_deadline).await,
         control_plane: check_control_plane(coordinator).await,
+        formation: None,
+        readiness: None,
+        local_coordination: None,
+        command_path: None,
+    }
+}
+
+/// Tickr Lite health retains the existing Console-facing rows while reporting
+/// the selected local roles and never probing an absent distributed substrate.
+use tickr_executor::local_pickup::ExecutorFleetStatus;
+
+pub async fn build_lite_health_report(
+    repositories: &ReadOnlyRepositoryBundle,
+    command_bus: &CommandBus,
+    coordinator: &CoordinatorClient,
+    executor_fleet: &tickr_executor::local_pickup::LocalExecutorFleetStatus,
+    formation: &ResolvedFormationHealth,
+    ready: bool,
+    ping_deadline: Duration,
+) -> HealthResponse {
+    let data_plane_sql = check_data_plane_sql(repositories).await;
+    let conductor = check_command_bus(command_bus, ping_deadline).await;
+    let control_plane = check_control_plane(coordinator).await;
+    let snapshot = executor_fleet.snapshot();
+    let readiness_status = if ready {
+        ComponentStatus::Healthy
+    } else {
+        ComponentStatus::Unhealthy
+    };
+    let local_status = if ready
+        && data_plane_sql.status == ComponentStatus::Healthy
+        && conductor.status == ComponentStatus::Healthy
+    {
+        ComponentStatus::Healthy
+    } else {
+        ComponentStatus::Unhealthy
+    };
+    let command_role = formation
+        .roles
+        .iter()
+        .find(|role| role.role == HealthCoordinationRole::CommandBus)
+        .expect("resolved Tickr Lite formation carries CommandBus");
+
+    HealthResponse {
+        checked_at: chrono::Utc::now().to_rfc3339(),
+        api: api_self(),
+        data_plane_sql,
+        // Compatibility row for older Console clients. It is never green when
+        // NATS is absent; formation.substrates.nats is the typed selection.
+        nats_kv: ComponentHealth::instant(
+            ComponentStatus::Degraded,
+            "not selected: Tickr Lite uses local coordination",
+        ),
+        executors: ExecutorHealth::instant(
+            readiness_status,
+            format!(
+                "1 executor: {} configured process slots, {} in flight",
+                snapshot.configured_process_slots, snapshot.in_flight_count
+            ),
+            1,
+            snapshot.configured_process_slots,
+            snapshot.in_flight_count,
+        ),
+        conductor: conductor.clone(),
+        control_plane,
+        formation: Some(formation.observed(
+            readiness_status,
+            if ready {
+                "Tickr Lite admitted; all critical children registered"
+            } else {
+                "Tickr Lite readiness withdrawn before formation cancellation"
+            },
+        )),
+        readiness: Some(ReadinessHealth {
+            ready,
+            status: readiness_status,
+            detail: if ready {
+                "LiteSupervisor ready"
+            } else {
+                "LiteSupervisor not ready"
+            }
+            .to_string(),
+            detection_window: INSTANT_WINDOW.to_string(),
+        }),
+        local_coordination: Some(ComponentHealth::instant(
+            local_status,
+            if ready {
+                "local SQLite, journal, notification, and observation roles registered"
+            } else {
+                "local coordination unavailable while LiteSupervisor is not ready"
+            },
+        )),
+        command_path: Some(CommandPathHealth {
+            implementation: command_role.implementation,
+            protocol: command_role.protocol.clone(),
+            status: conductor.status,
+            detail: conductor.detail,
+            detection_window: conductor.detection_window,
+        }),
     }
 }

@@ -93,6 +93,9 @@ pub enum LogsError {
     /// log corruption at the storage layer; HTTP layer maps to 5xx.
     #[error("gzip decode error: {0}")]
     GzipDecode(String),
+    /// Local final/staging journal access failed.
+    #[error("local Log error: {0}")]
+    Local(String),
 }
 
 /// Constructs the canonical MinIO object key for a task's gzipped log blob.
@@ -151,18 +154,57 @@ fn marker_from_headers(headers: Option<&async_nats::HeaderMap>) -> Option<EndOfS
     })
 }
 
-/// Dispatcher with both store handles injected. Construction-time injection
-/// lets the integration tests swap in testcontainer-backed clients without
-/// reaching through globals.
+/// Local Log query role used by Tickr Lite's same-process API component.
+#[async_trait::async_trait]
+pub trait LocalTaskLogStore: Send + Sync {
+    async fn fetch_task_logs(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+    ) -> Result<TaskLogs, LogsError>;
+
+    async fn fetch_batches_after(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+        after_seq: u64,
+    ) -> Result<LogBatchPage, LogsError>;
+
+    async fn fetch_tail(
+        &self,
+        workflow_id: Uuid,
+        workflow_instance_id: Uuid,
+        task_instance_id: Uuid,
+        tail: usize,
+        before_seq: Option<u64>,
+    ) -> Result<LogBatchPage, LogsError>;
+}
+
+#[derive(Clone)]
+enum LogsBackend {
+    Distributed { minio: Operator, nats: NatsClient },
+    Local(std::sync::Arc<dyn LocalTaskLogStore>),
+}
+
+/// Dispatcher with the selected formation's Log query role.
 #[derive(Clone)]
 pub struct LogsResolver {
-    minio: Operator,
-    nats: NatsClient,
+    backend: LogsBackend,
 }
 
 impl LogsResolver {
     pub fn new(minio: Operator, nats: NatsClient) -> Self {
-        Self { minio, nats }
+        Self {
+            backend: LogsBackend::Distributed { minio, nats },
+        }
+    }
+
+    pub fn local(store: std::sync::Arc<dyn LocalTaskLogStore>) -> Self {
+        Self {
+            backend: LogsBackend::Local(store),
+        }
     }
 
     /// Tries MinIO; on `NotFound`, falls through to the Log staging stream;
@@ -176,9 +218,17 @@ impl LogsResolver {
         workflow_instance_id: Uuid,
         task_instance_id: Uuid,
     ) -> Result<TaskLogs, LogsError> {
+        if let LogsBackend::Local(store) = &self.backend {
+            return store
+                .fetch_task_logs(workflow_id, workflow_instance_id, task_instance_id)
+                .await;
+        }
+        let LogsBackend::Distributed { minio, nats } = &self.backend else {
+            unreachable!()
+        };
         // 1. MinIO probe at the deterministic path.
         let key = minio_object_key(workflow_id, workflow_instance_id, task_instance_id);
-        match self.minio.read(&key).await {
+        match minio.read(&key).await {
             Ok(gzipped) => {
                 let content = decode_gzip(&gzipped.to_vec())?;
                 let marker = self
@@ -207,7 +257,7 @@ impl LogsResolver {
 
         // 2. Stream fallback — replay everything on the task's subject.
         let (batches, marker) = read_stream_page(
-            &self.nats,
+            nats,
             workflow_id,
             workflow_instance_id,
             task_instance_id,
@@ -236,8 +286,21 @@ impl LogsResolver {
         task_instance_id: Uuid,
         after_seq: u64,
     ) -> Result<LogBatchPage, LogsError> {
+        if let LogsBackend::Local(store) = &self.backend {
+            return store
+                .fetch_batches_after(
+                    workflow_id,
+                    workflow_instance_id,
+                    task_instance_id,
+                    after_seq,
+                )
+                .await;
+        }
+        let LogsBackend::Distributed { nats, .. } = &self.backend else {
+            unreachable!()
+        };
         let (batches, marker) = read_stream_page(
-            &self.nats,
+            nats,
             workflow_id,
             workflow_instance_id,
             task_instance_id,
@@ -263,8 +326,22 @@ impl LogsResolver {
         tail: usize,
         before_seq: Option<u64>,
     ) -> Result<LogBatchPage, LogsError> {
+        if let LogsBackend::Local(store) = &self.backend {
+            return store
+                .fetch_tail(
+                    workflow_id,
+                    workflow_instance_id,
+                    task_instance_id,
+                    tail,
+                    before_seq,
+                )
+                .await;
+        }
+        let LogsBackend::Distributed { nats, .. } = &self.backend else {
+            unreachable!()
+        };
         let (mut batches, marker) = read_stream_page(
-            &self.nats,
+            nats,
             workflow_id,
             workflow_instance_id,
             task_instance_id,
@@ -293,8 +370,11 @@ impl LogsResolver {
         workflow_instance_id: Uuid,
         task_instance_id: Uuid,
     ) -> Result<Option<EndOfStreamMarker>, LogsError> {
+        let LogsBackend::Distributed { minio, .. } = &self.backend else {
+            return Ok(None);
+        };
         let key = exit_sidecar_key(workflow_id, workflow_instance_id, task_instance_id);
-        match self.minio.read(&key).await {
+        match minio.read(&key).await {
             Ok(bytes) => serde_json::from_slice(&bytes.to_vec())
                 .map(Some)
                 .map_err(|e| LogsError::Minio(format!("malformed sidecar {}: {}", key, e))),

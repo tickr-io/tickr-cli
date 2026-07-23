@@ -74,6 +74,16 @@ impl CoordinatorClient {
         Self::with_timeout(base_url, DEFAULT_TIMEOUT)
     }
 
+    /// Validate Control-plane query configuration without requiring startup
+    /// reachability; availability remains an operator health concern.
+    pub fn try_new(base_url: impl Into<String>) -> Result<Self, CoordinatorClientError> {
+        let base_url = base_url.into();
+        reqwest::Url::parse(&base_url).map_err(|error| {
+            CoordinatorClientError::Unreachable(format!("invalid coordinator URL: {error}"))
+        })?;
+        Ok(Self::new(base_url))
+    }
+
     pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         Self {
             base_url: base_url.into(),

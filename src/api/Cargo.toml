@@ -20,9 +20,11 @@ workspace = true
 tickr_proto = { workspace = true }
 tickr_migrations = { workspace = true }
 tickr_ctx = { workspace = true }
+tickr_executor = { workspace = true }
 
 # Workspace dependencies — the same externals the conductor's HTTP layer uses.
 async-nats = { workspace = true }
+async-trait = { workspace = true }
 # Encodes/decodes the protobuf command envelopes the API ships over the bus.
 prost = { workspace = true }
 serde = { workspace = true }

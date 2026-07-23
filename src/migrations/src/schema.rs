@@ -5,6 +5,7 @@ use sqlx::{PgPool, Row, SqlitePool};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LogicalType {
     Integer,
+    Bytes,
     Uuid,
     Timestamp,
     Text,
@@ -44,6 +45,16 @@ struct EnumSpec {
 
 const TABLES: &[&str] = &[
     "events",
+    "local_compaction_staging",
+    "local_task_cancellation_ack_outbox",
+    "local_task_cancellation_fences",
+    "local_task_dispatch_quarantine",
+    "local_task_dispatches",
+    "local_task_event_outbox",
+    "local_task_terminal_outcomes",
+    "tickr_ctx_scope_claims",
+    "tickr_ctx_scope_values",
+    "tickr_ctx_scopes",
     "signal_cancels",
     "signal_captures",
     "signal_wakeups",
@@ -77,6 +88,141 @@ const COLUMNS: &[ColumnSpec] = &[
     column!("events", "event_type", Text, false),
     column!("events", "payload", Json, false),
     column!("events", "archived_at", Timestamp, false),
+    column!(
+        "local_task_dispatch_quarantine",
+        "dispatch_key",
+        Text,
+        false
+    ),
+    column!("local_task_dispatch_quarantine", "payload", Json, false),
+    column!("local_task_dispatch_quarantine", "reason", Text, false),
+    column!(
+        "local_task_dispatch_quarantine",
+        "quarantined_at",
+        Timestamp,
+        false
+    ),
+    column!(
+        "local_task_cancellation_ack_outbox",
+        "acknowledgement_identity",
+        Text,
+        false
+    ),
+    column!(
+        "local_task_cancellation_ack_outbox",
+        "acknowledgement",
+        Json,
+        false
+    ),
+    column!(
+        "local_task_cancellation_ack_outbox",
+        "staged_at",
+        Timestamp,
+        false
+    ),
+    column!(
+        "local_task_cancellation_ack_outbox",
+        "forwarded_at",
+        Timestamp,
+        true
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "acknowledgement_identity",
+        Text,
+        false
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "task_instance_id",
+        Text,
+        false
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "workflow_instance_id",
+        Text,
+        false
+    ),
+    column!("local_task_cancellation_fences", "dispatch_key", Text, true),
+    column!(
+        "local_task_cancellation_fences",
+        "pickup_generation",
+        Integer,
+        true
+    ),
+    column!("local_task_cancellation_fences", "owner", Text, true),
+    column!(
+        "local_task_cancellation_fences",
+        "committed_at",
+        Timestamp,
+        false
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "owner_notified_at",
+        Timestamp,
+        true
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "reconciliation",
+        Text,
+        true
+    ),
+    column!(
+        "local_task_cancellation_fences",
+        "settled_at",
+        Timestamp,
+        true
+    ),
+    column!("local_task_dispatches", "dispatch_key", Text, false),
+    column!("local_task_dispatches", "payload", Json, false),
+    column!("local_task_dispatches", "state", Text, false),
+    column!("local_task_dispatches", "pickup_generation", Integer, false),
+    column!("local_task_dispatches", "task_instance_id", Text, true),
+    column!("local_task_dispatches", "workflow_instance_id", Text, true),
+    column!("local_task_dispatches", "owner", Text, true),
+    column!(
+        "local_task_dispatches",
+        "liveness_deadline",
+        Timestamp,
+        true
+    ),
+    column!(
+        "local_task_dispatches",
+        "liveness_armed_at",
+        Timestamp,
+        true
+    ),
+    column!("local_task_dispatches", "rejection_reason", Text, true),
+    column!("local_task_dispatches", "created_at", Timestamp, false),
+    column!("local_task_dispatches", "updated_at", Timestamp, false),
+    column!("local_task_event_outbox", "dispatch_key", Text, false),
+    column!(
+        "local_task_event_outbox",
+        "pickup_generation",
+        Integer,
+        false
+    ),
+    column!("local_task_event_outbox", "kind", Text, false),
+    column!("local_task_event_outbox", "event", Json, false),
+    column!("local_task_event_outbox", "staged_at", Timestamp, false),
+    column!("local_task_event_outbox", "forwarded_at", Timestamp, true),
+    column!("local_task_terminal_outcomes", "dispatch_key", Text, false),
+    column!(
+        "local_task_terminal_outcomes",
+        "pickup_generation",
+        Integer,
+        false
+    ),
+    column!("local_task_terminal_outcomes", "outcome", Text, false),
+    column!(
+        "local_task_terminal_outcomes",
+        "settled_at",
+        Timestamp,
+        false
+    ),
     column!("signal_cancels", "signal_id", Uuid, false),
     column!("signal_cancels", "applied_count", Integer, false),
     column!("signal_cancels", "target", Json, false),
@@ -138,6 +284,14 @@ const COLUMNS: &[ColumnSpec] = &[
         false
     ),
     column!("workflow_patch_task_builds", "built_at", Timestamp, true),
+    column!("workflow_patch_task_builds", "lease_owner", Text, true),
+    column!("workflow_patch_task_builds", "lease_token", Uuid, true),
+    column!(
+        "workflow_patch_task_builds",
+        "lease_expires_at",
+        Timestamp,
+        true
+    ),
     column!("workflow_patches", "patch_key", Uuid, false),
     column!("workflow_patches", "patch_id", Uuid, false),
     column!("workflow_patches", "workflow_instance_id", Uuid, false),
@@ -152,6 +306,14 @@ const COLUMNS: &[ColumnSpec] = &[
     column!("workflow_patches", "source", Text, true),
     column!("workflow_patches", "source_format", Enum, true),
     column!("workflow_patches", "operation", Json, true),
+    column!("workflow_patches", "lifecycle_lease_owner", Text, true),
+    column!("workflow_patches", "lifecycle_lease_token", Uuid, true),
+    column!(
+        "workflow_patches",
+        "lifecycle_lease_expires_at",
+        Timestamp,
+        true
+    ),
     column!("workflow_replays", "replay_instance_id", Uuid, false),
     column!("workflow_replays", "source_instance_id", Uuid, false),
     column!("workflow_replays", "signal_id", Uuid, false),
@@ -165,6 +327,61 @@ const COLUMNS: &[ColumnSpec] = &[
     column!("workflow_replays", "created_at", Timestamp, false),
     column!("workflow_replays", "updated_at", Timestamp, false),
     column!("workflow_replays", "shadowed_keys", Json, false),
+    column!("workflow_replays", "lease_owner", Text, true),
+    column!("workflow_replays", "lease_token", Uuid, true),
+    column!("workflow_replays", "lease_expires_at", Timestamp, true),
+    column!("tickr_ctx_scope_claims", "claim_id", Uuid, false),
+    column!("tickr_ctx_scope_claims", "scope_id", Uuid, false),
+    column!("tickr_ctx_scope_claims", "request_digest", Text, false),
+    column!("tickr_ctx_scope_claims", "committed_at", Timestamp, false),
+    column!("tickr_ctx_scope_values", "scope_id", Uuid, false),
+    column!("tickr_ctx_scope_values", "key", Text, false),
+    column!("tickr_ctx_scope_values", "value_identity", Uuid, false),
+    column!("tickr_ctx_scope_values", "envelope", Bytes, false),
+    column!("tickr_ctx_scope_values", "created_at", Timestamp, false),
+    column!("tickr_ctx_scope_values", "updated_at", Timestamp, false),
+    column!(
+        "local_compaction_staging",
+        "workflow_instance_id",
+        Uuid,
+        false
+    ),
+    column!(
+        "local_compaction_staging",
+        "protocol_version",
+        Integer,
+        false
+    ),
+    column!("local_compaction_staging", "payload_digest", Text, false),
+    column!("local_compaction_staging", "payload", Bytes, true),
+    column!("local_compaction_staging", "state", Enum, false),
+    column!("local_compaction_staging", "scope_id", Uuid, true),
+    column!("local_compaction_staging", "scope_digest", Text, true),
+    column!(
+        "local_compaction_staging",
+        "final_log_references",
+        Json,
+        true
+    ),
+    column!("local_compaction_staging", "staged_at", Timestamp, false),
+    column!("local_compaction_staging", "completed_at", Timestamp, true),
+    column!("local_compaction_staging", "purged_at", Timestamp, true),
+    column!("tickr_ctx_scopes", "scope_id", Uuid, false),
+    column!("tickr_ctx_scopes", "namespace", Text, false),
+    column!("tickr_ctx_scopes", "run_id", Text, false),
+    column!("tickr_ctx_scopes", "protocol_version", Integer, false),
+    column!("tickr_ctx_scopes", "creation_claim_id", Uuid, false),
+    column!("tickr_ctx_scopes", "creation_request_digest", Text, false),
+    column!("tickr_ctx_scopes", "state", Enum, false),
+    column!("tickr_ctx_scopes", "created_at", Timestamp, false),
+    column!("tickr_ctx_scopes", "updated_at", Timestamp, false),
+    column!("tickr_ctx_scopes", "snapshot", Bytes, true),
+    column!("tickr_ctx_scopes", "snapshot_digest", Text, true),
+    column!("tickr_ctx_scopes", "snapshot_row_count", Integer, true),
+    column!("tickr_ctx_scopes", "snapshot_value_bytes", Integer, true),
+    column!("tickr_ctx_scopes", "snapshotted_at", Timestamp, true),
+    column!("tickr_ctx_scopes", "cleaned_at", Timestamp, true),
+    column!("tickr_ctx_scopes", "quarantine_reason", Text, true),
     column!("workflow_run_info", "workflow_instance_id", Uuid, false),
     column!("workflow_run_info", "ctx_envelope", Json, false),
     column!("workflow_run_info", "runtime_params", Json, false),
@@ -177,6 +394,9 @@ const COLUMNS: &[ColumnSpec] = &[
     column!("workflow_task_builds", "error", Text, true),
     column!("workflow_task_builds", "pending_since", Timestamp, false),
     column!("workflow_task_builds", "built_at", Timestamp, true),
+    column!("workflow_task_builds", "lease_owner", Text, true),
+    column!("workflow_task_builds", "lease_token", Uuid, true),
+    column!("workflow_task_builds", "lease_expires_at", Timestamp, true),
     column!("workflows", "id", Uuid, false),
     column!("workflows", "name", Text, false),
     column!("workflows", "definition", Json, false),
@@ -189,12 +409,55 @@ const COLUMNS: &[ColumnSpec] = &[
     column!("workflows", "slug", Text, false),
     column!("workflows", "content_hash", Text, false),
     column!("workflows", "cosmetic_hash", Text, false),
+    column!("workflows", "submission_lease_owner", Text, true),
+    column!("workflows", "submission_lease_token", Uuid, true),
+    column!("workflows", "submission_lease_expires_at", Timestamp, true),
 ];
 
 const PRIMARY_KEYS: &[KeySpec] = &[
     KeySpec {
         table: "events",
         columns: &["seq"],
+    },
+    KeySpec {
+        table: "local_compaction_staging",
+        columns: &["workflow_instance_id"],
+    },
+    KeySpec {
+        table: "local_task_dispatch_quarantine",
+        columns: &["dispatch_key"],
+    },
+    KeySpec {
+        table: "local_task_cancellation_ack_outbox",
+        columns: &["acknowledgement_identity"],
+    },
+    KeySpec {
+        table: "local_task_cancellation_fences",
+        columns: &["acknowledgement_identity"],
+    },
+    KeySpec {
+        table: "local_task_dispatches",
+        columns: &["dispatch_key"],
+    },
+    KeySpec {
+        table: "local_task_event_outbox",
+        columns: &["dispatch_key", "pickup_generation", "kind"],
+    },
+    KeySpec {
+        table: "local_task_terminal_outcomes",
+        columns: &["dispatch_key", "pickup_generation"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scope_claims",
+        columns: &["claim_id"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scope_values",
+        columns: &["scope_id", "key"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scopes",
+        columns: &["scope_id"],
     },
     KeySpec {
         table: "signal_cancels",
@@ -256,6 +519,30 @@ const UNIQUE_KEYS: &[KeySpec] = &[
         columns: &["id"],
     },
     KeySpec {
+        table: "local_task_dispatches",
+        columns: &["task_instance_id", "workflow_instance_id"],
+    },
+    KeySpec {
+        table: "local_task_cancellation_fences",
+        columns: &["task_instance_id", "workflow_instance_id"],
+    },
+    KeySpec {
+        table: "local_task_event_outbox",
+        columns: &["dispatch_key", "pickup_generation"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scope_values",
+        columns: &["value_identity"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scopes",
+        columns: &["creation_claim_id"],
+    },
+    KeySpec {
+        table: "tickr_ctx_scopes",
+        columns: &["namespace", "run_id"],
+    },
+    KeySpec {
         table: "workflow_replays",
         columns: &["source_instance_id", "idempotency_key"],
     },
@@ -267,6 +554,55 @@ const FOREIGN_KEYS: &[ForeignKeySpec] = &[
         columns: &["workflow_instance_id"],
         referenced_table: "workflow_instances",
         referenced_columns: &["id"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "local_task_cancellation_ack_outbox",
+        columns: &["acknowledgement_identity"],
+        referenced_table: "local_task_cancellation_fences",
+        referenced_columns: &["acknowledgement_identity"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "local_task_cancellation_fences",
+        columns: &["dispatch_key"],
+        referenced_table: "local_task_dispatches",
+        referenced_columns: &["dispatch_key"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "local_task_dispatch_quarantine",
+        columns: &["dispatch_key"],
+        referenced_table: "local_task_dispatches",
+        referenced_columns: &["dispatch_key"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "local_task_event_outbox",
+        columns: &["dispatch_key"],
+        referenced_table: "local_task_dispatches",
+        referenced_columns: &["dispatch_key"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "local_task_terminal_outcomes",
+        columns: &["dispatch_key"],
+        referenced_table: "local_task_dispatches",
+        referenced_columns: &["dispatch_key"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "tickr_ctx_scope_claims",
+        columns: &["scope_id"],
+        referenced_table: "tickr_ctx_scopes",
+        referenced_columns: &["scope_id"],
+        on_delete: "CASCADE",
+    },
+    ForeignKeySpec {
+        table: "tickr_ctx_scope_values",
+        columns: &["scope_id"],
+        referenced_table: "tickr_ctx_scopes",
+        referenced_columns: &["scope_id"],
         on_delete: "CASCADE",
     },
     ForeignKeySpec {
@@ -324,6 +660,16 @@ const ENUMS: &[EnumSpec] = &[
         table: "workflow_replays",
         column: "status",
         values: &["Materializing", "Released", "VersionUnresolvable"],
+    },
+    EnumSpec {
+        table: "tickr_ctx_scopes",
+        column: "state",
+        values: &["active", "cleaned", "quarantined", "snapshotted"],
+    },
+    EnumSpec {
+        table: "local_compaction_staging",
+        column: "state",
+        values: &["complete", "purged", "staged"],
     },
 ];
 
@@ -658,6 +1004,7 @@ fn postgres_type(value: &str) -> Result<LogicalType, SchemaVerificationError> {
         "timestamp with time zone" => Ok(LogicalType::Timestamp),
         "text" => Ok(LogicalType::Text),
         "jsonb" => Ok(LogicalType::Json),
+        "bytea" => Ok(LogicalType::Bytes),
         other => Err(SchemaVerificationError::Incompatible {
             backend: "postgres",
             detail: format!("unsupported column type `{other}`"),
@@ -673,6 +1020,7 @@ fn sqlite_type(value: &str) -> Result<LogicalType, SchemaVerificationError> {
         "TEXT" => Ok(LogicalType::Text),
         "JSON" => Ok(LogicalType::Json),
         "ENUM" => Ok(LogicalType::Enum),
+        "BLOB" => Ok(LogicalType::Bytes),
         other => Err(SchemaVerificationError::Incompatible {
             backend: "sqlite",
             detail: format!("unsupported declared column type `{other}`"),

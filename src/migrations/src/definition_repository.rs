@@ -18,6 +18,8 @@ use crate::backend::{
 use crate::encoding::{decode_json, decode_timestamp, encode_json, encode_timestamp, encode_uuid};
 
 const BUILD_STATUSES: &[&str] = &["Building", "Ready", "BuildFailed", "Submitted"];
+pub const MAX_DEFINITION_BUILD_LEASE_BATCH: usize = 64;
+pub const MAX_DEFINITION_SUBMISSION_LEASE_BATCH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct DefinitionRegistrationInput {
@@ -33,6 +35,22 @@ pub struct DefinitionBuildTask {
     pub workflow_version: i64,
     pub task_id: Uuid,
     pub nix_expression_path: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DefinitionBuildLeaseRequest<'a> {
+    pub owner: &'a str,
+    pub now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedDefinitionBuildTask {
+    pub task: DefinitionBuildTask,
+    pub lease_owner: String,
+    pub lease_token: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +96,22 @@ pub struct DefinitionSubmissionIntent {
     pub definition: wf::WorkflowDefinition,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DefinitionSubmissionLeaseRequest<'a> {
+    pub owner: &'a str,
+    pub now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeasedDefinitionSubmission {
+    pub intent: DefinitionSubmissionIntent,
+    pub lease_owner: String,
+    pub lease_token: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DefinitionSubmissionPointer {
     pub workflow_id: Uuid,
@@ -92,6 +126,12 @@ pub enum DefinitionBuildSettlementOutcome {
     AlreadySettled(DefinitionLifecycleStatus),
     TaskAlreadySettled,
     Absent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LeasedDefinitionBuildSettlementOutcome {
+    Settled(DefinitionBuildSettlementOutcome),
+    LeaseLost,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +153,12 @@ pub enum DefinitionSubmissionSettlementOutcome {
     Submitted,
     AlreadySettled(DefinitionLifecycleStatus),
     Absent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LeasedDefinitionSubmissionSettlementOutcome {
+    Settled(DefinitionSubmissionSettlementOutcome),
+    LeaseLost,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +191,20 @@ struct LatestRow {
     status: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DefinitionBuildLeaseGuard<'a> {
+    owner: &'a str,
+    token: Uuid,
+    now: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DefinitionSubmissionLeaseGuard<'a> {
+    owner: &'a str,
+    token: Uuid,
+    now: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistrationDecision {
     Insert(i64),
@@ -157,6 +217,36 @@ enum RegistrationDecision {
 #[error("corrupt stored definition value: {0}")]
 struct CorruptStoredValue(String);
 
+#[derive(Debug, thiserror::Error)]
+enum DefinitionBuildLeaseError {
+    #[error("definition build leases require SQLite")]
+    RequiresSqlite,
+    #[error("definition build lease owner must contain 1 to 128 bytes")]
+    InvalidOwner,
+    #[error("definition build lease expiry must be later than acquisition time")]
+    InvalidExpiry,
+    #[error(
+        "definition build lease batch must contain 1 to {MAX_DEFINITION_BUILD_LEASE_BATCH} rows"
+    )]
+    InvalidLimit,
+    #[error("unguarded definition build settlement reported lease loss")]
+    UnexpectedLeaseLoss,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DefinitionSubmissionLeaseError {
+    #[error("definition submission leases require SQLite")]
+    RequiresSqlite,
+    #[error("definition submission lease owner must contain 1 to 128 bytes")]
+    InvalidOwner,
+    #[error("definition submission lease expiry must be later than acquisition time")]
+    InvalidExpiry,
+    #[error(
+        "definition submission lease batch must contain 1 to {MAX_DEFINITION_SUBMISSION_LEASE_BATCH} rows"
+    )]
+    InvalidLimit,
+}
+
 impl WriterRepositoryBundle {
     pub async fn register_definition(
         &self,
@@ -165,6 +255,23 @@ impl WriterRepositoryBundle {
         match &self.pool {
             BackendPool::Postgres(pool) => register_postgres(pool, input).await,
             BackendPool::Sqlite(pool) => register_sqlite(pool, input).await,
+        }
+    }
+
+    /// Lease committed pending definition builds in durable stable order.
+    ///
+    /// This operation is local to Tickr Lite's one-writer SQLite formation;
+    /// distributed Postgres processing retains its NATS queue-group protocol.
+    pub async fn lease_definition_build_tasks(
+        &self,
+        request: DefinitionBuildLeaseRequest<'_>,
+    ) -> Result<Vec<LeasedDefinitionBuildTask>, RepositoryError> {
+        validate_definition_build_lease_request(request)?;
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(definition_build_lease_error(
+                DefinitionBuildLeaseError::RequiresSqlite,
+            )),
+            BackendPool::Sqlite(pool) => lease_definition_build_tasks_sqlite(pool, request).await,
         }
     }
 
@@ -223,7 +330,51 @@ impl WriterRepositoryBundle {
                     .await
             }
             BackendPool::Sqlite(pool) => {
-                settle_task_build_sqlite(pool, workflow_id, workflow_version, task_id, result).await
+                match settle_task_build_sqlite(
+                    pool,
+                    workflow_id,
+                    workflow_version,
+                    task_id,
+                    result,
+                    None,
+                )
+                .await?
+                {
+                    LeasedDefinitionBuildSettlementOutcome::Settled(outcome) => Ok(outcome),
+                    LeasedDefinitionBuildSettlementOutcome::LeaseLost => Err(RepositoryError::new(
+                        RepositoryErrorKind::Internal,
+                        DefinitionBuildLeaseError::UnexpectedLeaseLoss,
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Settle one build only while the caller still owns its unexpired lease.
+    pub async fn settle_leased_definition_task_build(
+        &self,
+        lease: &LeasedDefinitionBuildTask,
+        result: DefinitionTaskBuildResult<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<LeasedDefinitionBuildSettlementOutcome, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(definition_build_lease_error(
+                DefinitionBuildLeaseError::RequiresSqlite,
+            )),
+            BackendPool::Sqlite(pool) => {
+                settle_task_build_sqlite(
+                    pool,
+                    lease.task.workflow_id,
+                    lease.task.workflow_version,
+                    lease.task.task_id,
+                    result,
+                    Some(DefinitionBuildLeaseGuard {
+                        owner: &lease.lease_owner,
+                        token: lease.lease_token,
+                        now,
+                    }),
+                )
+                .await
             }
         }
     }
@@ -279,6 +430,49 @@ impl WriterRepositoryBundle {
             }
             BackendPool::Sqlite(pool) => {
                 settle_submission_sqlite(pool, workflow_id, workflow_version).await
+            }
+        }
+    }
+
+    /// Lease committed `Ready` definitions in stable identity order.
+    ///
+    /// This operation is local to Tickr Lite's one-writer SQLite formation;
+    /// distributed Postgres processing retains its NATS queue-group protocol.
+    pub async fn lease_definition_submissions(
+        &self,
+        request: DefinitionSubmissionLeaseRequest<'_>,
+    ) -> Result<Vec<LeasedDefinitionSubmission>, RepositoryError> {
+        validate_definition_submission_lease_request(request)?;
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(definition_submission_lease_error(
+                DefinitionSubmissionLeaseError::RequiresSqlite,
+            )),
+            BackendPool::Sqlite(pool) => lease_definition_submissions_sqlite(pool, request).await,
+        }
+    }
+
+    /// Settle one submission only while the caller still owns its unexpired lease.
+    pub async fn settle_leased_definition_submission(
+        &self,
+        lease: &LeasedDefinitionSubmission,
+        now: DateTime<Utc>,
+    ) -> Result<LeasedDefinitionSubmissionSettlementOutcome, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(_) => Err(definition_submission_lease_error(
+                DefinitionSubmissionLeaseError::RequiresSqlite,
+            )),
+            BackendPool::Sqlite(pool) => {
+                settle_leased_submission_sqlite(
+                    pool,
+                    lease.intent.workflow_id,
+                    lease.intent.workflow_version,
+                    DefinitionSubmissionLeaseGuard {
+                        owner: &lease.lease_owner,
+                        token: lease.lease_token,
+                        now,
+                    },
+                )
+                .await
             }
         }
     }
@@ -414,6 +608,132 @@ fn build_tasks(
         .collect()
 }
 
+fn validate_definition_build_lease_request(
+    request: DefinitionBuildLeaseRequest<'_>,
+) -> Result<(), RepositoryError> {
+    if request.owner.is_empty() || request.owner.len() > 128 {
+        return Err(definition_build_lease_error(
+            DefinitionBuildLeaseError::InvalidOwner,
+        ));
+    }
+    if request.expires_at <= request.now {
+        return Err(definition_build_lease_error(
+            DefinitionBuildLeaseError::InvalidExpiry,
+        ));
+    }
+    if !(1..=MAX_DEFINITION_BUILD_LEASE_BATCH).contains(&request.limit) {
+        return Err(definition_build_lease_error(
+            DefinitionBuildLeaseError::InvalidLimit,
+        ));
+    }
+    Ok(())
+}
+
+fn definition_build_lease_error(error: DefinitionBuildLeaseError) -> RepositoryError {
+    RepositoryError::new(RepositoryErrorKind::Configuration, error)
+}
+
+fn validate_definition_submission_lease_request(
+    request: DefinitionSubmissionLeaseRequest<'_>,
+) -> Result<(), RepositoryError> {
+    if request.owner.is_empty() || request.owner.len() > 128 {
+        return Err(definition_submission_lease_error(
+            DefinitionSubmissionLeaseError::InvalidOwner,
+        ));
+    }
+    if request.expires_at <= request.now {
+        return Err(definition_submission_lease_error(
+            DefinitionSubmissionLeaseError::InvalidExpiry,
+        ));
+    }
+    if !(1..=MAX_DEFINITION_SUBMISSION_LEASE_BATCH).contains(&request.limit) {
+        return Err(definition_submission_lease_error(
+            DefinitionSubmissionLeaseError::InvalidLimit,
+        ));
+    }
+    Ok(())
+}
+
+fn definition_submission_lease_error(error: DefinitionSubmissionLeaseError) -> RepositoryError {
+    RepositoryError::new(RepositoryErrorKind::Configuration, error)
+}
+
+async fn lease_definition_build_tasks_sqlite(
+    pool: &SqlitePool,
+    request: DefinitionBuildLeaseRequest<'_>,
+) -> Result<Vec<LeasedDefinitionBuildTask>, RepositoryError> {
+    let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
+    let encoded_now = encode_timestamp(request.now);
+    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT b.workflow_id, b.workflow_version, b.task_id, w.definition \
+         FROM workflow_task_builds b \
+         JOIN workflows w ON w.id = b.workflow_id AND w.version = b.workflow_version \
+         WHERE b.status = 'pending' AND w.status = 'Building' \
+           AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= ?1) \
+         ORDER BY b.pending_since, b.workflow_id, b.workflow_version, b.task_id \
+         LIMIT ?2",
+    )
+    .bind(&encoded_now)
+    .bind(request.limit as i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(repository_sqlx_error)?;
+
+    let encoded_expiry = encode_timestamp(request.expires_at);
+    let mut leases = Vec::with_capacity(rows.len());
+    for (encoded_workflow_id, workflow_version, encoded_task_id, definition) in rows {
+        let workflow_id =
+            crate::encoding::decode_uuid(&encoded_workflow_id).map_err(corrupt_value)?;
+        let task_id = crate::encoding::decode_uuid(&encoded_task_id).map_err(corrupt_value)?;
+        let task = requeued_tasks(
+            decode_json(&definition).map_err(corrupt_value)?,
+            workflow_id,
+            workflow_version,
+            vec![task_id],
+        )?
+        .pop()
+        .ok_or_else(|| {
+            corrupt_value(CorruptStoredValue(format!(
+                "missing leased definition build task {task_id}"
+            )))
+        })?;
+        let lease_token = Uuid::new_v4();
+        let updated = sqlx::query(
+            "UPDATE workflow_task_builds \
+             SET lease_owner = ?4, lease_token = ?5, lease_expires_at = ?6 \
+             WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3 \
+               AND status = 'pending' \
+               AND (lease_expires_at IS NULL OR lease_expires_at <= ?7)",
+        )
+        .bind(&encoded_workflow_id)
+        .bind(workflow_version)
+        .bind(&encoded_task_id)
+        .bind(request.owner)
+        .bind(encode_uuid(lease_token))
+        .bind(&encoded_expiry)
+        .bind(&encoded_now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                CorruptStoredValue(format!(
+                    "selected definition build task {task_id} was not leaseable"
+                )),
+            ));
+        }
+        leases.push(LeasedDefinitionBuildTask {
+            task,
+            lease_owner: request.owner.to_owned(),
+            lease_token,
+            lease_expires_at: request.expires_at,
+        });
+    }
+    transaction.commit().await.map_err(repository_sqlx_error)?;
+    Ok(leases)
+}
+
 async fn settle_task_build_postgres(
     pool: &PgPool,
     workflow_id: Uuid,
@@ -521,7 +841,8 @@ async fn settle_task_build_sqlite(
     workflow_version: i64,
     task_id: Uuid,
     result: DefinitionTaskBuildResult<'_>,
-) -> Result<DefinitionBuildSettlementOutcome, RepositoryError> {
+    lease_guard: Option<DefinitionBuildLeaseGuard<'_>>,
+) -> Result<LeasedDefinitionBuildSettlementOutcome, RepositoryError> {
     let mut tx = pool.begin().await.map_err(repository_sqlx_error)?;
     let encoded_workflow_id = encode_uuid(workflow_id);
     let encoded_task_id = encode_uuid(task_id);
@@ -534,45 +855,81 @@ async fn settle_task_build_sqlite(
             .map_err(repository_sqlx_error)?;
     let Some(status) = status else {
         tx.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(DefinitionBuildSettlementOutcome::Absent);
+        return Ok(LeasedDefinitionBuildSettlementOutcome::Settled(
+            DefinitionBuildSettlementOutcome::Absent,
+        ));
     };
     let status = lifecycle_status(&status)?;
     if status != DefinitionLifecycleStatus::Building {
         tx.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(DefinitionBuildSettlementOutcome::AlreadySettled(status));
+        return Ok(LeasedDefinitionBuildSettlementOutcome::Settled(
+            DefinitionBuildSettlementOutcome::AlreadySettled(status),
+        ));
     }
 
+    let settled_at = lease_guard.map_or_else(Utc::now, |guard| guard.now);
     let (task_status, error) = task_build_values(result);
-    let updated = sqlx::query(
-        "UPDATE workflow_task_builds SET status = ?4, error = ?5, built_at = ?6 \
-         WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3 \
-           AND status = 'pending'",
-    )
-    .bind(&encoded_workflow_id)
-    .bind(workflow_version)
-    .bind(&encoded_task_id)
-    .bind(task_status)
-    .bind(error)
-    .bind(encode_timestamp(Utc::now()))
-    .execute(&mut *tx)
-    .await
-    .map_err(repository_sqlx_error)?;
-    if updated.rows_affected() == 0 {
-        let task_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workflow_task_builds \
-             WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3)",
+    let updated = if let Some(guard) = lease_guard {
+        sqlx::query(
+            "UPDATE workflow_task_builds \
+             SET status = ?4, error = ?5, built_at = ?6, \
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+             WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3 \
+               AND status = 'pending' AND lease_owner = ?7 AND lease_token = ?8 \
+               AND lease_expires_at > ?9",
         )
         .bind(&encoded_workflow_id)
         .bind(workflow_version)
         .bind(&encoded_task_id)
-        .fetch_one(&mut *tx)
+        .bind(task_status)
+        .bind(error)
+        .bind(encode_timestamp(settled_at))
+        .bind(guard.owner)
+        .bind(encode_uuid(guard.token))
+        .bind(encode_timestamp(guard.now))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_sqlx_error)?
+    } else {
+        sqlx::query(
+            "UPDATE workflow_task_builds \
+             SET status = ?4, error = ?5, built_at = ?6, \
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+             WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3 \
+               AND status = 'pending' AND lease_token IS NULL",
+        )
+        .bind(&encoded_workflow_id)
+        .bind(workflow_version)
+        .bind(&encoded_task_id)
+        .bind(task_status)
+        .bind(error)
+        .bind(encode_timestamp(settled_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_sqlx_error)?
+    };
+    if updated.rows_affected() == 0 {
+        let stored_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM workflow_task_builds \
+             WHERE workflow_id = ?1 AND workflow_version = ?2 AND task_id = ?3",
+        )
+        .bind(&encoded_workflow_id)
+        .bind(workflow_version)
+        .bind(&encoded_task_id)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(repository_sqlx_error)?;
         tx.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(if task_exists {
-            DefinitionBuildSettlementOutcome::TaskAlreadySettled
-        } else {
-            DefinitionBuildSettlementOutcome::Absent
+        return Ok(match stored_status.as_deref() {
+            Some("pending") if lease_guard.is_some() => {
+                LeasedDefinitionBuildSettlementOutcome::LeaseLost
+            }
+            Some(_) => LeasedDefinitionBuildSettlementOutcome::Settled(
+                DefinitionBuildSettlementOutcome::TaskAlreadySettled,
+            ),
+            None => LeasedDefinitionBuildSettlementOutcome::Settled(
+                DefinitionBuildSettlementOutcome::Absent,
+            ),
         });
     }
 
@@ -584,12 +941,14 @@ async fn settle_task_build_sqlite(
             )
             .bind(&encoded_workflow_id)
             .bind(workflow_version)
-            .bind(encode_timestamp(Utc::now()))
+            .bind(encode_timestamp(settled_at))
             .execute(&mut *tx)
             .await
             .map_err(repository_sqlx_error)?;
             tx.commit().await.map_err(repository_sqlx_error)?;
-            Ok(DefinitionBuildSettlementOutcome::BuildFailed)
+            Ok(LeasedDefinitionBuildSettlementOutcome::Settled(
+                DefinitionBuildSettlementOutcome::BuildFailed,
+            ))
         }
         DefinitionTaskBuildResult::Success => {
             let definition: Option<String> = sqlx::query_scalar(
@@ -604,7 +963,7 @@ async fn settle_task_build_sqlite(
             )
             .bind(&encoded_workflow_id)
             .bind(workflow_version)
-            .bind(encode_timestamp(Utc::now()))
+            .bind(encode_timestamp(settled_at))
             .fetch_optional(&mut *tx)
             .await
             .map_err(repository_sqlx_error)?;
@@ -618,11 +977,132 @@ async fn settle_task_build_sqlite(
                 })
                 .transpose()?;
             tx.commit().await.map_err(repository_sqlx_error)?;
-            Ok(match intent {
-                Some(intent) => DefinitionBuildSettlementOutcome::Ready(intent),
-                None => DefinitionBuildSettlementOutcome::AwaitingTasks,
-            })
+            Ok(LeasedDefinitionBuildSettlementOutcome::Settled(
+                match intent {
+                    Some(intent) => DefinitionBuildSettlementOutcome::Ready(intent),
+                    None => DefinitionBuildSettlementOutcome::AwaitingTasks,
+                },
+            ))
         }
+    }
+}
+
+async fn lease_definition_submissions_sqlite(
+    pool: &SqlitePool,
+    request: DefinitionSubmissionLeaseRequest<'_>,
+) -> Result<Vec<LeasedDefinitionSubmission>, RepositoryError> {
+    let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
+    let encoded_now = encode_timestamp(request.now);
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT id, version, definition FROM workflows \
+         WHERE status = 'Ready' \
+           AND (submission_lease_expires_at IS NULL OR submission_lease_expires_at <= ?1) \
+         ORDER BY id, version \
+         LIMIT ?2",
+    )
+    .bind(&encoded_now)
+    .bind(request.limit as i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(repository_sqlx_error)?;
+
+    let encoded_expiry = encode_timestamp(request.expires_at);
+    let mut leases = Vec::with_capacity(rows.len());
+    for (encoded_workflow_id, workflow_version, definition) in rows {
+        let workflow_id =
+            crate::encoding::decode_uuid(&encoded_workflow_id).map_err(corrupt_value)?;
+        let intent = submission_intent(
+            workflow_id,
+            workflow_version,
+            decode_json(&definition).map_err(corrupt_value)?,
+        )?;
+        let lease_token = Uuid::new_v4();
+        let updated = sqlx::query(
+            "UPDATE workflows \
+             SET submission_lease_owner = ?3, submission_lease_token = ?4, \
+                 submission_lease_expires_at = ?5 \
+             WHERE id = ?1 AND version = ?2 AND status = 'Ready' \
+               AND (submission_lease_expires_at IS NULL OR submission_lease_expires_at <= ?6)",
+        )
+        .bind(&encoded_workflow_id)
+        .bind(workflow_version)
+        .bind(request.owner)
+        .bind(encode_uuid(lease_token))
+        .bind(&encoded_expiry)
+        .bind(&encoded_now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                CorruptStoredValue(format!(
+                    "selected definition submission ({workflow_id}, {workflow_version}) was not leaseable"
+                )),
+            ));
+        }
+        leases.push(LeasedDefinitionSubmission {
+            intent,
+            lease_owner: request.owner.to_owned(),
+            lease_token,
+            lease_expires_at: request.expires_at,
+        });
+    }
+    transaction.commit().await.map_err(repository_sqlx_error)?;
+    Ok(leases)
+}
+
+async fn settle_leased_submission_sqlite(
+    pool: &SqlitePool,
+    workflow_id: Uuid,
+    workflow_version: i64,
+    guard: DefinitionSubmissionLeaseGuard<'_>,
+) -> Result<LeasedDefinitionSubmissionSettlementOutcome, RepositoryError> {
+    let encoded_workflow_id = encode_uuid(workflow_id);
+    let encoded_now = encode_timestamp(guard.now);
+    let won: Option<String> = sqlx::query_scalar(
+        "UPDATE workflows \
+         SET status = 'Submitted', updated_at = ?3, \
+             submission_lease_owner = NULL, submission_lease_token = NULL, \
+             submission_lease_expires_at = NULL \
+         WHERE id = ?1 AND version = ?2 AND status = 'Ready' \
+           AND submission_lease_owner = ?4 AND submission_lease_token = ?5 \
+           AND submission_lease_expires_at > ?3 \
+         RETURNING status",
+    )
+    .bind(&encoded_workflow_id)
+    .bind(workflow_version)
+    .bind(&encoded_now)
+    .bind(guard.owner)
+    .bind(encode_uuid(guard.token))
+    .fetch_optional(pool)
+    .await
+    .map_err(repository_sqlx_error)?;
+    if won.is_some() {
+        return Ok(LeasedDefinitionSubmissionSettlementOutcome::Settled(
+            DefinitionSubmissionSettlementOutcome::Submitted,
+        ));
+    }
+
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM workflows WHERE id = ?1 AND version = ?2")
+            .bind(encoded_workflow_id)
+            .bind(workflow_version)
+            .fetch_optional(pool)
+            .await
+            .map_err(repository_sqlx_error)?;
+    let Some(status) = status else {
+        return Ok(LeasedDefinitionSubmissionSettlementOutcome::Settled(
+            DefinitionSubmissionSettlementOutcome::Absent,
+        ));
+    };
+    let status = lifecycle_status(&status)?;
+    if status == DefinitionLifecycleStatus::Ready {
+        Ok(LeasedDefinitionSubmissionSettlementOutcome::LeaseLost)
+    } else {
+        Ok(LeasedDefinitionSubmissionSettlementOutcome::Settled(
+            DefinitionSubmissionSettlementOutcome::AlreadySettled(status),
+        ))
     }
 }
 
@@ -750,7 +1230,9 @@ async fn settle_submission_postgres(
     workflow_version: i64,
 ) -> Result<DefinitionSubmissionSettlementOutcome, RepositoryError> {
     let won: Option<String> = sqlx::query_scalar(
-        "UPDATE workflows SET status = 'Submitted', updated_at = now() \
+        "UPDATE workflows SET status = 'Submitted', updated_at = now(), \
+             submission_lease_owner = NULL, submission_lease_token = NULL, \
+             submission_lease_expires_at = NULL \
          WHERE id = $1 AND version = $2 AND status = 'Ready' RETURNING status",
     )
     .bind(workflow_id)
@@ -770,7 +1252,9 @@ async fn settle_submission_sqlite(
     workflow_version: i64,
 ) -> Result<DefinitionSubmissionSettlementOutcome, RepositoryError> {
     let won: Option<String> = sqlx::query_scalar(
-        "UPDATE workflows SET status = 'Submitted', updated_at = ?3 \
+        "UPDATE workflows SET status = 'Submitted', updated_at = ?3, \
+             submission_lease_owner = NULL, submission_lease_token = NULL, \
+             submission_lease_expires_at = NULL \
          WHERE id = ?1 AND version = ?2 AND status = 'Ready' RETURNING status",
     )
     .bind(encode_uuid(workflow_id))
@@ -1030,8 +1514,20 @@ async fn requeue_postgres(
     .execute(&mut **tx)
     .await
     .map_err(repository_sqlx_error)?;
+    sqlx::query(
+        "UPDATE workflow_task_builds \
+         SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+         WHERE workflow_id = $1 AND workflow_version = $2 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(version)
+    .execute(&mut **tx)
+    .await
+    .map_err(repository_sqlx_error)?;
     let reset: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE workflow_task_builds SET status = 'pending', error = NULL, built_at = NULL \
+        "UPDATE workflow_task_builds \
+         SET status = 'pending', error = NULL, built_at = NULL, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
          WHERE workflow_id = $1 AND workflow_version = $2 AND status = 'failure' RETURNING task_id",
     )
     .bind(id)
@@ -1206,8 +1702,20 @@ async fn requeue_sqlite(
     .execute(&mut **tx)
     .await
     .map_err(repository_sqlx_error)?;
+    sqlx::query(
+        "UPDATE workflow_task_builds \
+         SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+         WHERE workflow_id = ?1 AND workflow_version = ?2 AND status = 'pending'",
+    )
+    .bind(&stored_id)
+    .bind(version)
+    .execute(&mut **tx)
+    .await
+    .map_err(repository_sqlx_error)?;
     let reset: Vec<String> = sqlx::query_scalar(
-        "UPDATE workflow_task_builds SET status = 'pending', error = NULL, built_at = NULL \
+        "UPDATE workflow_task_builds \
+         SET status = 'pending', error = NULL, built_at = NULL, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
          WHERE workflow_id = ?1 AND workflow_version = ?2 AND status = 'failure' RETURNING task_id",
     )
     .bind(&stored_id)

@@ -1,22 +1,28 @@
 #![cfg(not(madsim))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::sqlite::SqlitePoolOptions;
 use tempfile::TempDir;
+use tickr_conductor::replay_pipeline::local::{
+    replay_work_notifications, start_local_replay_worker, LocalReplayWorkerConfig,
+};
 use tickr_conductor::replay_pipeline::{
     process_replay, reconcile_orphan_replay_rows, redrive_unsettled, replay_instance_id,
     ReplayError, ReplayIngress, ReplayRelaySender, ReplayRequest, STATUS_MATERIALIZING,
     STATUS_RELEASED, STATUS_VERSION_UNRESOLVABLE,
 };
 use tickr_conductor::replay_rehydration::RehydrationPlan;
-use tickr_migrations::backend::{RepositoryErrorKind, RepositoryFactory};
+use tickr_migrations::backend::{RepositoryErrorKind, RepositoryFactory, WriterRepositoryBundle};
 use tickr_migrations::encoding::{encode_json, encode_timestamp, encode_uuid};
 use tickr_migrations::replay_repository::{
-    ReplayLifecycleStatus, ReplayRedriveCandidate, ReplaySettlementOutcome,
+    LeasedReplay, ReplayLeaseCandidate, ReplayLeaseRequest, ReplayLifecycleStatus,
+    ReplayRedriveCandidate, ReplaySettlementOutcome,
 };
 use tickr_proto::archive as ap;
 use tickr_proto::config::DataPlaneSql;
@@ -24,6 +30,7 @@ use tickr_proto::runnable as rp;
 use tickr_proto::signal as sp;
 use tickr_proto::workflow as wf;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct FailingSender;
@@ -71,6 +78,52 @@ impl ReplayRelaySender for CountingSender {
 
     async fn rehydrate(&self, _replay_run_id: Uuid, _plan: &RehydrationPlan) -> Result<()> {
         *self.0.lock().await += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashPoint {
+    Never,
+    AfterHydration,
+    AfterResumeForward,
+}
+
+#[derive(Debug, Default)]
+struct BoundaryEffects {
+    signals: Vec<(&'static str, String)>,
+    hydrations: Vec<Uuid>,
+}
+
+struct BoundarySender {
+    crash: CrashPoint,
+    effects: Arc<Mutex<BoundaryEffects>>,
+}
+
+#[async_trait::async_trait]
+impl ReplayRelaySender for BoundarySender {
+    async fn send(&self, signal: &sp::Signal) -> Result<()> {
+        let kind = match signal.variant.as_ref() {
+            Some(sp::signal::Variant::Trigger(_)) => "trigger",
+            Some(sp::signal::Variant::Resume(_)) => "resume",
+            other => panic!("unexpected replay signal: {other:?}"),
+        };
+        self.effects
+            .lock()
+            .await
+            .signals
+            .push((kind, signal.signal_id.clone()));
+        if self.crash == CrashPoint::AfterResumeForward && kind == "resume" {
+            panic!("simulated crash after Resume relay forwarding");
+        }
+        Ok(())
+    }
+
+    async fn rehydrate(&self, replay_run_id: Uuid, _plan: &RehydrationPlan) -> Result<()> {
+        self.effects.lock().await.hydrations.push(replay_run_id);
+        if self.crash == CrashPoint::AfterHydration {
+            panic!("simulated crash after rehydration effect");
+        }
         Ok(())
     }
 }
@@ -241,6 +294,36 @@ fn accepted_id(outcome: ReplayIngress) -> Uuid {
         } => replay_instance_id,
         other => panic!("expected accepted replay, got {other:?}"),
     }
+}
+
+fn worker_config(scan_interval: Duration, lease_duration: Duration) -> LocalReplayWorkerConfig {
+    LocalReplayWorkerConfig {
+        scan_interval,
+        lease_duration,
+        min_age: Duration::ZERO,
+        batch_size: NonZeroUsize::new(8).unwrap(),
+    }
+}
+
+async fn run_one_startup_scan(
+    repositories: Arc<WriterRepositoryBundle>,
+    sender: Arc<dyn ReplayRelaySender>,
+    owner: &str,
+    lease_duration: Duration,
+) -> Result<()> {
+    let (notifier, notifications) = replay_work_notifications(NonZeroUsize::new(1).unwrap());
+    drop(notifier);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    start_local_replay_worker(
+        repositories,
+        sender,
+        owner.to_owned(),
+        notifications,
+        worker_config(Duration::from_millis(1), lease_duration),
+        cancel,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,26 +583,125 @@ async fn file_backed_recovery_scan_is_stable_and_isolates_corrupt_rows_across_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_backed_concurrent_steady_state_drives_converge_on_one_terminal_replay() {
+async fn file_backed_replay_leases_are_bounded_stable_and_exclusive() {
+    let (_directory, url, fixture) = prepare().await;
+    let factory = RepositoryFactory::new(DataPlaneSql::Sqlite { url: url.clone() });
+    let writer = factory.open_writer().await.unwrap();
+    let mut replay_ids = Vec::new();
+    for key in ["lease-c", "lease-a", "lease-b"] {
+        replay_ids.push(accepted_id(
+            process_replay(
+                &writer,
+                &FailingSender,
+                request(fixture.source_id, Some(key)),
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    let raw = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(tickr_migrations::sqlite_writer_options(&url, false).unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workflow_replays SET updated_at = ?1")
+        .bind(encode_timestamp(Utc::now() - chrono::Duration::seconds(1)))
+        .execute(&raw)
+        .await
+        .unwrap();
+    raw.close().await;
+
+    replay_ids.sort_unstable();
+    let now = Utc::now();
+    let first = writer
+        .lease_replays(ReplayLeaseRequest {
+            owner: "bounded-a",
+            now,
+            expires_at: now + chrono::Duration::minutes(1),
+            eligible_before: now,
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    let first_leases = first
+        .into_iter()
+        .map(|candidate| match candidate {
+            ReplayLeaseCandidate::Ready(lease) => lease,
+            ReplayLeaseCandidate::Corrupt { error, .. } => panic!("{error}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_leases.len(), 2);
+    assert_eq!(
+        first_leases
+            .iter()
+            .map(|lease| lease.row.replay_instance_id)
+            .collect::<Vec<_>>(),
+        replay_ids[..2]
+    );
+
+    let second = writer
+        .lease_replays(ReplayLeaseRequest {
+            owner: "bounded-b",
+            now,
+            expires_at: now + chrono::Duration::minutes(1),
+            eligible_before: now,
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1, "active leases exclude competing scans");
+    let remaining = match &second[0] {
+        ReplayLeaseCandidate::Ready(lease) => lease.row.replay_instance_id,
+        ReplayLeaseCandidate::Corrupt { error, .. } => panic!("{error}"),
+    };
+    assert_eq!(remaining, replay_ids[2]);
+
+    for lease in first_leases {
+        assert!(writer.release_replay_lease(&lease).await.unwrap());
+    }
+    if let ReplayLeaseCandidate::Ready(lease) = &second[0] {
+        assert!(writer.release_replay_lease(lease).await.unwrap());
+    }
+    writer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_backed_concurrent_local_workers_lease_one_terminal_replay() {
     let (_directory, url, fixture) = prepare().await;
     let factory = RepositoryFactory::new(DataPlaneSql::Sqlite { url });
-    let writer = factory.open_writer().await.unwrap();
+    let writer = Arc::new(factory.open_writer().await.unwrap());
     let replay_id = accepted_id(
         process_replay(
-            &writer,
+            writer.as_ref(),
             &FailingSender,
             request(fixture.source_id, Some("concurrent-drive")),
         )
         .await
         .unwrap(),
     );
-    let sender = CountingSender::default();
+    let sender = Arc::new(CountingSender::default());
 
     let (left, right) = tokio::join!(
-        redrive_unsettled(&writer, &sender, Duration::ZERO),
-        redrive_unsettled(&writer, &sender, Duration::ZERO)
+        run_one_startup_scan(
+            writer.clone(),
+            sender.clone(),
+            "race-left",
+            Duration::from_secs(30),
+        ),
+        run_one_startup_scan(
+            writer.clone(),
+            sender.clone(),
+            "race-right",
+            Duration::from_secs(30),
+        )
     );
-    assert!(left.unwrap() + right.unwrap() >= 1);
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(
+        *sender.0.lock().await,
+        3,
+        "the exclusive lease permits one Trigger, hydration, and Resume drive"
+    );
     assert_eq!(
         writer
             .replay_lifecycle(replay_id)
@@ -529,17 +711,204 @@ async fn file_backed_concurrent_steady_state_drives_converge_on_one_terminal_rep
             .status,
         STATUS_RELEASED
     );
-    assert_eq!(
-        writer.settle_replay_released(replay_id).await.unwrap(),
-        ReplaySettlementOutcome::AlreadySettled(ReplayLifecycleStatus::Released)
+    writer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_backed_crash_boundaries_recover_with_stable_effect_identities() {
+    let (_directory, url, fixture) = prepare().await;
+    let factory = RepositoryFactory::new(DataPlaneSql::Sqlite { url });
+    let writer = factory.open_writer().await.unwrap();
+    let replay_id = accepted_id(
+        process_replay(
+            &writer,
+            &FailingSender,
+            request(fixture.source_id, Some("crash-matrix")),
+        )
+        .await
+        .unwrap(),
     );
+    writer.close().await;
+
+    // Crash before effects but after lease commit. Restart cannot race the live
+    // lease; expiry makes the same durable replay identity eligible again.
+    let writer = factory.open_writer().await.unwrap();
+    let lease_now = Utc::now();
+    let leased = writer
+        .lease_replays(ReplayLeaseRequest {
+            owner: "crash-after-lease",
+            now: lease_now,
+            expires_at: lease_now + chrono::Duration::milliseconds(50),
+            eligible_before: lease_now,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let lease = match leased.into_iter().next().unwrap() {
+        ReplayLeaseCandidate::Ready(lease) => lease,
+        ReplayLeaseCandidate::Corrupt { error, .. } => panic!("{error}"),
+    };
+    assert_eq!(lease.row.replay_instance_id, replay_id);
+    writer.close().await;
+
+    let writer = factory.open_writer().await.unwrap();
+    assert!(writer
+        .lease_replays(ReplayLeaseRequest {
+            owner: "too-early",
+            now: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(1),
+            eligible_before: Utc::now(),
+            limit: 1,
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    writer.close().await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let effects = Arc::new(Mutex::new(BoundaryEffects::default()));
+    let writer = Arc::new(factory.open_writer().await.unwrap());
+    let hydration_crash = tokio::spawn(run_one_startup_scan(
+        writer.clone(),
+        Arc::new(BoundarySender {
+            crash: CrashPoint::AfterHydration,
+            effects: effects.clone(),
+        }),
+        "crash-after-effect",
+        Duration::from_millis(50),
+    ));
+    assert!(hydration_crash.await.unwrap_err().is_panic());
+    writer.close().await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let writer = Arc::new(factory.open_writer().await.unwrap());
+    let relay_crash = tokio::spawn(run_one_startup_scan(
+        writer.clone(),
+        Arc::new(BoundarySender {
+            crash: CrashPoint::AfterResumeForward,
+            effects: effects.clone(),
+        }),
+        "crash-after-relay",
+        Duration::from_millis(50),
+    ));
+    assert!(relay_crash.await.unwrap_err().is_panic());
+    writer.close().await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let writer = Arc::new(factory.open_writer().await.unwrap());
+    run_one_startup_scan(
+        writer.clone(),
+        Arc::new(BoundarySender {
+            crash: CrashPoint::Never,
+            effects: effects.clone(),
+        }),
+        "settlement-winner",
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        redrive_unsettled(&writer, &sender, Duration::ZERO)
+        writer
+            .replay_lifecycle(replay_id)
             .await
-            .unwrap(),
-        0,
-        "the terminal replay is not selected again"
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RELEASED
     );
+    writer.close().await;
+
+    // A crash after settlement cannot reopen or replay the terminal row.
+    let writer = Arc::new(factory.open_writer().await.unwrap());
+    run_one_startup_scan(
+        writer.clone(),
+        Arc::new(BoundarySender {
+            crash: CrashPoint::Never,
+            effects: effects.clone(),
+        }),
+        "after-settlement-restart",
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    writer.close().await;
+
+    let effects = effects.lock().await;
+    let trigger_ids = effects
+        .signals
+        .iter()
+        .filter(|(kind, _)| *kind == "trigger")
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    let resume_ids = effects
+        .signals
+        .iter()
+        .filter(|(kind, _)| *kind == "resume")
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(trigger_ids.len(), 3);
+    assert_eq!(resume_ids.len(), 2);
+    assert_eq!(
+        trigger_ids.iter().copied().collect::<HashSet<_>>().len(),
+        1,
+        "Trigger retries retain the committed signal identity"
+    );
+    assert_eq!(
+        resume_ids.iter().copied().collect::<HashSet<_>>().len(),
+        1,
+        "Resume retries retain the replay-derived signal identity"
+    );
+    assert_eq!(effects.hydrations, vec![replay_id; 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_backed_periodic_scan_recovers_work_after_notification_channel_loss() {
+    let (_directory, url, fixture) = prepare().await;
+    let factory = RepositoryFactory::new(DataPlaneSql::Sqlite { url });
+    let writer = Arc::new(factory.open_writer().await.unwrap());
+    let sender = Arc::new(CountingSender::default());
+    let (notifier, notifications) = replay_work_notifications(NonZeroUsize::new(1).unwrap());
+    drop(notifier);
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn(start_local_replay_worker(
+        writer.clone(),
+        sender.clone(),
+        "periodic-recovery".to_owned(),
+        notifications,
+        worker_config(Duration::from_millis(20), Duration::from_secs(1)),
+        cancel.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let replay_id = accepted_id(
+        process_replay(
+            writer.as_ref(),
+            &FailingSender,
+            request(fixture.source_id, Some("dropped-notification")),
+        )
+        .await
+        .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if writer
+                .replay_lifecycle(replay_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == STATUS_RELEASED
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    worker.await.unwrap().unwrap();
+    assert_eq!(*sender.0.lock().await, 3);
     writer.close().await;
 }
 

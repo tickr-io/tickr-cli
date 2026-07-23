@@ -223,7 +223,7 @@ CREATE INDEX task_instances_workflow_instance_id_idx ON public.task_instances US
 
 CREATE INDEX workflow_instances_state_archived_at_idx ON public.workflow_instances USING btree (state, archived_at DESC);
 
-CREATE INDEX workflow_instances_workflow_scheduled_idx ON public.workflow_instances USING btree (workflow_id, scheduled_at);
+CREATE INDEX workflow_instances_workflow_id_idx ON public.workflow_instances USING btree (workflow_id);
 
 CREATE INDEX workflow_patch_discrepancies_detected_idx ON public.workflow_patch_discrepancies USING btree (detected_at DESC);
 
@@ -231,9 +231,9 @@ CREATE INDEX workflow_patches_unsettled_idx ON public.workflow_patches USING btr
 
 CREATE UNIQUE INDEX workflow_replays_idempotency_idx ON public.workflow_replays USING btree (source_instance_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
 
-CREATE INDEX workflow_replays_source_idx ON public.workflow_replays USING btree (source_instance_id, created_at DESC, replay_instance_id DESC);
+CREATE INDEX workflow_replays_source_idx ON public.workflow_replays USING btree (source_instance_id);
 
-CREATE INDEX workflow_replays_unsettled_idx ON public.workflow_replays USING btree (updated_at, replay_instance_id) WHERE (status = 'Materializing'::text);
+CREATE INDEX workflow_replays_unsettled_idx ON public.workflow_replays USING btree (updated_at) WHERE (status = 'Materializing'::text);
 
 CREATE INDEX workflow_task_builds_workflow_idx ON public.workflow_task_builds USING btree (workflow_id, workflow_version);
 

@@ -73,6 +73,8 @@ use crate::build_pipeline::{BuildExecutor, BuildOutcome, TaskBuildJob};
 use crate::parser::builder::project_gate_proto;
 use crate::parser::types::{ParsedGate, ParsedInputBinding, ParsedTask};
 
+pub mod local;
+
 /// Reject a chain whose `steps` name the same `handle` twice **within one
 /// scope** (a step list). The same string may recur in a sibling scope — the
 /// scope path disambiguates — so the check is per-scope, recursing into any

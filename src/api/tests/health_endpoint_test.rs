@@ -16,11 +16,14 @@
 #![cfg(not(madsim))]
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::jetstream;
 use futures::StreamExt as _;
+use prost::Message as _;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::SqlitePoolOptions;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
@@ -28,11 +31,20 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_api::commands::client::send_command;
+use tickr_api::commands::client::CommandBus;
+use tickr_api::commands::local::LocalCommandBusConfig;
 use tickr_api::http::coordinator_client::CoordinatorClient;
 use tickr_api::http::health::{
     api_self, build_health_report, check_conductor, check_control_plane, check_data_plane_sql,
     check_executors, check_nats_kv, ComponentStatus, DataPlaneSqlImplementation,
+    HealthCoordinationRole, HealthFinalLogStore, HealthFormationProfile, HealthFormationTopology,
+    HealthProtocolIdentity, HealthResolvedRole, HealthRoleImplementation, HealthSubstrateSelection,
+    HealthWriterTopology, ResolvedFormationHealth,
 };
+use tickr_api::http::logs_resolver::{
+    LocalTaskLogStore, LogBatchPage, LogsError, LogsResolver, TaskLogs,
+};
+use tickr_executor::local_pickup::LocalExecutorFleetStatus;
 use tickr_migrations::backend::{ReadOnlyRepositoryBundle, RepositoryFactory};
 use tickr_migrations::{apply_sqlite, apply_target, sqlite_writer_options, MigrationTarget};
 use tickr_proto::config::DataPlaneSql;
@@ -809,4 +821,326 @@ async fn conductor_row_unhealthy_when_consumer_absent_but_broker_connected() {
         "no command consumer (NoResponders) while broker up ⇒ unhealthy, got detail: {}",
         row.detail
     );
+}
+
+struct UnusedLocalLogs;
+
+#[async_trait::async_trait]
+impl LocalTaskLogStore for UnusedLocalLogs {
+    async fn fetch_task_logs(
+        &self,
+        _workflow_id: Uuid,
+        _workflow_instance_id: Uuid,
+        _task_instance_id: Uuid,
+    ) -> Result<TaskLogs, LogsError> {
+        Err(LogsError::NotFound)
+    }
+
+    async fn fetch_batches_after(
+        &self,
+        _workflow_id: Uuid,
+        _workflow_instance_id: Uuid,
+        _task_instance_id: Uuid,
+        _after_seq: u64,
+    ) -> Result<LogBatchPage, LogsError> {
+        Err(LogsError::NotFound)
+    }
+
+    async fn fetch_tail(
+        &self,
+        _workflow_id: Uuid,
+        _workflow_instance_id: Uuid,
+        _task_instance_id: Uuid,
+        _tail: usize,
+        _before_seq: Option<u64>,
+    ) -> Result<LogBatchPage, LogsError> {
+        Err(LogsError::NotFound)
+    }
+}
+
+fn lite_formation_health() -> ResolvedFormationHealth {
+    let roles = [
+        (
+            HealthCoordinationRole::CommandBus,
+            HealthRoleImplementation::LocalRequestReply,
+            "tickr.command-bus.local-request-reply",
+        ),
+        (
+            HealthCoordinationRole::TaskDispatch,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.task-dispatch.sqlite",
+        ),
+        (
+            HealthCoordinationRole::TaskEvents,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.task-events.sqlite",
+        ),
+        (
+            HealthCoordinationRole::TaskCancellation,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.task-cancellation.sqlite",
+        ),
+        (
+            HealthCoordinationRole::CompactionStaging,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.compaction-staging.sqlite",
+        ),
+        (
+            HealthCoordinationRole::LifecycleWork,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.lifecycle-work.sqlite",
+        ),
+        (
+            HealthCoordinationRole::LogStaging,
+            HealthRoleImplementation::LocalJournal,
+            "tickr.log-staging.local-journal",
+        ),
+        (
+            HealthCoordinationRole::ScopeStore,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.scope-store.sqlite",
+        ),
+        (
+            HealthCoordinationRole::IngressIdempotencyStore,
+            HealthRoleImplementation::Disabled,
+            "tickr.ingress-idempotency.disabled",
+        ),
+        (
+            HealthCoordinationRole::LivenessWatchdog,
+            HealthRoleImplementation::LocalSqlite,
+            "tickr.liveness-watchdog.sqlite",
+        ),
+        (
+            HealthCoordinationRole::SignalAppliedNotifier,
+            HealthRoleImplementation::LocalNotification,
+            "tickr.signal-applied.local-notification",
+        ),
+        (
+            HealthCoordinationRole::ExecutorFleetStatus,
+            HealthRoleImplementation::LocalObservation,
+            "tickr.executor-fleet-status.local-observation",
+        ),
+        (
+            HealthCoordinationRole::EventIngress,
+            HealthRoleImplementation::Disabled,
+            "tickr.event-ingress.disabled",
+        ),
+    ]
+    .into_iter()
+    .map(|(role, implementation, name)| HealthResolvedRole {
+        role,
+        implementation,
+        protocol: HealthProtocolIdentity {
+            name: name.to_string(),
+            version: 1,
+        },
+    })
+    .collect();
+    ResolvedFormationHealth {
+        profile: HealthFormationProfile::TickrLite,
+        topology: HealthFormationTopology::SingleNode,
+        sql: DataPlaneSqlImplementation::Sqlite,
+        final_logs: HealthFinalLogStore::LocalFiles,
+        writer_topology: HealthWriterTopology::ConductorOwned,
+        executor_count: 1,
+        substrates: HealthSubstrateSelection {
+            sqlite: true,
+            postgres: false,
+            nats: false,
+            redis: false,
+            object_store: false,
+        },
+        roles,
+    }
+}
+
+async fn spawn_mutable_control_plane() -> (String, Arc<AtomicU8>) {
+    let state = Arc::new(AtomicU8::new(0));
+    let app = axum::Router::new().route(
+        "/api/internal/health",
+        axum::routing::get({
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move {
+                    let status = match state.load(Ordering::Acquire) {
+                        0 => "healthy",
+                        1 => "degraded",
+                        _ => "unhealthy",
+                    };
+                    axum::Json(serde_json::json!({ "status": status }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind mutable control plane");
+    let address = listener
+        .local_addr()
+        .expect("mutable control-plane address");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_states() {
+    let (directory, _url, repositories) = migrated_sqlite_repository().await;
+    std::fs::write(directory.path().join("index.html"), "<html></html>").unwrap();
+    let (coordinator_url, control_plane_state) = spawn_mutable_control_plane().await;
+    let coordinator = Arc::new(CoordinatorClient::new(coordinator_url));
+    let (command_bus, command_writer) = CommandBus::local(LocalCommandBusConfig::default());
+    let command_cancel = CancellationToken::new();
+    let command_task = tokio::spawn(command_writer.run(
+        command_cancel.clone(),
+        |bytes| async move {
+            let request = api::ApiCommandRequest::decode(bytes.as_slice()).unwrap();
+            assert!(matches!(
+                request.body,
+                Some(api::api_command_request::Body::Ping(_))
+            ));
+            api::ApiCommandResponse {
+                status_code: 200,
+                payload: Some(api::api_command_response::Payload::Ping(
+                    api::PingPayload {},
+                )),
+            }
+            .encode_to_vec()
+        },
+    ));
+    let ready = Arc::new(AtomicBool::new(false));
+    let fleet = LocalExecutorFleetStatus::new(
+        Uuid::new_v4(),
+        NonZeroUsize::new(4).expect("non-zero test capacity"),
+    );
+    let state = tickr_api::http::routes::build_lite_app_state(
+        command_bus,
+        Arc::new(repositories),
+        coordinator,
+        Arc::new(LogsResolver::local(Arc::new(UnusedLocalLogs))),
+        ready.clone(),
+        directory.path().to_path_buf(),
+        fleet,
+        lite_formation_health(),
+    );
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind Lite health API");
+    let address = listener.local_addr().unwrap();
+    let api_task = tokio::spawn(async move {
+        axum::serve(listener, tickr_api::http::routes::build_lite_router(state))
+            .await
+            .unwrap()
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+
+    let unready = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(unready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let unready_report: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unready_report["formation"]["profile"], "tickr_lite");
+    assert_eq!(unready_report["formation"]["status"], "unhealthy");
+    assert_eq!(unready_report["readiness"]["ready"], false);
+    assert_eq!(unready_report["nats_kv"]["status"], "degraded");
+    assert_eq!(unready_report["formation"]["substrates"]["nats"], false);
+    assert_eq!(unready_report["formation"]["substrates"]["redis"], false);
+    assert_eq!(unready_report["formation"]["substrates"]["postgres"], false);
+    assert_eq!(
+        unready_report["formation"]["substrates"]["object_store"],
+        false
+    );
+
+    ready.store(true, Ordering::Release);
+    let ready_response = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(ready_response.status(), reqwest::StatusCode::OK);
+    let healthy: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(healthy["formation"]["status"], "healthy");
+    assert_eq!(healthy["local_coordination"]["status"], "healthy");
+    assert_eq!(
+        healthy["command_path"]["implementation"],
+        "local_request_reply"
+    );
+    assert_eq!(
+        healthy["command_path"]["protocol"]["name"],
+        "tickr.command-bus.local-request-reply"
+    );
+    assert_eq!(healthy["executors"]["observed_executors"], 1);
+    assert_eq!(healthy["executors"]["configured_process_slots"], 4);
+    assert_eq!(healthy["executors"]["in_flight_count"], 0);
+    assert_eq!(healthy["formation"]["roles"].as_array().unwrap().len(), 13);
+
+    control_plane_state.store(1, Ordering::Release);
+    let degraded: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(degraded["control_plane"]["status"], "degraded");
+    assert_eq!(degraded["readiness"]["ready"], true);
+
+    control_plane_state.store(2, Ordering::Release);
+    let lost: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lost["control_plane"]["status"], "unhealthy");
+    assert_eq!(lost["readiness"]["ready"], true);
+    assert_eq!(lost["data_plane_sql"]["status"], "healthy");
+
+    control_plane_state.store(0, Ordering::Release);
+    let reconnected: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reconnected["control_plane"]["status"], "healthy");
+    assert_eq!(reconnected["readiness"]["ready"], true);
+
+    // This is the same shared transition the critical-child path performs
+    // before cancelling siblings; diagnostics remain available during teardown.
+    ready.store(false, Ordering::Release);
+    let failed: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed["readiness"]["ready"], false);
+    assert_eq!(failed["formation"]["status"], "unhealthy");
+    let blocked = client
+        .get(format!("{base}/api/workflows"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    command_cancel.cancel();
+    command_task.await.unwrap();
+    api_task.abort();
 }

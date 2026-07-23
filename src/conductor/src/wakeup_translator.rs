@@ -118,6 +118,27 @@ pub async fn process_wakeup(
     gate_index: &GateIndex,
     req: WakeupRequest,
 ) -> Result<WakeupOutcome> {
+    process_wakeup_with_working_set(repositories, Some(nats), sender, gate_index, req).await
+}
+
+/// Tickr Lite wakeups preserve relay and SQL effects while the profile-disabled
+/// ingress cache and NATS working-set mirror are absent.
+pub async fn process_wakeup_local(
+    repositories: &WriterRepositoryBundle,
+    sender: &dyn WakeupRelaySender,
+    gate_index: &GateIndex,
+    req: WakeupRequest,
+) -> Result<WakeupOutcome> {
+    process_wakeup_with_working_set(repositories, None, sender, gate_index, req).await
+}
+
+async fn process_wakeup_with_working_set(
+    repositories: &WriterRepositoryBundle,
+    nats: Option<&NatsClient>,
+    sender: &dyn WakeupRelaySender,
+    gate_index: &GateIndex,
+    req: WakeupRequest,
+) -> Result<WakeupOutcome> {
     let payload_value = req.payload.unwrap_or(Value::Object(Default::default()));
     let hash_payload = serde_json::json!({
         "name": &req.name,
@@ -130,7 +151,7 @@ pub async fn process_wakeup(
     // 1. Idempotency cache. Only consulted when a producer-supplied key
     //    is present. The check_or_insert is atomic against concurrent
     //    retries on the same key.
-    if let Some(key) = req.idempotency_key.as_deref() {
+    if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
         let bucket = idempotency::open_bucket(nats)
             .await
             .context("idempotency bucket")?;
@@ -189,24 +210,23 @@ pub async fn process_wakeup(
         if !predicate_matches(&entry, &payload_value) {
             continue;
         }
-        if let Err(e) = persist_subscriber_captures(
-            repositories,
-            nats,
-            signal_id,
-            &req.name,
-            &entry,
-            &payload_value,
-        )
-        .await
-        {
-            // First-writer-wins on shared signal_id is the known
-            // footgun; log and continue rather than fail the whole
-            // fan-out for this subscriber's downstream issue.
-            tracing::warn!(
-                "wakeup translator: persist captures failed for workflow {}: {} (continuing fan-out)",
-                entry.workflow_id,
-                e
-            );
+        if let Some(nats) = nats {
+            if let Err(e) = persist_subscriber_captures(
+                repositories,
+                nats,
+                signal_id,
+                &req.name,
+                &entry,
+                &payload_value,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "wakeup translator: persist captures failed for workflow {}: {} (continuing fan-out)",
+                    entry.workflow_id,
+                    e
+                );
+            }
         }
         let signal = sp::Signal {
             signal_id: signal_id.to_string(),
@@ -250,14 +270,17 @@ pub async fn process_wakeup(
         if !gate_predicate_matches(&gate, &payload_value) {
             continue;
         }
-        if let Err(e) = write_gate_captures(nats, signal_id, &req.name, &gate, &payload_value).await
-        {
-            tracing::warn!(
-                "wakeup translator: persist gate captures failed for ({}, {}): {} (continuing fan-out)",
-                gate.workflow_instance_id,
-                gate.edge_id,
-                e
-            );
+        if let Some(nats) = nats {
+            if let Err(e) =
+                write_gate_captures(nats, signal_id, &req.name, &gate, &payload_value).await
+            {
+                tracing::warn!(
+                    "wakeup translator: persist gate captures failed for ({}, {}): {} (continuing fan-out)",
+                    gate.workflow_instance_id,
+                    gate.edge_id,
+                    e
+                );
+            }
         }
         let outcome = sp::GateOutcome {
             workflow_instance_id: gate.workflow_instance_id.to_string(),
