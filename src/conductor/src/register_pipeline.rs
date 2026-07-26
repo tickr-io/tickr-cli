@@ -6,8 +6,8 @@
 //! projection); the work in between is identical — Nickel parse with a 30s
 //! timeout, version-novelty check, the single repository transaction that
 //! inserts the `workflows` row at `Building` plus one `workflow_task_builds`
-//! row per task, and the publish-after-commit of one `TaskBuildJob` per task
-//! onto the build queue.
+//! row per task, and advisory publish-after-commit `TaskBuildJob` notifications
+//! that request earlier authoritative SQL scans.
 //!
 //! This module is that shared middle layer, mirroring `trigger_pipeline`.
 //! Callers build a [`RegisterRequest`], invoke [`process_register`], and adapt
@@ -226,12 +226,12 @@ async fn publish_build_tasks(nats: &NatsClient, tasks: Vec<DefinitionBuildTask>)
                     .await
                 {
                     eprintln!(
-                        "Failed to publish TaskBuildJob for task {}: {}",
+                        "Failed to publish TaskBuildJob notification for task {}: {}",
                         job.task_id, error
                     );
                 }
             }
-            Err(error) => eprintln!("Failed to serialize TaskBuildJob: {}", error),
+            Err(error) => eprintln!("Failed to serialize TaskBuildJob notification: {}", error),
         }
     }
 }

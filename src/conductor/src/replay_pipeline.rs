@@ -605,11 +605,9 @@ pub async fn run_replay_redrive(
 }
 
 /// Boot-time reconcile: re-drive every unsettled replay row once at startup,
-/// regardless of age. Follows the submission queue's `reconcile_orphan_ready_rows`
-/// precedent — a process that died mid-drive (Trigger relayed but the ctx
-/// re-hydration / release never landed) leaves a durable `Materializing` row;
-/// this finishes it before steady-state traffic resumes. Runs exactly once on
-/// startup.
+/// regardless of age. A process that died mid-drive (Trigger relayed but the
+/// ctx re-hydration / release never landed) leaves a durable `Materializing`
+/// row; this finishes it before steady-state traffic resumes.
 pub async fn reconcile_orphan_replay_rows(
     repositories: &WriterRepositoryBundle,
     sender: &dyn ReplayRelaySender,
@@ -708,9 +706,17 @@ fn source_run_from_repository(source_instance_id: Uuid, source: &ReplaySource) -
         .into_iter()
         .flatten()
         .filter_map(|entry| {
+            let key = entry.get("key")?.as_str()?.to_string();
+            let envelope = entry.get("envelope")?.clone();
+            let envelope_bytes = entry
+                .get("envelope_bytes")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|encoded| hex::decode(encoded).ok())
+                .unwrap_or_else(|| serde_json::to_vec(&envelope).unwrap_or_default());
             Some(ArchivedCtxEntry {
-                key: entry.get("key")?.as_str()?.to_string(),
-                envelope: entry.get("envelope")?.clone(),
+                key,
+                envelope,
+                envelope_bytes,
             })
         })
         .collect();

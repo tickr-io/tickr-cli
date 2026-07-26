@@ -370,7 +370,7 @@ pub async fn mirror_reshaped_ctx_graph(
 /// Shared by the materialization mirror and the patch-apply re-mirror so both
 /// land in the same bucket the executor reads from.
 async fn get_or_create_ctx_bucket(js: &jetstream::Context) -> Result<jetstream::kv::Store> {
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     match js.get_key_value(&bucket_name).await {
         Ok(kv) => Ok(kv),
         Err(_) => js

@@ -57,7 +57,7 @@ pub async fn on_workflow_terminal(
     }
 
     let js = jetstream::new(nats.clone());
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv_opt = js.get_key_value(&bucket_name).await.ok();
 
     let mut touched = Vec::with_capacity(rows.len());
@@ -101,7 +101,7 @@ pub async fn sweep_expired(
     }
 
     let js = jetstream::new(nats.clone());
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv_opt = js.get_key_value(&bucket_name).await.ok();
 
     let mut deleted = 0usize;

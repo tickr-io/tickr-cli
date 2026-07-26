@@ -343,9 +343,16 @@ components:
       - event_type
       - payload
       type: object
+    ExecutorCapacityInterpretation:
+      description: Public API contract.
+      enum:
+      - observation_only
+      type: string
     ExecutorHealth:
       description: Public API contract.
       properties:
+        capacity_interpretation:
+          $ref: '#/components/schemas/ExecutorCapacityInterpretation'
         configured_process_slots:
           minimum: 0
           type:
@@ -355,12 +362,30 @@ components:
           type: string
         detection_window:
           type: string
+        freshest_observation_age_ms:
+          format: int64
+          minimum: 0
+          type:
+          - integer
+          - 'null'
         in_flight_count:
           minimum: 0
           type:
           - integer
           - 'null'
+        observation_ttl_ms:
+          format: int64
+          minimum: 0
+          type:
+          - integer
+          - 'null'
         observed_executors:
+          minimum: 0
+          type:
+          - integer
+          - 'null'
+        oldest_observation_age_ms:
+          format: int64
           minimum: 0
           type:
           - integer
@@ -371,6 +396,7 @@ components:
       - status
       - detail
       - detection_window
+      - capacity_interpretation
       type: object
     FormationHealth:
       description: Public API contract.
@@ -575,6 +601,7 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/ReadinessHealth'
+        redis_capability: {}
       required:
       - checked_at
       - api

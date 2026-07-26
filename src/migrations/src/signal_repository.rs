@@ -59,6 +59,9 @@ pub struct SignalCancelInput {
     pub note: Option<String>,
 }
 
+/// Durable marker for a ByTag cancellation awaiting materialization.
+pub const PENDING_SIGNAL_CANCEL_APPLIED_COUNT: i32 = -1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignalCancelRecord {
     pub signal_id: Uuid,
@@ -226,6 +229,51 @@ impl WriterRepositoryBundle {
                 Ok(result.rows_affected() == 1)
             }
         }
+    }
+
+    /// Read the durable state of one Cancel Signal.
+    pub async fn signal_cancel(
+        &self,
+        signal_id: Uuid,
+    ) -> Result<Option<SignalCancelRecord>, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(pool) => cancel_postgres(pool, signal_id).await,
+            BackendPool::Sqlite(pool) => cancel_sqlite(pool, signal_id).await,
+        }
+    }
+
+    /// Materialize a pending ByTag cancellation exactly once.
+    pub async fn materialize_signal_cancel(
+        &self,
+        signal_id: Uuid,
+        applied_count: i32,
+    ) -> Result<bool, RepositoryError> {
+        let rows_affected = match &self.pool {
+            BackendPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE signal_cancels SET applied_count = $2 WHERE signal_id = $1 AND applied_count = $3",
+                )
+                .bind(signal_id)
+                .bind(applied_count)
+                .bind(PENDING_SIGNAL_CANCEL_APPLIED_COUNT)
+                .execute(pool)
+                .await
+                .map(|result| result.rows_affected())
+            }
+            BackendPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE signal_cancels SET applied_count = ?2 WHERE signal_id = ?1 AND applied_count = ?3",
+                )
+                .bind(encode_uuid(signal_id))
+                .bind(applied_count)
+                .bind(PENDING_SIGNAL_CANCEL_APPLIED_COUNT)
+                .execute(pool)
+                .await
+                .map(|result| result.rows_affected())
+            }
+        }
+        .map_err(repository_sqlx_error)?;
+        Ok(rows_affected == 1)
     }
 
     pub async fn insert_signal_wakeup(

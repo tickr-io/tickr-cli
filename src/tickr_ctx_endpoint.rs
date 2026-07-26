@@ -1,9 +1,11 @@
-//! Root-local tickr-ctx access for Tickr Lite.
+//! Root-local tickr-ctx access for selected ScopeStore implementations.
 //!
-//! The endpoint owns no repository handle. Every operation crosses the bounded
-//! writer channel, keeping task processes and socket handlers outside SQLite.
+//! The endpoint owns no repository or substrate handle. Every operation
+//! crosses the bounded writer channel, keeping task processes and socket
+//! handlers outside SQLite and Redis.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,11 +17,13 @@ use tickr_ctx::local::{
     LocalRequest, LocalResponse, CREDENTIAL_ENV, ENDPOINT_ENV, LOCAL_PROTOCOL_VERSION,
     MAX_LOCAL_REQUEST_BYTES, MAX_LOCAL_RESPONSE_BYTES,
 };
-use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_executor::task_handler::TaskContextProvider;
+use tickr_executor::wire::DispatchedTask;
 use tickr_migrations::scope_repository::{
-    DeleteTickrCtxScopeInput, ScopeBoundViolation, ScopeDeleteOutcome, ScopeMutationRejection,
-    ScopeReadOutcome, ScopeValueInput, ScopeWriteOutcome, StoredScopeValue, TickrCtxScopeState,
-    WriteTickrCtxScopeInput, MAX_SCOPE_REQUEST_BYTES, MAX_SCOPE_VALUE_BYTES,
+    CreateTickrCtxScopeInput, DeleteTickrCtxScopeInput, ScopeBoundViolation, ScopeCreationOutcome,
+    ScopeDeleteOutcome, ScopeMutationRejection, ScopeReadOutcome, ScopeStore, ScopeValueInput,
+    ScopeWriteOutcome, StoredScopeValue, TickrCtxScopeState, WriteTickrCtxScopeInput,
+    MAX_SCOPE_REQUEST_BYTES, MAX_SCOPE_VALUE_BYTES,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
@@ -113,6 +117,71 @@ impl TickrCtxEndpointHandle {
 }
 
 #[derive(Clone)]
+pub struct DistributedTickrCtx {
+    handle: TickrCtxEndpointHandle,
+    store: Arc<dyn ScopeStore>,
+    namespace: String,
+}
+
+impl DistributedTickrCtx {
+    pub fn new(
+        handle: TickrCtxEndpointHandle,
+        store: Arc<dyn ScopeStore>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            handle,
+            store,
+            namespace: namespace.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskContextProvider for DistributedTickrCtx {
+    async fn register_task(
+        &self,
+        task: &DispatchedTask,
+    ) -> std::result::Result<HashMap<String, String>, String> {
+        let requested_scope_id = task.workflow_instance_id;
+        let run_id = requested_scope_id.to_string();
+        let claim_id = Uuid::new_v5(&requested_scope_id, b"tickr-distributed-ctx-scope");
+        let scope_id = match self
+            .store
+            .create_tickr_ctx_scope(CreateTickrCtxScopeInput {
+                scope_id: requested_scope_id,
+                namespace: &self.namespace,
+                run_id: &run_id,
+                claim_id,
+                values: &[],
+                now: Utc::now(),
+            })
+            .await
+            .map_err(|error| format!("create distributed tickr-ctx scope: {error}"))?
+        {
+            ScopeCreationOutcome::Created | ScopeCreationOutcome::Idempotent => requested_scope_id,
+            ScopeCreationOutcome::Collision { existing_scope_id } => existing_scope_id,
+            outcome => return Err(format!("create distributed tickr-ctx scope: {outcome:?}")),
+        };
+        let environment = self
+            .handle
+            .register_task(
+                task.task_instance_id.to_string(),
+                self.namespace.clone(),
+                run_id,
+                scope_id,
+            )
+            .await
+            .map_err(|error| format!("register distributed tickr-ctx task: {error}"))?;
+        Ok(environment.variables().into_iter().collect())
+    }
+
+    async fn revoke_task(&self, task_instance_id: Uuid) {
+        self.handle.revoke_task(&task_instance_id.to_string()).await;
+    }
+}
+
+#[derive(Clone)]
 struct TaskGrant {
     task_id: String,
     namespace: String,
@@ -129,12 +198,19 @@ struct ScopeEvent {
 
 pub struct TickrCtxEndpoint {
     listener: UnixListener,
-    data_directory: Arc<DataDirectory>,
-    socket_path: RootRelativePath,
+    cleanup: EndpointCleanup,
     ready: Arc<AtomicBool>,
     grants: Arc<RwLock<HashMap<String, TaskGrant>>>,
     writer: TickrCtxScopeWriterClient,
     events: broadcast::Sender<ScopeEvent>,
+}
+
+enum EndpointCleanup {
+    DataDirectory {
+        data_directory: Arc<DataDirectory>,
+        socket_path: RootRelativePath,
+    },
+    Ephemeral(PathBuf),
 }
 
 impl TickrCtxEndpoint {
@@ -160,26 +236,69 @@ impl TickrCtxEndpoint {
             return Err(error).context("securing root-local tickr-ctx endpoint");
         }
 
+        Ok(Self::from_bound(
+            listener,
+            endpoint,
+            writer,
+            EndpointCleanup::DataDirectory {
+                data_directory,
+                socket_path,
+            },
+        ))
+    }
+
+    /// Bind a process-private task context endpoint after distributed
+    /// ScopeStore reconstruction. Child tasks receive only this socket and an
+    /// ephemeral grant, never Redis credentials.
+    pub fn bind_distributed_after_recovery(
+        writer: TickrCtxScopeWriterClient,
+    ) -> Result<(TickrCtxEndpointHandle, Self)> {
+        let endpoint = std::env::temp_dir().join(format!("tickr-ctx-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&endpoint).with_context(|| {
+            format!(
+                "binding distributed tickr-ctx endpoint at {}",
+                endpoint.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600))
+                .context("securing distributed tickr-ctx endpoint")?;
+        }
+        Ok(Self::from_bound(
+            listener,
+            endpoint.clone(),
+            writer,
+            EndpointCleanup::Ephemeral(endpoint),
+        ))
+    }
+
+    fn from_bound(
+        listener: UnixListener,
+        endpoint: PathBuf,
+        writer: TickrCtxScopeWriterClient,
+        cleanup: EndpointCleanup,
+    ) -> (TickrCtxEndpointHandle, Self) {
         let ready = Arc::new(AtomicBool::new(false));
         let grants = Arc::new(RwLock::new(HashMap::new()));
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let handle = TickrCtxEndpointHandle {
-            endpoint: endpoint.clone(),
+            endpoint,
             ready: ready.clone(),
             grants: grants.clone(),
         };
-        Ok((
+        (
             handle,
             Self {
                 listener,
-                data_directory,
-                socket_path,
+                cleanup,
                 ready,
                 grants,
                 writer,
                 events,
             },
-        ))
+        )
     }
 
     pub async fn run(self, cancel: CancellationToken) -> Result<()> {
@@ -215,9 +334,21 @@ impl TickrCtxEndpoint {
                 }
             }
         }
-        self.data_directory
-            .remove_unix_socket(&self.socket_path)
-            .context("removing root-local tickr-ctx endpoint")?;
+        match &self.cleanup {
+            EndpointCleanup::DataDirectory {
+                data_directory,
+                socket_path,
+            } => data_directory
+                .remove_unix_socket(socket_path)
+                .context("removing root-local tickr-ctx endpoint")?,
+            EndpointCleanup::Ephemeral(endpoint) => {
+                if let Err(error) = fs::remove_file(endpoint) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error).context("removing distributed tickr-ctx endpoint");
+                    }
+                }
+            }
+        }
         result
     }
 }
@@ -522,21 +653,16 @@ pub struct TickrCtxScopeWriterClient {
 }
 
 pub struct TickrCtxScopeWriter {
-    repository: Arc<WriterRepositoryBundle>,
+    store: Arc<dyn ScopeStore>,
     receiver: mpsc::Receiver<WriterRequest>,
 }
 
 impl TickrCtxScopeWriter {
-    pub fn new(
-        repository: Arc<WriterRepositoryBundle>,
-    ) -> (TickrCtxScopeWriterClient, TickrCtxScopeWriter) {
+    pub fn new(store: Arc<dyn ScopeStore>) -> (TickrCtxScopeWriterClient, TickrCtxScopeWriter) {
         let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         (
             TickrCtxScopeWriterClient { sender },
-            TickrCtxScopeWriter {
-                repository,
-                receiver,
-            },
+            TickrCtxScopeWriter { store, receiver },
         )
     }
 
@@ -555,10 +681,7 @@ impl TickrCtxScopeWriter {
     async fn handle(&self, request: WriterRequest) {
         match request {
             WriterRequest::Read { scope_id, reply } => {
-                let result = self
-                    .repository
-                    .read_tickr_ctx_scope(scope_id, Utc::now())
-                    .await;
+                let result = self.store.read_tickr_ctx_scope(scope_id, Utc::now()).await;
                 let _ = reply.send(match result {
                     Ok(ScopeReadOutcome::Present(values)) => Ok(values),
                     Ok(ScopeReadOutcome::Archived(_)) => Err(LocalFailure::ScopeNotWritable {
@@ -586,7 +709,7 @@ impl TickrCtxScopeWriter {
                     envelope: &envelope,
                 }];
                 let result = self
-                    .repository
+                    .store
                     .write_tickr_ctx_scope(WriteTickrCtxScopeInput {
                         scope_id,
                         claim_id,
@@ -616,7 +739,7 @@ impl TickrCtxScopeWriter {
                 reply,
             } => {
                 let result = self
-                    .repository
+                    .store
                     .delete_tickr_ctx_scope_value(DeleteTickrCtxScopeInput {
                         scope_id,
                         claim_id,

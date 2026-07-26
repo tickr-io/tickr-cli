@@ -669,10 +669,7 @@ impl IdentityRecord {
 }
 
 fn profile_name(value: FormationProfile) -> &'static str {
-    match value {
-        FormationProfile::Distributed => "distributed",
-        FormationProfile::TickrLite => "tickr-lite",
-    }
+    value.name()
 }
 
 fn topology_name(value: Topology) -> &'static str {
@@ -713,6 +710,7 @@ fn executor_topology_name(value: ExecutorTopology) -> String {
 fn http_command_ingress_name(value: HttpCommandIngress) -> &'static str {
     match value {
         HttpCommandIngress::Enabled => "enabled",
+        HttpCommandIngress::Disabled => "disabled",
     }
 }
 
@@ -792,7 +790,7 @@ mod tests {
     }
 
     fn spec(configuration_value: &str) -> FormationManifestSpec {
-        let descriptor = resolve_formation(&FormationSelection::tickr_lite()).unwrap();
+        let descriptor = resolve_formation(&FormationSelection::lite_local()).unwrap();
         FormationManifestSpec::new(
             &descriptor,
             SqlMigrationSetIdentity::new(
@@ -990,7 +988,7 @@ mod tests {
 
     #[test]
     fn unknown_protocol_and_schema_identities_are_refused() {
-        let descriptor = resolve_formation(&FormationSelection::tickr_lite()).unwrap();
+        let descriptor = resolve_formation(&FormationSelection::lite_local()).unwrap();
         let error = FormationManifestSpec::new(
             &descriptor,
             SqlMigrationSetIdentity::new(

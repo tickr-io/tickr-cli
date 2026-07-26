@@ -422,6 +422,7 @@ fn archive_scope_entries(
                 "key": key,
                 "envelope": serde_json::from_slice::<Value>(&envelope)
                     .context("decode opaque tickr-ctx envelope for archive response")?,
+                "envelope_bytes": encode_hex(&envelope),
             }))
         })
         .collect::<Result<Vec<_>>>()
@@ -448,6 +449,16 @@ fn validate_streams(
             "local log stream inventory does not match archived task instances"
         ))
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Vec::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)]);
+        encoded.push(HEX[usize::from(byte & 0x0f)]);
+    }
+    String::from_utf8(encoded).expect("hex alphabet is valid UTF-8")
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -477,7 +488,7 @@ mod tests {
     use tickr_proto::instance::SnapshotTaskInstance;
 
     use super::*;
-    use crate::local_log_staging::{LogExit, LogRecordIdentity};
+    use crate::local_log_staging::{LogExit, LogRecordIdentity, LogRecordSubmission};
 
     const TEST_ENVELOPE: &[u8] = br#"{"v":2,"type":"string","value":"terminal-value","secret":false,"producer":{"kind":"task","task_id":"task-7","task_name":"extract"},"created_at":"2026-07-22T00:00:00Z","sha256":"lineage-a"}"#;
 
@@ -661,13 +672,13 @@ mod tests {
             pickup_generation: claim.pickup_generation.try_into().unwrap(),
         };
         let mut log = LocalLogStagingStream::open(&data_directory, stream.clone()).unwrap();
-        log.accept(
+        log.accept(LogRecordSubmission::new(
             LogRecordIdentity {
                 stream: stream.clone(),
                 sequence: 0,
             },
             b"failure evidence".to_vec(),
-        )
+        ))
         .unwrap();
         log.finish_cleanly(LogExit::Status(1)).unwrap();
         drop(log);
@@ -1125,7 +1136,7 @@ mod tests {
                 fs::set_permissions(journal, fs::Permissions::from_mode(0o000)).unwrap();
             }
             Corruption::CorruptLog => {
-                let mut bytes = b"tickr-local-log-v1\n".to_vec();
+                let mut bytes = b"tickr-local-log-v2\n".to_vec();
                 bytes.extend_from_slice(&5_u32.to_le_bytes());
                 bytes.extend_from_slice(b"xxxxx");
                 fs::write(journal, bytes).unwrap();

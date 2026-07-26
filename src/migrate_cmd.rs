@@ -73,7 +73,7 @@ pub async fn run(formation: MigrationFormation) -> Result<()> {
             verify_sqlite_current(MigrationTarget::Conductor, &pool).await?;
             verify_sqlite_schema(&pool).await?;
             if formation == MigrationFormation::TickrLite {
-                let descriptor = resolve_formation(&FormationSelection::tickr_lite())
+                let descriptor = resolve_formation(&FormationSelection::lite_local())
                     .context("resolving the Tickr Lite formation")?;
                 let spec = tickr_lite_manifest_spec(&descriptor, &url, &sqlite_relative)?;
                 install_or_verify_formation_manifest(

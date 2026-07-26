@@ -124,6 +124,18 @@ impl WriterRepositoryBundle {
         }
     }
 
+    /// Read committed run enrichment through the writer bundle so an
+    /// idempotent Compaction redelivery can verify an already-cleaned scope.
+    pub async fn archive_run_info(
+        &self,
+        workflow_instance_id: Uuid,
+    ) -> Result<Option<ArchiveRunInfo>, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(pool) => run_info_postgres(pool, workflow_instance_id).await,
+            BackendPool::Sqlite(pool) => run_info_sqlite(pool, workflow_instance_id).await,
+        }
+    }
+
     /// Archive a staged Tickr Lite Compaction and mark its staging record
     /// complete in the same SQLite transaction. The caller may only purge
     /// logs, scope values, and envelope bytes after this returns successfully.

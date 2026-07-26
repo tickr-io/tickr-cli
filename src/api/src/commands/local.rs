@@ -6,9 +6,9 @@
 
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use prost::Message as _;
+use tickr_proto::coord::command_bus::{CommandRequestMetadata, DEFAULT_MAX_PAYLOAD_BYTES};
 use tickr_proto::tickr_api::{ApiCommandRequest, ApiCommandResponse};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -26,16 +26,16 @@ impl Default for LocalCommandBusConfig {
     fn default() -> Self {
         Self {
             capacity: NonZeroUsize::new(64).expect("non-zero constant"),
-            // Matches the ordinary NATS server default. The selected value is
-            // explicit so a formation can fingerprint a different hard limit.
-            max_payload_bytes: NonZeroUsize::new(1024 * 1024).expect("non-zero constant"),
+            max_payload_bytes: NonZeroUsize::new(DEFAULT_MAX_PAYLOAD_BYTES)
+                .expect("non-zero constant"),
         }
     }
 }
 
 struct LocalRequest {
+    metadata: CommandRequestMetadata,
     payload: Vec<u8>,
-    reply: oneshot::Sender<Vec<u8>>,
+    reply: oneshot::Sender<Result<Vec<u8>, BusError>>,
 }
 
 /// Cloneable API-side handle for one local Command writer.
@@ -70,26 +70,27 @@ impl LocalCommandBus {
     pub(crate) async fn request(
         &self,
         request: ApiCommandRequest,
-        deadline: Duration,
+        metadata: CommandRequestMetadata,
     ) -> Result<ApiCommandResponse, BusError> {
         let payload = request.encode_to_vec();
         if payload.len() > self.max_payload_bytes {
             return Err(BusError::TooLarge);
         }
+        let timeout = metadata.remaining().ok_or(BusError::Timeout)?;
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .try_send(LocalRequest {
+                metadata,
+                payload,
+                reply,
+            })
+            .map_err(|_| BusError::Unavailable)?;
 
-        let round_trip = async {
-            let (reply, response) = oneshot::channel();
-            self.sender
-                .send(LocalRequest { payload, reply })
-                .await
-                .map_err(|_| BusError::Unavailable)?;
-            let bytes = response.await.map_err(|_| BusError::Unavailable)?;
-            ApiCommandResponse::decode(bytes.as_slice()).map_err(|_| BusError::Malformed)
-        };
-
-        tokio::time::timeout(deadline, round_trip)
+        let bytes = tokio::time::timeout(timeout, response)
             .await
             .map_err(|_| BusError::Timeout)?
+            .map_err(|_| BusError::Unavailable)??;
+        ApiCommandResponse::decode(bytes.as_slice()).map_err(|_| BusError::Malformed)
     }
 }
 
@@ -107,11 +108,12 @@ impl LocalCommandWriter {
                 _ = cancel.cancelled() => break,
                 request = self.receiver.recv() => {
                     let Some(request) = request else { break };
+                    if request.metadata.is_expired() {
+                        let _ = request.reply.send(Err(BusError::Timeout));
+                        continue;
+                    }
                     let response = handler(request.payload).await;
-                    // A timed-out or cancelled API caller drops its receiver.
-                    // The mutation has already reached the writer; completing
-                    // it and discarding the late reply preserves bus semantics.
-                    let _ = request.reply.send(response);
+                    let _ = request.reply.send(Ok(response));
                 }
             }
         }
@@ -123,11 +125,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tickr_proto::tickr_api as api;
     use tickr_proto::tickr_api::{
         api_command_request, api_command_response, CancelRequest, ErrorPayload, PatchRequest,
         PingPayload, PingRequest, RegisterRequest, ReplayRequest, TriggerRequest, WakeupRequest,
     };
+
+    fn metadata(deadline: Duration) -> CommandRequestMetadata {
+        CommandRequestMetadata::new(uuid::Uuid::new_v4(), deadline)
+    }
 
     fn request_bodies() -> Vec<api_command_request::Body> {
         vec![
@@ -227,7 +234,7 @@ mod tests {
                 let response = local
                     .request(
                         ApiCommandRequest { body: Some(body) },
-                        Duration::from_secs(1),
+                        metadata(Duration::from_secs(1)),
                     )
                     .await
                     .unwrap();
@@ -258,7 +265,10 @@ mod tests {
         drop(writer);
         assert!(matches!(
             unavailable
-                .request(ApiCommandRequest::default(), Duration::from_secs(1))
+                .request(
+                    ApiCommandRequest::default(),
+                    metadata(Duration::from_secs(1))
+                )
                 .await,
             Err(BusError::Unavailable)
         ));
@@ -271,7 +281,10 @@ mod tests {
         }));
         assert!(matches!(
             timed_out
-                .request(ApiCommandRequest::default(), Duration::from_millis(10))
+                .request(
+                    ApiCommandRequest::default(),
+                    metadata(Duration::from_millis(10))
+                )
                 .await,
             Err(BusError::Timeout)
         ));
@@ -283,7 +296,10 @@ mod tests {
         let task = tokio::spawn(writer.run(cancel.clone(), |_| async { vec![0xff] }));
         assert!(matches!(
             malformed
-                .request(ApiCommandRequest::default(), Duration::from_secs(1))
+                .request(
+                    ApiCommandRequest::default(),
+                    metadata(Duration::from_secs(1))
+                )
                 .await,
             Err(BusError::Malformed)
         ));
@@ -298,7 +314,9 @@ mod tests {
             })),
         };
         assert!(matches!(
-            too_large.request(request, Duration::from_secs(1)).await,
+            too_large
+                .request(request, metadata(Duration::from_secs(1)))
+                .await,
             Err(BusError::TooLarge)
         ));
     }
@@ -328,7 +346,10 @@ mod tests {
         }));
 
         let unsupported = local
-            .request(ApiCommandRequest::default(), Duration::from_secs(1))
+            .request(
+                ApiCommandRequest::default(),
+                metadata(Duration::from_secs(1)),
+            )
             .await
             .unwrap();
         assert_eq!(unsupported.status_code, 501);
@@ -341,7 +362,7 @@ mod tests {
                         ApiCommandRequest {
                             body: Some(api_command_request::Body::Ping(PingRequest {})),
                         },
-                        Duration::from_secs(1),
+                        metadata(Duration::from_secs(1)),
                     )
                     .await
             })
@@ -354,7 +375,7 @@ mod tests {
                 ApiCommandRequest {
                     body: Some(api_command_request::Body::Ping(PingRequest {})),
                 },
-                Duration::from_secs(1),
+                metadata(Duration::from_secs(1)),
             )
             .await
             .unwrap();

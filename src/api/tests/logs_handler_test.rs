@@ -23,12 +23,17 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use opendal::{services::Memory, Operator};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
-use tickr_api::http::logs_resolver::{
-    exit_sidecar_key, log_subject, minio_object_key, LogsError, LogsResolver,
+use tickr_api::http::logs_resolver::{exit_sidecar_key, minio_object_key, LogsError, LogsResolver};
+use tickr_executor::log_stream::{
+    AllNatsLogStream, AllNatsLogStreamProvider, LogStream, LogStreamProvider, LogStreamRoute,
+};
+use tickr_proto::coord::log_stream::{
+    LogExit, LogRecordIdentity, LogRecordSubmission, LogStreamIdentity,
 };
 use uuid::Uuid;
 
@@ -71,12 +76,51 @@ async fn start_nats_with_jetstream() -> Option<(
 async fn create_log_stream(nats: &async_nats::Client) {
     let js = jetstream::new(nats.clone());
     js.get_or_create_stream(jetstream::stream::Config {
-        name: "tickr_task_logs".to_string(),
-        subjects: vec!["logs.>".to_string()],
+        name: tickr_proto::coord::all_nats::LOG_STREAM.to_string(),
+        subjects: vec![tickr_proto::coord::all_nats::LOG_STREAM_SUBJECTS.to_string()],
         ..Default::default()
     })
     .await
     .expect("create log staging stream");
+}
+
+fn log_stream_provider(nats: &async_nats::Client) -> Arc<dyn LogStreamProvider> {
+    Arc::new(AllNatsLogStreamProvider::new(
+        Arc::new(nats.clone()),
+        Duration::from_secs(2),
+    ))
+}
+
+async fn open_log_stream(
+    nats: &async_nats::Client,
+    workflow_id: Uuid,
+    workflow_instance_id: Uuid,
+    task_instance_id: Uuid,
+) -> Result<AllNatsLogStream, Box<dyn std::error::Error>> {
+    Ok(AllNatsLogStream::open(
+        Arc::new(jetstream::new(nats.clone())),
+        LogStreamRoute {
+            workflow_id,
+            workflow_instance_id,
+            task_instance_id,
+        },
+        LogStreamIdentity {
+            task_instance_id,
+            pickup_generation: 1,
+        },
+        Duration::from_secs(2),
+    )
+    .await?)
+}
+
+fn submission(stream: &AllNatsLogStream, sequence: u64, bytes: Vec<u8>) -> LogRecordSubmission {
+    LogRecordSubmission::new(
+        LogRecordIdentity {
+            stream: stream.identity().clone(),
+            sequence,
+        },
+        bytes,
+    )
 }
 
 fn gzip(plain: &[u8]) -> Vec<u8> {
@@ -102,7 +146,7 @@ async fn minio_hit_returns_decompressed_bytes() -> Result<(), Box<dyn std::error
     let key = minio_object_key(wf, wi, ti);
     minio.write(&key, gzip(plain)).await?;
 
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
     let logs = resolver.fetch_task_logs(wf, wi, ti).await?;
     assert_eq!(
         logs.content, plain,
@@ -128,21 +172,19 @@ async fn nats_hit_when_minio_misses() -> Result<(), Box<dyn std::error::Error>> 
     let wi = Uuid::new_v4();
     let ti = Uuid::new_v4();
 
-    // Publish three batches onto the task's log subject, in order.
-    let js = jetstream::new(nats.clone());
-    let subject = log_subject(wf, wi, ti);
+    let mut stream = open_log_stream(&nats, wf, wi, ti).await?;
     let batches = [
         b"first\n".to_vec(),
         b"second\n".to_vec(),
         b"third\n".to_vec(),
     ];
-    for batch in &batches {
-        js.publish(subject.clone(), batch.clone().into())
-            .await?
+    for (sequence, batch) in batches.iter().enumerate() {
+        stream
+            .accept(submission(&stream, sequence as u64, batch.clone()))
             .await?;
     }
 
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
     let logs = resolver.fetch_task_logs(wf, wi, ti).await?;
     let expected: Vec<u8> = batches.iter().flatten().copied().collect();
     assert_eq!(
@@ -170,22 +212,13 @@ async fn live_marker_reported_and_excluded_from_content() -> Result<(), Box<dyn 
     let wi = Uuid::new_v4();
     let ti = Uuid::new_v4();
 
-    let js = jetstream::new(nats.clone());
-    let subject = log_subject(wf, wi, ti);
-    js.publish(subject.clone(), b"the only line\n".to_vec().into())
-        .await?
+    let mut stream = open_log_stream(&nats, wf, wi, ti).await?;
+    stream
+        .accept(submission(&stream, 0, b"the only line\n".to_vec()))
         .await?;
+    stream.finish_cleanly(LogExit::Status(2)).await?;
 
-    // Publish the End-of-stream marker the way the executor does: header-
-    // tagged, empty payload, exit status in headers.
-    let mut headers = async_nats::HeaderMap::new();
-    headers.insert("Tickr-Log-Marker", "end-of-stream");
-    headers.insert("Tickr-Exit-Status", "2");
-    js.publish_with_headers(subject.clone(), headers, Default::default())
-        .await?
-        .await?;
-
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
     let logs = resolver.fetch_task_logs(wf, wi, ti).await?;
     assert_eq!(
         logs.content, b"the only line\n",
@@ -209,15 +242,17 @@ async fn cursor_reads_return_only_new_batches() -> Result<(), Box<dyn std::error
     let wi = Uuid::new_v4();
     let ti = Uuid::new_v4();
 
-    let js = jetstream::new(nats.clone());
-    let subject = log_subject(wf, wi, ti);
-    for batch in [b"one\n".as_slice(), b"two\n", b"three\n"] {
-        js.publish(subject.clone(), batch.to_vec().into())
-            .await?
+    let mut stream = open_log_stream(&nats, wf, wi, ti).await?;
+    for (sequence, batch) in [b"one\n".as_slice(), b"two\n", b"three\n"]
+        .into_iter()
+        .enumerate()
+    {
+        stream
+            .accept(submission(&stream, sequence as u64, batch.to_vec()))
             .await?;
     }
 
-    let resolver = LogsResolver::new(minio, nats.clone());
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
 
     // First poll from sequence 0 sees everything, with advancing sequences.
     let page = resolver.fetch_batches_after(wf, wi, ti, 0).await?;
@@ -236,15 +271,10 @@ async fn cursor_reads_return_only_new_batches() -> Result<(), Box<dyn std::error
 
     // New content plus the marker land past the cursor; the next poll sees
     // exactly them — never the already-shipped batches.
-    js.publish(subject.clone(), b"four\n".to_vec().into())
-        .await?
+    stream
+        .accept(submission(&stream, 3, b"four\n".to_vec()))
         .await?;
-    let mut headers = async_nats::HeaderMap::new();
-    headers.insert("Tickr-Log-Marker", "end-of-stream");
-    headers.insert("Tickr-Exit-Status", "0");
-    js.publish_with_headers(subject.clone(), headers, Default::default())
-        .await?
-        .await?;
+    stream.finish_cleanly(LogExit::Status(0)).await?;
 
     let page = resolver.fetch_batches_after(wf, wi, ti, cursor).await?;
     assert_eq!(page.batches.len(), 1, "only the batch after the cursor");
@@ -271,15 +301,14 @@ async fn tail_reads_page_backwards() -> Result<(), Box<dyn std::error::Error>> {
     let wi = Uuid::new_v4();
     let ti = Uuid::new_v4();
 
-    let js = jetstream::new(nats.clone());
-    let subject = log_subject(wf, wi, ti);
+    let mut stream = open_log_stream(&nats, wf, wi, ti).await?;
     for i in 1..=5u8 {
-        js.publish(subject.clone(), vec![b'0' + i, b'\n'].into())
-            .await?
+        stream
+            .accept(submission(&stream, u64::from(i - 1), vec![b'0' + i, b'\n']))
             .await?;
     }
 
-    let resolver = LogsResolver::new(minio, nats.clone());
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
 
     // Tail of 2 → the last two batches, with earlier content flagged.
     let page = resolver.fetch_tail(wf, wi, ti, 2, None).await?;
@@ -338,7 +367,7 @@ async fn archived_marker_reported_from_sidecar() -> Result<(), Box<dyn std::erro
         )
         .await?;
 
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
     let logs = resolver.fetch_task_logs(wf, wi, ti).await?;
     assert_eq!(logs.content, plain);
     let marker = logs.marker.expect("sidecar marker must be reported");
@@ -371,7 +400,7 @@ async fn archived_marker_without_blob_is_not_a_404() -> Result<(), Box<dyn std::
         )
         .await?;
 
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
     let logs = resolver.fetch_task_logs(wf, wi, ti).await?;
     assert!(logs.content.is_empty(), "no blob → empty content");
     assert_eq!(logs.marker.expect("marker").exit_status, 0);
@@ -387,7 +416,7 @@ async fn returns_not_found_when_both_stores_empty() -> Result<(), Box<dyn std::e
     create_log_stream(&nats).await;
 
     let minio = memory_operator(); // empty
-    let resolver = LogsResolver::new(minio, nats);
+    let resolver = LogsResolver::new(minio, log_stream_provider(&nats));
 
     let err = resolver
         .fetch_task_logs(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())

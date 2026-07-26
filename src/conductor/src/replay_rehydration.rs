@@ -73,10 +73,9 @@ pub const HYDRATION_SENTINEL_KEY: &str = "tickr_replay/hydrated";
 /// in practice; this only bounds a corrupt self-referential provenance.
 const MAX_CHAIN_DEPTH: usize = 4096;
 
-/// One archived ctx entry from a run's terminal dump
-/// (`workflow_run_info.ctx_envelope`): the full NATS key `<run>/<name>` and the
-/// raw envelope JSON. On carry the raw JSON is serialized **verbatim** — the
-/// envelope is never rebuilt through `Envelope::new`.
+/// One archived ctx entry from a run's terminal dump. The parsed envelope is
+/// used only for lineage checks; `envelope_bytes` is the exact accepted payload
+/// copied during rehydration.
 #[derive(Debug, Clone)]
 pub struct ArchivedCtxEntry {
     /// The full run-scoped key as archived, `<sanitized_run_id>/<name>`.
@@ -84,6 +83,7 @@ pub struct ArchivedCtxEntry {
     /// The envelope as archived (opaque JSON — read for its `producer`, copied
     /// verbatim on carry).
     pub envelope: serde_json::Value,
+    pub envelope_bytes: Vec<u8>,
 }
 
 /// One archived task-instance row, reduced to the two facts producer
@@ -289,7 +289,7 @@ pub fn plan_rehydration(
                         // Copy the archived envelope bytes verbatim; rebuilding
                         // through `Envelope::new` would stamp a fresh
                         // created_at/sha and launder the producer.
-                        let bytes = serde_json::to_vec(&entry.envelope).unwrap_or_default();
+                        let bytes = entry.envelope_bytes.clone();
                         carried.push(CarriedKey { name, bytes });
                     }
                     // Producing HyperNode outside the set → absent (the task
@@ -429,7 +429,7 @@ fn build_sentinel_envelope(
 /// Mirrors the graph-mirror writer so carried keys land in the executor's
 /// bucket.
 async fn get_or_create_ctx_bucket(js: &jetstream::Context) -> Result<jetstream::kv::Store> {
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     match js.get_key_value(&bucket_name).await {
         Ok(kv) => Ok(kv),
         Err(_) => js
@@ -604,9 +604,11 @@ mod tests {
     }
 
     fn entry(run: Uuid, name: &str, envelope: serde_json::Value) -> ArchivedCtxEntry {
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         ArchivedCtxEntry {
             key: format!("{}/{}", sanitize_segment(&run.to_string()), name),
             envelope,
+            envelope_bytes,
         }
     }
 

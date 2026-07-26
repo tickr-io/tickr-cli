@@ -20,7 +20,9 @@ use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_conductor::proto::{ConductorRelayMessage, EntityType};
-use tickr_conductor::relay::{ensure_task_dispatch_stream, publish_dispatch_and_deliver};
+use tickr_conductor::relay::{
+    ensure_task_dispatch_stream, publish_dispatch_and_deliver, NatsTaskDispatchPublisher,
+};
 use tickr_proto::coord::TASK_DISPATCH_STREAM;
 use tickr_proto::task as tc;
 use tickr_proto::workflow as wf;
@@ -109,13 +111,14 @@ async fn delivered_is_emitted_only_after_the_publish_ack() {
     ensure_task_dispatch_stream(&nats)
         .await
         .expect("ensure dispatch stream");
+    let task_dispatch = NatsTaskDispatchPublisher::new(&nats);
 
     let (task_instance_id, task_id, workflow_instance_id, workflow_id) = fresh_dispatch_ids();
     let payload = encode_dispatch(task_instance_id, task_id, workflow_instance_id, workflow_id);
 
     let (tx, mut rx) = mpsc::channel::<ConductorRelayMessage>(4);
     publish_dispatch_and_deliver(
-        &nats,
+        &task_dispatch,
         &tx,
         payload,
         task_instance_id,

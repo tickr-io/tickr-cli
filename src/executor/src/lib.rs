@@ -2,6 +2,8 @@ pub mod app;
 // pub mod client;     // Commented out - missing proto definitions
 pub mod component_liveness;
 pub mod local_pickup;
+pub mod log_stream;
+pub mod nats_pickup;
 pub mod self_reaping_key;
 pub mod task_handler;
 pub mod task_liveness;

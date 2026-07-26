@@ -251,6 +251,10 @@ test *args:
     docker info >/dev/null
     scripts/test_with_isolated_postgres.sh {{args}}
 
+# Run the complete supportability evidence against disposable external services.
+all-redis-release-gate:
+    scripts/all_redis_release_gate.sh
+
 dsl-check file:
     nickel export {{file}} --format json -I dsl
 

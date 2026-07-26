@@ -27,8 +27,13 @@ use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_conductor::proto::{ConductorRelayMessage, EntityType};
-use tickr_conductor::relay::{drain_task_events, task_event_consumer};
-use tickr_proto::coord::{TASK_EVENT_CONSUMER, TASK_EVENT_STREAM, TASK_EVENT_SUBJECT};
+use tickr_conductor::relay::{
+    cancel_ack_consumer, drain_cancel_acks, drain_task_events, task_event_consumer,
+};
+use tickr_proto::coord::{
+    TASK_CANCEL_ACK_CONSUMER, TASK_CANCEL_ACK_STREAM, TASK_CANCEL_ACK_SUBJECT, TASK_EVENT_CONSUMER,
+    TASK_EVENT_STREAM, TASK_EVENT_SUBJECT,
+};
 use tickr_proto::task as tc;
 use tickr_proto::workflow as wf;
 use tokio::sync::mpsc;
@@ -102,7 +107,7 @@ async fn seed_ctx_output(nats: &async_nats::Client, run_id: Uuid, task_instance_
     let js = jetstream::new(nats.clone());
     let kv = js
         .create_key_value(jetstream::kv::Config {
-            bucket: "ctx-default".to_string(),
+            bucket: tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET.to_string(),
             ..Default::default()
         })
         .await
@@ -290,6 +295,99 @@ async fn durable_consumer_redelivers_on_unack_then_acks_on_forward_with_enrichme
         "forwarded event must be acked and removed from the queue"
     );
 
+    token.cancel();
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_ack_redelivers_after_forwarder_death_and_acks_on_forward() {
+    let Some((_nats_c, nats)) = start_nats().await else {
+        return;
+    };
+    let js = jetstream::new(nats.clone());
+    let stream = js
+        .get_or_create_stream(jetstream::stream::Config {
+            name: TASK_CANCEL_ACK_STREAM.to_owned(),
+            subjects: vec![TASK_CANCEL_ACK_SUBJECT.to_owned()],
+            retention: jetstream::stream::RetentionPolicy::WorkQueue,
+            ..Default::default()
+        })
+        .await
+        .expect("create cancellation acknowledgement stream");
+    stream
+        .get_or_create_consumer(
+            TASK_CANCEL_ACK_CONSUMER,
+            jetstream::consumer::pull::Config {
+                durable_name: Some(TASK_CANCEL_ACK_CONSUMER.to_owned()),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create cancellation acknowledgement consumer");
+    let acknowledgement = tc::CancelTaskAck {
+        task_instance_id: Uuid::new_v4().to_string(),
+        workflow_instance_id: Uuid::new_v4().to_string(),
+        outcome: tc::KillOutcome::Killed as i32,
+    }
+    .encode_to_vec();
+    js.publish(TASK_CANCEL_ACK_SUBJECT, acknowledgement.clone().into())
+        .await
+        .expect("publish cancellation acknowledgement")
+        .await
+        .expect("prove cancellation acknowledgement publish");
+
+    let failed_consumer = cancel_ack_consumer(&nats)
+        .await
+        .expect("open failed forwarder consumer");
+    let (closed_tx, closed_rx) = mpsc::channel::<ConductorRelayMessage>(1);
+    drop(closed_rx);
+    drain_cancel_acks(failed_consumer, closed_tx, CancellationToken::new()).await;
+
+    let consumer = cancel_ack_consumer(&nats)
+        .await
+        .expect("reopen cancellation acknowledgement consumer");
+    let (relay_tx, mut relay_rx) = mpsc::channel(1);
+    let token = CancellationToken::new();
+    let drain_token = token.clone();
+    let handle = tokio::spawn(async move {
+        drain_cancel_acks(consumer, relay_tx, drain_token).await;
+    });
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), relay_rx.recv())
+        .await
+        .expect("redelivered cancellation acknowledgement did not forward")
+        .expect("relay channel closed");
+    assert_eq!(
+        forwarded.entity_type,
+        EntityType::CancelTaskAck as i32,
+        "forwarding preserves the existing relay entity type"
+    );
+    assert_eq!(forwarded.payload, acknowledgement);
+
+    let mut removed = false;
+    for _ in 0..40 {
+        let mut stream = js
+            .get_stream(TASK_CANCEL_ACK_STREAM)
+            .await
+            .expect("get cancellation acknowledgement stream");
+        if stream
+            .info()
+            .await
+            .expect("read stream info")
+            .state
+            .messages
+            == 0
+        {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        removed,
+        "acknowledgement is removed only after relay forward"
+    );
     token.cancel();
     let _ = handle.await;
 }

@@ -5,11 +5,23 @@ const COORDINATION_ROLE_COUNT: usize = 13;
 /// A named Data-plane formation profile.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FormationProfile {
-    /// The existing independently deployed component formation.
+    /// The default distributed all-NATS formation.
     #[default]
-    Distributed,
+    AllNats,
     /// The explicit single-node Tickr Lite formation.
-    TickrLite,
+    LiteLocal,
+    /// The explicit distributed all-Redis formation.
+    AllRedis,
+}
+
+impl FormationProfile {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AllNats => "all-nats",
+            Self::LiteLocal => "lite-local",
+            Self::AllRedis => "all-redis",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +57,7 @@ pub enum ExecutorTopology {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpCommandIngress {
     Enabled,
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +213,7 @@ pub struct FormationSelection {
     pub writer_topology: Option<WriterTopology>,
     pub executor_count: Option<u16>,
     pub choreography: Option<ChoreographyCapabilities>,
+    pub http_commands: Option<HttpCommandIngress>,
     role_overrides: [Option<RoleOverride>; COORDINATION_ROLE_COUNT],
 }
 
@@ -213,15 +227,30 @@ impl Default for FormationSelection {
             writer_topology: None,
             executor_count: None,
             choreography: None,
+            http_commands: None,
             role_overrides: [None; COORDINATION_ROLE_COUNT],
         }
     }
 }
 
 impl FormationSelection {
-    pub fn tickr_lite() -> Self {
+    pub fn all_nats() -> Self {
         Self {
-            profile: Some(FormationProfile::TickrLite),
+            profile: Some(FormationProfile::AllNats),
+            ..Self::default()
+        }
+    }
+
+    pub fn lite_local() -> Self {
+        Self {
+            profile: Some(FormationProfile::LiteLocal),
+            ..Self::default()
+        }
+    }
+
+    pub fn all_redis() -> Self {
+        Self {
+            profile: Some(FormationProfile::AllRedis),
             ..Self::default()
         }
     }
@@ -258,9 +287,13 @@ pub enum FormationAdmissionError {
         expected: WriterTopology,
         actual: WriterTopology,
     },
-    InvalidExecutorCount {
-        expected: u16,
-        actual: u16,
+    IncompatibleExecutorTopology {
+        expected: ExecutorTopology,
+        actual: ExecutorTopology,
+    },
+    IncompatibleHttpCommandIngress {
+        expected: HttpCommandIngress,
+        actual: HttpCommandIngress,
     },
     IncompatibleRole {
         role: CoordinationRole,
@@ -306,9 +339,13 @@ impl fmt::Display for FormationAdmissionError {
                 formatter,
                 "formation requires {expected:?} writer topology, got {actual:?}"
             ),
-            Self::InvalidExecutorCount { expected, actual } => write!(
+            Self::IncompatibleExecutorTopology { expected, actual } => write!(
                 formatter,
-                "formation requires exactly {expected} Executor, got {actual}"
+                "formation requires {expected:?} Executor topology, got {actual:?}"
+            ),
+            Self::IncompatibleHttpCommandIngress { expected, actual } => write!(
+                formatter,
+                "formation requires {expected:?} HTTP Command ingress, got {actual:?}"
             ),
             Self::IncompatibleRole {
                 role,
@@ -354,48 +391,37 @@ pub fn resolve_formation(
     let profile = selection.profile.unwrap_or_default();
     let expected = profile_descriptor(profile);
 
-    let sql = selection.sql.unwrap_or(expected.sql);
-    if profile == FormationProfile::TickrLite {
-        require_equal_sql(expected.sql, sql)?;
-    }
+    let topology = selection.topology.unwrap_or(expected.topology);
+    require_equal_topology(expected.topology, topology)?;
 
-    let expected_topology = match (profile, sql) {
-        (FormationProfile::Distributed, SqlImplementation::Sqlite) => Topology::SingleNode,
-        _ => expected.topology,
-    };
-    let topology = selection.topology.unwrap_or(expected_topology);
-    require_equal_topology(expected_topology, topology)?;
+    let sql = selection.sql.unwrap_or(expected.sql);
+    require_equal_sql(expected.sql, sql)?;
 
     let final_logs = selection.final_logs.unwrap_or(expected.final_logs);
     require_equal_final_logs(expected.final_logs, final_logs)?;
 
-    let expected_writer_topology = match (profile, sql) {
-        (FormationProfile::Distributed, SqlImplementation::Sqlite) => {
-            WriterTopology::ConductorOwned
-        }
-        _ => expected.writer_topology,
-    };
     let writer_topology = selection
         .writer_topology
-        .unwrap_or(expected_writer_topology);
-    require_equal_writer_topology(expected_writer_topology, writer_topology)?;
+        .unwrap_or(expected.writer_topology);
+    require_equal_writer_topology(expected.writer_topology, writer_topology)?;
 
-    let executors = match expected.executors {
-        ExecutorTopology::DistributedFleet => match selection.executor_count {
-            Some(count) => ExecutorTopology::Exactly(count),
-            None => ExecutorTopology::DistributedFleet,
-        },
-        ExecutorTopology::Exactly(expected_count) => {
-            let actual = selection.executor_count.unwrap_or(expected_count);
-            if actual != expected_count {
-                return Err(FormationAdmissionError::InvalidExecutorCount {
-                    expected: expected_count,
-                    actual,
-                });
-            }
-            ExecutorTopology::Exactly(actual)
-        }
-    };
+    let executors = selection
+        .executor_count
+        .map_or(expected.executors, ExecutorTopology::Exactly);
+    if executors != expected.executors {
+        return Err(FormationAdmissionError::IncompatibleExecutorTopology {
+            expected: expected.executors,
+            actual: executors,
+        });
+    }
+
+    let http_commands = selection.http_commands.unwrap_or(expected.http_commands);
+    if http_commands != expected.http_commands {
+        return Err(FormationAdmissionError::IncompatibleHttpCommandIngress {
+            expected: expected.http_commands,
+            actual: http_commands,
+        });
+    }
 
     let choreography = selection.choreography.unwrap_or(expected.choreography);
     for capability in [
@@ -412,23 +438,19 @@ pub fn resolve_formation(
     for (index, role) in resolved_roles.iter_mut().enumerate() {
         *role = resolve_role(profile, *role, selection.role_overrides[index])?;
     }
-    let roles = ResolvedCoordinationRoles {
-        roles: resolved_roles,
-    };
 
     Ok(ResolvedFormationDescriptor {
         profile,
         topology,
         sql,
-        sql_migration_identity: match sql {
-            SqlImplementation::Postgres => ProtocolIdentity::new("tickr.postgres-migrations", 1),
-            SqlImplementation::Sqlite => ProtocolIdentity::new("tickr.sqlite-migrations", 1),
-        },
+        sql_migration_identity: expected.sql_migration_identity,
         final_logs,
         writer_topology,
         executors,
-        http_commands: HttpCommandIngress::Enabled,
-        roles,
+        http_commands,
+        roles: ResolvedCoordinationRoles {
+            roles: resolved_roles,
+        },
         choreography,
     })
 }
@@ -444,7 +466,7 @@ fn resolve_role(
         .unwrap_or(expected.implementation);
 
     if implementation != expected.implementation {
-        if profile == FormationProfile::TickrLite && expected.role == CoordinationRole::EventIngress
+        if profile == FormationProfile::LiteLocal && expected.role == CoordinationRole::EventIngress
         {
             return Err(FormationAdmissionError::ExternalEventIngressEnabled {
                 actual: implementation,
@@ -527,7 +549,7 @@ fn require_equal_writer_topology(
 
 fn profile_descriptor(profile: FormationProfile) -> ResolvedFormationDescriptor {
     let (topology, sql, migration, final_logs, writer_topology, executors) = match profile {
-        FormationProfile::Distributed => (
+        FormationProfile::AllNats => (
             Topology::Distributed,
             SqlImplementation::Postgres,
             ProtocolIdentity::new("tickr.postgres-migrations", 1),
@@ -535,13 +557,21 @@ fn profile_descriptor(profile: FormationProfile) -> ResolvedFormationDescriptor 
             WriterTopology::Distributed,
             ExecutorTopology::DistributedFleet,
         ),
-        FormationProfile::TickrLite => (
+        FormationProfile::LiteLocal => (
             Topology::SingleNode,
             SqlImplementation::Sqlite,
             ProtocolIdentity::new("tickr.sqlite-migrations", 1),
             FinalLogStore::LocalFiles,
             WriterTopology::ConductorOwned,
             ExecutorTopology::Exactly(1),
+        ),
+        FormationProfile::AllRedis => (
+            Topology::Distributed,
+            SqlImplementation::Postgres,
+            ProtocolIdentity::new("tickr.postgres-migrations", 1),
+            FinalLogStore::ObjectStore,
+            WriterTopology::Distributed,
+            ExecutorTopology::DistributedFleet,
         ),
     };
 
@@ -564,8 +594,9 @@ fn profile_roles(profile: FormationProfile) -> ResolvedCoordinationRoles {
         roles: array::from_fn(|index| {
             let role = ALL_COORDINATION_ROLES[index];
             let implementation = match profile {
-                FormationProfile::Distributed => RoleImplementation::NatsJetStream,
-                FormationProfile::TickrLite => match role {
+                FormationProfile::AllNats => RoleImplementation::NatsJetStream,
+                FormationProfile::AllRedis => RoleImplementation::Redis,
+                FormationProfile::LiteLocal => match role {
                     CoordinationRole::CommandBus => RoleImplementation::LocalRequestReply,
                     CoordinationRole::LogStaging => RoleImplementation::LocalJournal,
                     CoordinationRole::SignalAppliedNotifier => {
@@ -595,213 +626,330 @@ fn profile_roles(profile: FormationProfile) -> ResolvedCoordinationRoles {
 
 fn protocol_identity(profile: FormationProfile, role: CoordinationRole) -> ProtocolIdentity {
     let name = match (profile, role) {
-        (FormationProfile::Distributed, CoordinationRole::CommandBus) => {
-            "tickr.command-bus.nats-request-reply"
+        (FormationProfile::AllNats, CoordinationRole::CommandBus) => {
+            "tickr.all-nats.command-bus.nats-request-reply"
         }
-        (FormationProfile::Distributed, CoordinationRole::TaskDispatch) => {
-            "tickr.task-dispatch.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::TaskDispatch) => {
+            "tickr.all-nats.task-dispatch.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::TaskEvents) => {
-            "tickr.task-events.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::TaskEvents) => {
+            "tickr.all-nats.task-events.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::TaskCancellation) => {
-            "tickr.task-cancellation.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::TaskCancellation) => {
+            "tickr.all-nats.task-cancellation.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::CompactionStaging) => {
-            "tickr.compaction-staging.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::CompactionStaging) => {
+            "tickr.all-nats.compaction-staging.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::LifecycleWork) => {
-            "tickr.lifecycle-work.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::LifecycleWork) => {
+            "tickr.all-nats.lifecycle-work.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::LogStaging) => {
-            "tickr.log-staging.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::LogStaging) => {
+            "tickr.all-nats.log-staging.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::ScopeStore) => {
-            "tickr.scope-store.jetstream-kv"
+        (FormationProfile::AllNats, CoordinationRole::ScopeStore) => {
+            "tickr.all-nats.scope-store.jetstream-kv"
         }
-        (FormationProfile::Distributed, CoordinationRole::IngressIdempotencyStore) => {
-            "tickr.ingress-idempotency.jetstream-kv"
+        (FormationProfile::AllNats, CoordinationRole::IngressIdempotencyStore) => {
+            "tickr.all-nats.ingress-idempotency.jetstream-kv"
         }
-        (FormationProfile::Distributed, CoordinationRole::LivenessWatchdog) => {
-            "tickr.liveness-watchdog.jetstream-kv"
+        (FormationProfile::AllNats, CoordinationRole::LivenessWatchdog) => {
+            "tickr.all-nats.liveness-watchdog.jetstream-kv"
         }
-        (FormationProfile::Distributed, CoordinationRole::SignalAppliedNotifier) => {
-            "tickr.signal-applied.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::SignalAppliedNotifier) => {
+            "tickr.all-nats.signal-applied.jetstream"
         }
-        (FormationProfile::Distributed, CoordinationRole::ExecutorFleetStatus) => {
-            "tickr.executor-fleet-status.jetstream-kv"
+        (FormationProfile::AllNats, CoordinationRole::ExecutorFleetStatus) => {
+            "tickr.all-nats.executor-fleet-status.jetstream-kv"
         }
-        (FormationProfile::Distributed, CoordinationRole::EventIngress) => {
-            "tickr.event-ingress.jetstream"
+        (FormationProfile::AllNats, CoordinationRole::EventIngress) => {
+            "tickr.all-nats.event-ingress.jetstream"
         }
-        (FormationProfile::TickrLite, CoordinationRole::CommandBus) => {
+        (FormationProfile::AllRedis, CoordinationRole::CommandBus) => {
+            "tickr.command-bus.redis-request-reply"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::TaskDispatch) => {
+            "tickr.task-dispatch.redis-stream"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::TaskEvents) => {
+            "tickr.task-events.redis-stream"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::TaskCancellation) => {
+            "tickr.task-cancellation.redis-fence"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::CompactionStaging) => {
+            "tickr.compaction-staging.redis-stream"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::LifecycleWork) => {
+            "tickr.lifecycle-work.redis-advisory-notification"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::LogStaging) => {
+            "tickr.log-staging.redis-accepted-stream"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::ScopeStore) => {
+            "tickr.scope-store.redis-opaque-snapshot"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::IngressIdempotencyStore) => {
+            "tickr.ingress-idempotency.redis-lease"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::LivenessWatchdog) => {
+            "tickr.liveness-watchdog.redis-deadline-election"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::SignalAppliedNotifier) => {
+            "tickr.signal-applied.redis-pubsub"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::ExecutorFleetStatus) => {
+            "tickr.executor-fleet-status.redis-expiring-observation"
+        }
+        (FormationProfile::AllRedis, CoordinationRole::EventIngress) => {
+            "tickr.event-ingress.redis-stream"
+        }
+        (FormationProfile::LiteLocal, CoordinationRole::CommandBus) => {
             "tickr.command-bus.local-request-reply"
         }
-        (FormationProfile::TickrLite, CoordinationRole::TaskDispatch) => {
+        (FormationProfile::LiteLocal, CoordinationRole::TaskDispatch) => {
             "tickr.task-dispatch.sqlite"
         }
-        (FormationProfile::TickrLite, CoordinationRole::TaskEvents) => "tickr.task-events.sqlite",
-        (FormationProfile::TickrLite, CoordinationRole::TaskCancellation) => {
+        (FormationProfile::LiteLocal, CoordinationRole::TaskEvents) => "tickr.task-events.sqlite",
+        (FormationProfile::LiteLocal, CoordinationRole::TaskCancellation) => {
             "tickr.task-cancellation.sqlite"
         }
-        (FormationProfile::TickrLite, CoordinationRole::CompactionStaging) => {
+        (FormationProfile::LiteLocal, CoordinationRole::CompactionStaging) => {
             "tickr.compaction-staging.sqlite"
         }
-        (FormationProfile::TickrLite, CoordinationRole::LifecycleWork) => {
+        (FormationProfile::LiteLocal, CoordinationRole::LifecycleWork) => {
             "tickr.lifecycle-work.sqlite"
         }
-        (FormationProfile::TickrLite, CoordinationRole::LogStaging) => {
+        (FormationProfile::LiteLocal, CoordinationRole::LogStaging) => {
             "tickr.log-staging.local-journal"
         }
-        (FormationProfile::TickrLite, CoordinationRole::ScopeStore) => "tickr.scope-store.sqlite",
-        (FormationProfile::TickrLite, CoordinationRole::IngressIdempotencyStore) => {
+        (FormationProfile::LiteLocal, CoordinationRole::ScopeStore) => "tickr.scope-store.sqlite",
+        (FormationProfile::LiteLocal, CoordinationRole::IngressIdempotencyStore) => {
             "tickr.ingress-idempotency.disabled"
         }
-        (FormationProfile::TickrLite, CoordinationRole::LivenessWatchdog) => {
+        (FormationProfile::LiteLocal, CoordinationRole::LivenessWatchdog) => {
             "tickr.liveness-watchdog.sqlite"
         }
-        (FormationProfile::TickrLite, CoordinationRole::SignalAppliedNotifier) => {
+        (FormationProfile::LiteLocal, CoordinationRole::SignalAppliedNotifier) => {
             "tickr.signal-applied.local-notification"
         }
-        (FormationProfile::TickrLite, CoordinationRole::ExecutorFleetStatus) => {
+        (FormationProfile::LiteLocal, CoordinationRole::ExecutorFleetStatus) => {
             "tickr.executor-fleet-status.local-observation"
         }
-        (FormationProfile::TickrLite, CoordinationRole::EventIngress) => {
+        (FormationProfile::LiteLocal, CoordinationRole::EventIngress) => {
             "tickr.event-ingress.disabled"
         }
     };
-    ProtocolIdentity::new(name, 1)
+    let version = if profile == FormationProfile::AllNats {
+        tickr_proto::coord::all_nats::PROTOCOL_VERSION
+    } else {
+        1
+    };
+    ProtocolIdentity::new(name, version)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn omission_preserves_the_distributed_formation() {
-        let descriptor = resolve_formation(&FormationSelection::default()).unwrap();
-
-        assert_eq!(descriptor.profile, FormationProfile::Distributed);
+    fn assert_distributed_descriptor(
+        descriptor: &ResolvedFormationDescriptor,
+        profile: FormationProfile,
+        implementation: RoleImplementation,
+    ) {
+        assert_eq!(descriptor.profile, profile);
         assert_eq!(descriptor.topology, Topology::Distributed);
         assert_eq!(descriptor.sql, SqlImplementation::Postgres);
-        assert_eq!(descriptor.final_logs, FinalLogStore::ObjectStore);
-        assert_eq!(descriptor.executors, ExecutorTopology::DistributedFleet);
-        assert_eq!(descriptor.http_commands, HttpCommandIngress::Enabled);
-        assert!(descriptor
-            .roles
-            .iter()
-            .all(|role| role.implementation == RoleImplementation::NatsJetStream));
-    }
-
-    #[test]
-    fn distributed_coordination_with_sqlite_remains_admissible() {
-        let selection = FormationSelection {
-            topology: Some(Topology::SingleNode),
-            sql: Some(SqlImplementation::Sqlite),
-            writer_topology: Some(WriterTopology::ConductorOwned),
-            ..FormationSelection::default()
-        };
-
-        let descriptor = resolve_formation(&selection).unwrap();
-
-        assert_eq!(descriptor.profile, FormationProfile::Distributed);
-        assert_eq!(descriptor.topology, Topology::SingleNode);
-        assert_eq!(descriptor.sql, SqlImplementation::Sqlite);
         assert_eq!(
             descriptor.sql_migration_identity,
-            ProtocolIdentity::new("tickr.sqlite-migrations", 1)
+            ProtocolIdentity::new("tickr.postgres-migrations", 1)
         );
-        assert_eq!(descriptor.writer_topology, WriterTopology::ConductorOwned);
-        assert!(descriptor
-            .roles
-            .iter()
-            .all(|role| role.implementation == RoleImplementation::NatsJetStream));
-    }
-
-    #[test]
-    fn tickr_lite_resolves_the_complete_local_descriptor() {
-        let descriptor = resolve_formation(&FormationSelection::tickr_lite()).unwrap();
-
-        assert_eq!(descriptor.profile, FormationProfile::TickrLite);
-        assert_eq!(descriptor.topology, Topology::SingleNode);
-        assert_eq!(descriptor.sql, SqlImplementation::Sqlite);
-        assert_eq!(descriptor.final_logs, FinalLogStore::LocalFiles);
-        assert_eq!(descriptor.writer_topology, WriterTopology::ConductorOwned);
-        assert_eq!(descriptor.executors, ExecutorTopology::Exactly(1));
+        assert_eq!(descriptor.final_logs, FinalLogStore::ObjectStore);
+        assert_eq!(descriptor.writer_topology, WriterTopology::Distributed);
+        assert_eq!(descriptor.executors, ExecutorTopology::DistributedFleet);
         assert_eq!(descriptor.http_commands, HttpCommandIngress::Enabled);
         assert_eq!(descriptor.roles.iter().len(), ALL_COORDINATION_ROLES.len());
         assert!(descriptor
             .roles
             .iter()
-            .all(|role| !role.protocol.name.is_empty() && role.protocol.version > 0));
+            .all(|role| role.implementation == implementation));
+        assert_eq!(descriptor.choreography, ChoreographyCapabilities::all());
+    }
+
+    #[test]
+    fn profile_names_and_omission_are_stable() {
+        assert_eq!(FormationProfile::AllNats.name(), "all-nats");
+        assert_eq!(FormationProfile::LiteLocal.name(), "lite-local");
+        assert_eq!(FormationProfile::AllRedis.name(), "all-redis");
+
+        let omitted = resolve_formation(&FormationSelection::default()).unwrap();
+        let explicit = resolve_formation(&FormationSelection::all_nats()).unwrap();
+
+        assert_eq!(omitted, explicit);
+        assert_eq!(omitted.profile, FormationProfile::AllNats);
+    }
+
+    #[test]
+    fn named_profiles_expand_to_complete_exact_descriptors() {
+        let all_nats = resolve_formation(&FormationSelection::all_nats()).unwrap();
+        assert_distributed_descriptor(
+            &all_nats,
+            FormationProfile::AllNats,
+            RoleImplementation::NatsJetStream,
+        );
+
+        let lite_local = resolve_formation(&FormationSelection::lite_local()).unwrap();
+        assert_eq!(lite_local.profile, FormationProfile::LiteLocal);
+        assert_eq!(lite_local.topology, Topology::SingleNode);
+        assert_eq!(lite_local.sql, SqlImplementation::Sqlite);
+        assert_eq!(lite_local.final_logs, FinalLogStore::LocalFiles);
+        assert_eq!(lite_local.writer_topology, WriterTopology::ConductorOwned);
+        assert_eq!(lite_local.executors, ExecutorTopology::Exactly(1));
+        assert_eq!(lite_local.http_commands, HttpCommandIngress::Enabled);
         assert_eq!(
-            descriptor
+            lite_local
                 .roles
                 .get(CoordinationRole::CommandBus)
                 .implementation,
             RoleImplementation::LocalRequestReply
         );
         assert_eq!(
-            descriptor
+            lite_local
                 .roles
                 .get(CoordinationRole::EventIngress)
                 .implementation,
             RoleImplementation::Disabled
         );
-        assert_eq!(descriptor.choreography, ChoreographyCapabilities::all());
+        assert_eq!(lite_local.choreography, ChoreographyCapabilities::all());
+
+        let all_redis = resolve_formation(&FormationSelection::all_redis()).unwrap();
+        assert_distributed_descriptor(
+            &all_redis,
+            FormationProfile::AllRedis,
+            RoleImplementation::Redis,
+        );
     }
 
     #[test]
-    fn tickr_lite_rejects_incompatible_substrates_and_topology() {
+    fn all_nats_protocol_identities_are_fresh_exact_and_versioned_together() {
+        let descriptor = resolve_formation(&FormationSelection::all_nats()).unwrap();
+        let expected = [
+            "tickr.all-nats.command-bus.nats-request-reply",
+            "tickr.all-nats.task-dispatch.jetstream",
+            "tickr.all-nats.task-events.jetstream",
+            "tickr.all-nats.task-cancellation.jetstream",
+            "tickr.all-nats.compaction-staging.jetstream",
+            "tickr.all-nats.lifecycle-work.jetstream",
+            "tickr.all-nats.log-staging.jetstream",
+            "tickr.all-nats.scope-store.jetstream-kv",
+            "tickr.all-nats.ingress-idempotency.jetstream-kv",
+            "tickr.all-nats.liveness-watchdog.jetstream-kv",
+            "tickr.all-nats.signal-applied.jetstream",
+            "tickr.all-nats.executor-fleet-status.jetstream-kv",
+            "tickr.all-nats.event-ingress.jetstream",
+        ];
+
+        for (resolved, expected_name) in descriptor.roles.iter().zip(expected) {
+            assert_eq!(
+                resolved.protocol,
+                ProtocolIdentity::new(
+                    expected_name,
+                    tickr_proto::coord::all_nats::PROTOCOL_VERSION
+                )
+            );
+            assert!(resolved.protocol.name.starts_with("tickr.all-nats."));
+        }
+    }
+
+    #[test]
+    fn all_redis_protocol_identities_are_exact_stable_and_secret_free() {
+        let descriptor = resolve_formation(&FormationSelection::all_redis()).unwrap();
+        let expected = [
+            "tickr.command-bus.redis-request-reply",
+            "tickr.task-dispatch.redis-stream",
+            "tickr.task-events.redis-stream",
+            "tickr.task-cancellation.redis-fence",
+            "tickr.compaction-staging.redis-stream",
+            "tickr.lifecycle-work.redis-advisory-notification",
+            "tickr.log-staging.redis-accepted-stream",
+            "tickr.scope-store.redis-opaque-snapshot",
+            "tickr.ingress-idempotency.redis-lease",
+            "tickr.liveness-watchdog.redis-deadline-election",
+            "tickr.signal-applied.redis-pubsub",
+            "tickr.executor-fleet-status.redis-expiring-observation",
+            "tickr.event-ingress.redis-stream",
+        ];
+
+        for (resolved, expected_name) in descriptor.roles.iter().zip(expected) {
+            assert_eq!(resolved.protocol, ProtocolIdentity::new(expected_name, 1));
+            assert!(!resolved.protocol.name.contains("://"));
+            assert!(!resolved.protocol.name.contains('@'));
+            assert!(!resolved.protocol.name.contains("password"));
+            assert!(!resolved.protocol.name.contains("certificate"));
+        }
+    }
+
+    #[test]
+    fn all_redis_rejects_every_non_role_descriptor_override_class() {
         let cases = [
             (
                 FormationSelection {
-                    topology: Some(Topology::Distributed),
-                    ..FormationSelection::tickr_lite()
+                    topology: Some(Topology::SingleNode),
+                    ..FormationSelection::all_redis()
                 },
                 FormationAdmissionError::IncompatibleTopology {
-                    expected: Topology::SingleNode,
-                    actual: Topology::Distributed,
+                    expected: Topology::Distributed,
+                    actual: Topology::SingleNode,
                 },
             ),
             (
                 FormationSelection {
-                    sql: Some(SqlImplementation::Postgres),
-                    ..FormationSelection::tickr_lite()
+                    sql: Some(SqlImplementation::Sqlite),
+                    ..FormationSelection::all_redis()
                 },
                 FormationAdmissionError::IncompatibleSql {
-                    expected: SqlImplementation::Sqlite,
-                    actual: SqlImplementation::Postgres,
+                    expected: SqlImplementation::Postgres,
+                    actual: SqlImplementation::Sqlite,
                 },
             ),
             (
                 FormationSelection {
-                    final_logs: Some(FinalLogStore::ObjectStore),
-                    ..FormationSelection::tickr_lite()
+                    final_logs: Some(FinalLogStore::LocalFiles),
+                    ..FormationSelection::all_redis()
                 },
                 FormationAdmissionError::IncompatibleFinalLogStore {
-                    expected: FinalLogStore::LocalFiles,
-                    actual: FinalLogStore::ObjectStore,
+                    expected: FinalLogStore::ObjectStore,
+                    actual: FinalLogStore::LocalFiles,
                 },
             ),
             (
                 FormationSelection {
-                    writer_topology: Some(WriterTopology::Distributed),
-                    ..FormationSelection::tickr_lite()
+                    writer_topology: Some(WriterTopology::ConductorOwned),
+                    ..FormationSelection::all_redis()
                 },
                 FormationAdmissionError::IncompatibleWriterTopology {
-                    expected: WriterTopology::ConductorOwned,
-                    actual: WriterTopology::Distributed,
+                    expected: WriterTopology::Distributed,
+                    actual: WriterTopology::ConductorOwned,
                 },
             ),
             (
                 FormationSelection {
-                    executor_count: Some(2),
-                    ..FormationSelection::tickr_lite()
+                    executor_count: Some(1),
+                    ..FormationSelection::all_redis()
                 },
-                FormationAdmissionError::InvalidExecutorCount {
-                    expected: 1,
-                    actual: 2,
+                FormationAdmissionError::IncompatibleExecutorTopology {
+                    expected: ExecutorTopology::DistributedFleet,
+                    actual: ExecutorTopology::Exactly(1),
+                },
+            ),
+            (
+                FormationSelection {
+                    http_commands: Some(HttpCommandIngress::Disabled),
+                    ..FormationSelection::all_redis()
+                },
+                FormationAdmissionError::IncompatibleHttpCommandIngress {
+                    expected: HttpCommandIngress::Enabled,
+                    actual: HttpCommandIngress::Disabled,
                 },
             ),
         ];
@@ -812,83 +960,70 @@ mod tests {
     }
 
     #[test]
-    fn tickr_lite_rejects_nats_redis_mixed_roles_and_event_ingress() {
-        let cases = [
-            (
-                CoordinationRole::TaskDispatch,
-                RoleImplementation::NatsJetStream,
-                FormationAdmissionError::IncompatibleRole {
-                    role: CoordinationRole::TaskDispatch,
-                    expected: RoleImplementation::LocalSqlite,
-                    actual: RoleImplementation::NatsJetStream,
-                },
-            ),
-            (
-                CoordinationRole::ScopeStore,
-                RoleImplementation::Redis,
-                FormationAdmissionError::IncompatibleRole {
-                    role: CoordinationRole::ScopeStore,
-                    expected: RoleImplementation::LocalSqlite,
-                    actual: RoleImplementation::Redis,
-                },
-            ),
-            (
-                CoordinationRole::EventIngress,
-                RoleImplementation::NatsJetStream,
-                FormationAdmissionError::ExternalEventIngressEnabled {
-                    actual: RoleImplementation::NatsJetStream,
-                },
-            ),
-        ];
+    fn all_redis_rejects_every_role_and_protocol_departure() {
+        let descriptor = resolve_formation(&FormationSelection::all_redis()).unwrap();
 
-        for (role, implementation, expected) in cases {
-            let selection = FormationSelection::tickr_lite().with_role_override(
+        for role in ALL_COORDINATION_ROLES {
+            let mixed = FormationSelection::all_redis().with_role_override(
                 role,
                 RoleOverride {
-                    implementation: Some(implementation),
+                    implementation: Some(RoleImplementation::NatsJetStream),
                     ..RoleOverride::default()
                 },
             );
-            assert_eq!(resolve_formation(&selection), Err(expected));
+            assert_eq!(
+                resolve_formation(&mixed),
+                Err(FormationAdmissionError::IncompatibleRole {
+                    role,
+                    expected: RoleImplementation::Redis,
+                    actual: RoleImplementation::NatsJetStream,
+                })
+            );
+
+            let missing = FormationSelection::all_redis().with_role_override(
+                role,
+                RoleOverride {
+                    protocol: ProtocolOverride::Missing,
+                    ..RoleOverride::default()
+                },
+            );
+            assert_eq!(
+                resolve_formation(&missing),
+                Err(FormationAdmissionError::MissingProtocolIdentity { role })
+            );
+
+            let expected = *descriptor.roles.get(role);
+            let unknown =
+                ProtocolIdentity::new(expected.protocol.name, expected.protocol.version + 1);
+            let unsupported = FormationSelection::all_redis().with_role_override(
+                role,
+                RoleOverride {
+                    protocol: ProtocolOverride::Identity(unknown),
+                    ..RoleOverride::default()
+                },
+            );
+            assert_eq!(
+                resolve_formation(&unsupported),
+                Err(FormationAdmissionError::UnsupportedProtocolIdentity {
+                    role,
+                    expected: expected.protocol,
+                    actual: unknown,
+                })
+            );
+
+            let exact = FormationSelection::all_redis().with_role_override(
+                role,
+                RoleOverride {
+                    implementation: Some(expected.implementation),
+                    protocol: ProtocolOverride::Identity(expected.protocol),
+                },
+            );
+            assert_eq!(resolve_formation(&exact), Ok(descriptor));
         }
     }
 
     #[test]
-    fn formation_rejects_missing_and_unknown_protocol_identities() {
-        let missing = FormationSelection::tickr_lite().with_role_override(
-            CoordinationRole::TaskEvents,
-            RoleOverride {
-                protocol: ProtocolOverride::Missing,
-                ..RoleOverride::default()
-            },
-        );
-        assert_eq!(
-            resolve_formation(&missing),
-            Err(FormationAdmissionError::MissingProtocolIdentity {
-                role: CoordinationRole::TaskEvents,
-            })
-        );
-
-        let unknown = ProtocolIdentity::new("tickr.task-events.sqlite", 2);
-        let selection = FormationSelection::tickr_lite().with_role_override(
-            CoordinationRole::TaskEvents,
-            RoleOverride {
-                protocol: ProtocolOverride::Identity(unknown),
-                ..RoleOverride::default()
-            },
-        );
-        assert!(matches!(
-            resolve_formation(&selection),
-            Err(FormationAdmissionError::UnsupportedProtocolIdentity {
-                role: CoordinationRole::TaskEvents,
-                actual,
-                ..
-            }) if actual == unknown
-        ));
-    }
-
-    #[test]
-    fn formation_rejects_each_missing_choreography_proof() {
+    fn all_redis_rejects_each_missing_choreography_proof() {
         let cases = [
             (
                 ChoreographyCapabilities {
@@ -916,12 +1051,59 @@ mod tests {
         for (choreography, capability) in cases {
             let selection = FormationSelection {
                 choreography: Some(choreography),
-                ..FormationSelection::tickr_lite()
+                ..FormationSelection::all_redis()
             };
             assert_eq!(
                 resolve_formation(&selection),
                 Err(FormationAdmissionError::MissingCapability { capability })
             );
+        }
+    }
+
+    #[test]
+    fn lite_local_runs_disabled_role_admission_laws_for_both_ingress_roles() {
+        let descriptor = resolve_formation(&FormationSelection::lite_local()).unwrap();
+        let disabled = [
+            (
+                CoordinationRole::IngressIdempotencyStore,
+                "tickr.ingress-idempotency.disabled",
+            ),
+            (
+                CoordinationRole::EventIngress,
+                "tickr.event-ingress.disabled",
+            ),
+        ];
+
+        for (role, protocol_name) in disabled {
+            let resolved = descriptor.roles.get(role);
+            assert_eq!(resolved.implementation, RoleImplementation::Disabled);
+            assert_eq!(resolved.protocol, ProtocolIdentity::new(protocol_name, 1));
+
+            let selection = FormationSelection::lite_local().with_role_override(
+                role,
+                RoleOverride {
+                    implementation: Some(RoleImplementation::Redis),
+                    ..RoleOverride::default()
+                },
+            );
+            let error = resolve_formation(&selection).unwrap_err();
+            match role {
+                CoordinationRole::IngressIdempotencyStore => assert_eq!(
+                    error,
+                    FormationAdmissionError::IncompatibleRole {
+                        role,
+                        expected: RoleImplementation::Disabled,
+                        actual: RoleImplementation::Redis,
+                    }
+                ),
+                CoordinationRole::EventIngress => assert_eq!(
+                    error,
+                    FormationAdmissionError::ExternalEventIngressEnabled {
+                        actual: RoleImplementation::Redis,
+                    }
+                ),
+                _ => unreachable!("only disabled ingress roles are exercised"),
+            }
         }
     }
 }

@@ -14,7 +14,8 @@ use crate::local::{
     failure_error, read_message, LocalClient, LocalEventOperation, LocalOperation, LocalResponse,
     MAX_LOCAL_RESPONSE_BYTES,
 };
-use crate::scope::Scope;
+use crate::nats_scope::{is_metadata_key, NatsScopeStore};
+use crate::scope::{sanitize_segment, Scope};
 
 pub const MAX_VALUE_SIZE: i32 = 1024 * 1024;
 
@@ -35,7 +36,7 @@ pub struct StoreEvent {
 pub type StoreWatch = Pin<Box<dyn Stream<Item = Result<StoreEvent>> + Send>>;
 
 enum StoreBackend {
-    Nats(kv::Store),
+    Nats(NatsScopeStore),
     Local(LocalClient),
 }
 
@@ -76,8 +77,10 @@ impl Store {
                 .await
                 .map_err(|error| anyhow!("failed to create KV bucket {bucket}: {error}"))?,
         };
+        let store = NatsScopeStore::new(kv, &scope.ns)?;
+        store.ensure_scope(&sanitize_segment(&scope.run_id)).await?;
         Ok(Self {
-            backend: StoreBackend::Nats(kv),
+            backend: StoreBackend::Nats(store),
         })
     }
 
@@ -86,8 +89,7 @@ impl Store {
             StoreBackend::Nats(store) => store
                 .get(key)
                 .await
-                .map(|value| value.map(|bytes| bytes.to_vec()))
-                .map_err(|error| anyhow!("nats kv get failed: {error}")),
+                .map_err(|error| anyhow!("NATS ScopeStore get failed: {error}")),
             StoreBackend::Local(client) => match client
                 .request(LocalOperation::Get {
                     key: key.to_owned(),
@@ -106,13 +108,10 @@ impl Store {
 
     pub async fn put(&self, key: String, envelope: Vec<u8>) -> Result<()> {
         match &self.backend {
-            StoreBackend::Nats(store) => {
-                store
-                    .put(key, envelope.into())
-                    .await
-                    .map_err(|error| anyhow!("nats kv put failed: {error}"))?;
-                Ok(())
-            }
+            StoreBackend::Nats(store) => store
+                .put(key, envelope)
+                .await
+                .map_err(|error| anyhow!("NATS ScopeStore put failed: {error}")),
             StoreBackend::Local(client) => match client
                 .request(LocalOperation::Put {
                     key,
@@ -135,7 +134,8 @@ impl Store {
             StoreBackend::Nats(store) => store
                 .delete(key)
                 .await
-                .map_err(|error| anyhow!("nats kv delete failed: {error}")),
+                .map(|_| ())
+                .map_err(|error| anyhow!("NATS ScopeStore delete failed: {error}")),
             StoreBackend::Local(client) => match client
                 .request(LocalOperation::Delete {
                     key: key.to_owned(),
@@ -154,21 +154,10 @@ impl Store {
 
     pub async fn keys(&self, prefix: &str) -> Result<Vec<String>> {
         match &self.backend {
-            StoreBackend::Nats(store) => {
-                let mut keys = store
-                    .keys()
-                    .await
-                    .map_err(|error| anyhow!("nats kv keys failed: {error}"))?;
-                let mut collected = Vec::new();
-                while let Some(key) = keys.next().await {
-                    let key =
-                        key.map_err(|error| anyhow!("nats kv keys stream failed: {error}"))?;
-                    if key.starts_with(prefix) {
-                        collected.push(key);
-                    }
-                }
-                Ok(collected)
-            }
+            StoreBackend::Nats(store) => store
+                .keys(prefix)
+                .await
+                .map_err(|error| anyhow!("NATS ScopeStore keys failed: {error}")),
             StoreBackend::Local(client) => match client
                 .request(LocalOperation::List {
                     prefix: prefix.to_owned(),
@@ -195,30 +184,35 @@ impl Store {
     async fn watch_prefix(&self, prefix: String) -> Result<StoreWatch> {
         match &self.backend {
             StoreBackend::Nats(store) => {
+                let raw_store = store.raw_store();
                 let watch = if prefix.is_empty() {
-                    store
+                    raw_store
                         .watch_all()
                         .await
                         .map_err(|error| anyhow!("nats kv watch failed: {error}"))?
                 } else {
-                    store
+                    raw_store
                         .watch(&prefix)
                         .await
                         .map_err(|error| anyhow!("nats kv watch failed: {error}"))?
                 };
-                Ok(Box::pin(watch.map(|item| {
-                    let entry =
-                        item.map_err(|error| anyhow!("nats kv watch stream failed: {error}"))?;
-                    let operation = match entry.operation {
-                        kv::Operation::Put => StoreOperation::Put,
-                        kv::Operation::Delete => StoreOperation::Delete,
-                        kv::Operation::Purge => StoreOperation::Purge,
-                    };
-                    Ok(StoreEvent {
-                        operation,
-                        key: entry.key,
-                        value: entry.value.to_vec(),
-                    })
+                Ok(Box::pin(watch.filter_map(|item| async move {
+                    match item {
+                        Ok(entry) if is_metadata_key(&entry.key) => None,
+                        Ok(entry) => {
+                            let operation = match entry.operation {
+                                kv::Operation::Put => StoreOperation::Put,
+                                kv::Operation::Delete => StoreOperation::Delete,
+                                kv::Operation::Purge => StoreOperation::Purge,
+                            };
+                            Some(Ok(StoreEvent {
+                                operation,
+                                key: entry.key,
+                                value: entry.value.to_vec(),
+                            }))
+                        }
+                        Err(error) => Some(Err(anyhow!("nats kv watch stream failed: {error}"))),
+                    }
                 })))
             }
             StoreBackend::Local(client) => {

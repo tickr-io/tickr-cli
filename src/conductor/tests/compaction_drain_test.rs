@@ -27,6 +27,7 @@ mod common;
 
 use chrono::Utc;
 use flate2::read::GzDecoder;
+use futures::StreamExt;
 use opendal::{services::Memory, Operator};
 use prost::Message;
 use sqlx::Row;
@@ -37,6 +38,7 @@ use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
 use tickr_conductor::system_tasks::compaction_drain;
+use tickr_conductor::system_tasks::compaction_receiver::persist_compaction_projection;
 use tickr_conductor::system_tasks::{run_compaction_drain, stage_compaction_payload};
 use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_migrations::signal_repository::SignalCapturesInput;
@@ -97,10 +99,17 @@ fn encode_proto_job(p: &Payload) -> Vec<u8> {
 }
 
 /// Log staging stream name/subject shape, matching the executor's publisher.
-const LOG_STREAM_NAME: &str = "tickr_task_logs";
+const LOG_STREAM_NAME: &str = tickr_proto::coord::all_nats::LOG_STREAM;
+const SCOPE_ENVELOPE: &[u8] = br#"{ "v": 2, "type": "string", "value": "archived", "secret": false, "producer": { "kind": "task", "task_id": "task-7", "task_name": "test-task" }, "created_at": "2026-07-23T00:00:00Z", "sha256": "scope-law" }"#;
 
 fn log_subject(workflow_id: Uuid, workflow_instance_id: Uuid, ti_id: &str) -> String {
-    format!("logs.{}.{}.{}", workflow_id, workflow_instance_id, ti_id)
+    format!(
+        "{}.{}.{}.{}",
+        tickr_proto::coord::all_nats::LOG_SUBJECT_PREFIX,
+        workflow_id,
+        workflow_instance_id,
+        ti_id
+    )
 }
 
 fn blob_path(workflow_id: Uuid, workflow_instance_id: Uuid, ti_id: &str) -> String {
@@ -117,8 +126,7 @@ fn sidecar_path(workflow_id: Uuid, workflow_instance_id: Uuid, ti_id: &str) -> S
     )
 }
 
-/// Publish an End-of-stream marker the way the executor does: header-tagged,
-/// empty payload, exit status in headers.
+/// Publish the controlled terminal record under the accepted-Log protocol.
 async fn publish_marker(
     nats: &async_nats::Client,
     workflow_id: Uuid,
@@ -128,8 +136,28 @@ async fn publish_marker(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let js = async_nats::jetstream::new(nats.clone());
     let mut headers = async_nats::HeaderMap::new();
-    headers.insert("Tickr-Log-Marker", "end-of-stream");
-    headers.insert("Tickr-Exit-Status", exit_status.to_string().as_str());
+    headers.insert(
+        tickr_proto::coord::all_nats::LOG_PROTOCOL_HEADER,
+        tickr_proto::coord::all_nats::LOG_PROTOCOL,
+    );
+    headers.insert(
+        tickr_proto::coord::all_nats::LOG_KIND_HEADER,
+        tickr_proto::coord::all_nats::LOG_KIND_END,
+    );
+    headers.insert(
+        tickr_proto::coord::all_nats::LOG_TASK_INSTANCE_HEADER,
+        ti_id,
+    );
+    headers.insert(
+        tickr_proto::coord::all_nats::LOG_PICKUP_GENERATION_HEADER,
+        "1",
+    );
+    headers.insert(tickr_proto::coord::all_nats::LOG_EXIT_KIND_HEADER, "status");
+    headers.insert(
+        tickr_proto::coord::all_nats::LOG_EXIT_STATUS_HEADER,
+        exit_status.to_string().as_str(),
+    );
+    headers.insert("Nats-Msg-Id", format!("log:{ti_id}:1:terminal").as_str());
     js.publish_with_headers(
         log_subject(workflow_id, workflow_instance_id, ti_id),
         headers,
@@ -142,6 +170,35 @@ async fn publish_marker(
 
 fn memory_operator() -> Operator {
     Operator::new(Memory::default()).unwrap().finish()
+}
+
+async fn seed_scope(
+    nats: &async_nats::Client,
+    payload: &Payload,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let namespace = "default";
+    let bucket = tickr_ctx::scope::bucket_for_namespace(namespace);
+    let js = async_nats::jetstream::new(nats.clone());
+    let kv = match js.get_key_value(&bucket).await {
+        Ok(kv) => kv,
+        Err(_) => {
+            js.create_key_value(async_nats::jetstream::kv::Config {
+                bucket,
+                history: 1,
+                max_value_size: tickr_ctx::store::MAX_VALUE_SIZE,
+                storage: async_nats::jetstream::stream::StorageType::File,
+                ..Default::default()
+            })
+            .await?
+        }
+    };
+    let owner = payload.instance_id.to_string();
+    let store = tickr_ctx::nats_scope::NatsScopeStore::new(kv, namespace)?;
+    store.ensure_scope(&owner).await?;
+    store
+        .put(format!("{owner}/result"), SCOPE_ENVELOPE.to_vec())
+        .await?;
+    Ok(())
 }
 
 fn gunzip(bytes: &[u8]) -> Vec<u8> {
@@ -163,13 +220,42 @@ async fn stage_log_batches(
     let js = async_nats::jetstream::new(nats.clone());
     js.get_or_create_stream(async_nats::jetstream::stream::Config {
         name: LOG_STREAM_NAME.to_string(),
-        subjects: vec!["logs.>".to_string()],
+        subjects: vec![tickr_proto::coord::all_nats::LOG_STREAM_SUBJECTS.to_string()],
         ..Default::default()
     })
     .await?;
     let subject = log_subject(workflow_id, workflow_instance_id, ti_id);
-    for batch in batches {
-        js.publish(subject.clone(), batch.to_vec().into())
+    for (sequence, batch) in batches.iter().enumerate() {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_PROTOCOL_HEADER,
+            tickr_proto::coord::all_nats::LOG_PROTOCOL,
+        );
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_KIND_HEADER,
+            tickr_proto::coord::all_nats::LOG_KIND_ACCEPTED,
+        );
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_TASK_INSTANCE_HEADER,
+            ti_id,
+        );
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_PICKUP_GENERATION_HEADER,
+            "1",
+        );
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_SEQUENCE_HEADER,
+            sequence.to_string().as_str(),
+        );
+        headers.insert(
+            tickr_proto::coord::all_nats::LOG_CONTENT_DIGEST_HEADER,
+            tickr_proto::coord::log_stream::content_digest(batch).as_str(),
+        );
+        headers.insert(
+            "Nats-Msg-Id",
+            format!("log:{ti_id}:1:record:{sequence}").as_str(),
+        );
+        js.publish_with_headers(subject.clone(), headers, batch.to_vec().into())
             .await?
             .await?;
     }
@@ -232,10 +318,11 @@ async fn staging_is_durable_and_needs_no_postgres() -> Result<(), Box<dyn std::e
     };
 
     let payload = build_payload("Completed", 1);
+    let bytes = encode_proto_job(&payload);
 
     // No Postgres pool exists anywhere in this test — staging must succeed
     // with NATS alone, because the relay path ACKs on stage.
-    stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
+    stage_compaction_payload(&nats, bytes.clone()).await?;
 
     // The job is durably in the work-queue stream.
     let js = async_nats::jetstream::new(nats.clone());
@@ -245,7 +332,132 @@ async fn staging_is_durable_and_needs_no_postgres() -> Result<(), Box<dyn std::e
         info.state.messages, 1,
         "staged job must be durably held by the work-queue stream"
     );
+    let staging = js
+        .get_key_value(tickr_proto::coord::all_nats::COMPACTION_STAGING_BUCKET)
+        .await?;
+    let staged = staging
+        .get(&format!("payload.{}", payload.instance_id))
+        .await?
+        .expect("raw payload under stable Compaction identity");
+    assert_eq!(staged.as_ref(), bytes.as_slice());
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stable_identity_rejects_conflicting_payload() -> Result<(), Box<dyn std::error::Error>> {
+    let Some((_nats_container, nats)) = start_nats().await else {
+        return Ok(());
+    };
+    let mut payload = build_payload("Completed", 1);
+    let original = encode_proto_job(&payload);
+    stage_compaction_payload(&nats, original.clone()).await?;
+
+    payload.state = "Failed";
+    let conflicting = encode_proto_job(&payload);
+    let error = stage_compaction_payload(&nats, conflicting)
+        .await
+        .expect_err("same identity with different bytes must conflict");
+    assert!(error.to_string().contains("conflicts with staged payload"));
+
+    let js = async_nats::jetstream::new(nats);
+    let staging = js
+        .get_key_value(tickr_proto::coord::all_nats::COMPACTION_STAGING_BUCKET)
+        .await?;
+    let staged = staging
+        .get(&format!("payload.{}", payload.instance_id))
+        .await?
+        .expect("original stable payload");
+    assert_eq!(
+        staged.as_ref(),
+        original.as_slice(),
+        "a conflict must not replace staged bytes"
+    );
+    let mut stream = js.get_stream(compaction_drain::STREAM_NAME).await?;
+    assert_eq!(stream.info().await?.state.messages, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consumer_death_before_archive_commit_redelivers() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some((_nats_container, nats)) = start_nats().await else {
+        return Ok(());
+    };
+    let payload = build_payload("Completed", 1);
+    let bytes = encode_proto_job(&payload);
+    stage_compaction_payload(&nats, bytes.clone()).await?;
+
+    let consumer = compaction_drain::init_stream_and_consumer(&nats).await?;
+    let mut delivery = consumer.stream().messages().await?;
+    let first = tokio::time::timeout(Duration::from_secs(5), delivery.next())
+        .await?
+        .expect("first Compaction delivery")?;
+    assert_eq!(first.payload.as_ref(), bytes.as_slice());
+    drop(first);
+    drop(delivery);
+
+    tokio::time::sleep(tickr_proto::coord::all_nats::COMPACTION_ACK_WAIT).await;
+    let replacement = compaction_drain::init_stream_and_consumer(&nats).await?;
+    let mut redelivery = replacement.stream().messages().await?;
+    let second = tokio::time::timeout(Duration::from_secs(5), redelivery.next())
+        .await?
+        .expect("redelivered Compaction")?;
+    assert_eq!(second.payload.as_ref(), bytes.as_slice());
+    second.ack().await.expect("ack redelivered Compaction");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_rejects_missing_and_corrupt_scope() -> Result<(), Box<dyn std::error::Error>> {
+    let Some((_nats_container, nats)) = start_nats().await else {
+        return Ok(());
+    };
+    let Some((_pg_container, pool)) = start_postgres_with_migrations().await else {
+        return Ok(());
+    };
+    let repositories = WriterRepositoryBundle::from_postgres_pool(pool.clone());
+
+    let missing = build_payload("Completed", 0);
+    let missing_projection = CompactionEnvelope::decode(encode_proto_job(&missing).as_slice())?
+        .projection
+        .expect("test Compaction projection");
+    let missing_error =
+        persist_compaction_projection(&repositories, &missing_projection, None, Some(&nats))
+            .await
+            .expect_err("missing scope must fail Compaction");
+    assert!(missing_error.to_string().contains("seal tickr-ctx scope"));
+
+    let corrupt = build_payload("Completed", 0);
+    seed_scope(&nats, &corrupt).await?;
+    let bucket = tickr_ctx::scope::bucket_for_namespace("default");
+    let scope = async_nats::jetstream::new(nats.clone())
+        .get_key_value(&bucket)
+        .await?;
+    scope
+        .put(
+            &format!("{}/result", corrupt.instance_id),
+            br#"{"v":99,"opaque":"future"}"#.as_slice().into(),
+        )
+        .await?;
+    let corrupt_projection = CompactionEnvelope::decode(encode_proto_job(&corrupt).as_slice())?
+        .projection
+        .expect("test Compaction projection");
+    let corrupt_error =
+        persist_compaction_projection(&repositories, &corrupt_projection, None, Some(&nats))
+            .await
+            .expect_err("corrupt scope must fail Compaction");
+    assert!(corrupt_error.to_string().contains("seal tickr-ctx scope"));
+
+    let archived: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workflow_instances WHERE id = ANY($1)")
+            .bind(vec![missing.instance_id, corrupt.instance_id])
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        archived, 0,
+        "failed Compaction must not fabricate an archive"
+    );
     Ok(())
 }
 
@@ -264,7 +476,20 @@ async fn drain_archives_a_staged_job() -> Result<(), Box<dyn std::error::Error>>
 
     let payload = build_payload("Completed", 2);
     let wfi_id = payload.instance_id;
-    stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
+    let staged_bytes = encode_proto_job(&payload);
+    seed_scope(&nats, &payload).await?;
+    for task in &payload.tasks {
+        stage_log_batches(
+            &nats,
+            payload.workflow_id,
+            payload.instance_id,
+            &task.id,
+            &[],
+        )
+        .await?;
+        publish_marker(&nats, payload.workflow_id, payload.instance_id, &task.id, 0).await?;
+    }
+    stage_compaction_payload(&nats, staged_bytes).await?;
 
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
@@ -294,6 +519,17 @@ async fn drain_archives_a_staged_job() -> Result<(), Box<dyn std::error::Error>>
             .await?
             .get(0);
     assert_eq!(run_info_count, 1, "expected the enrichment row");
+    let archived_scope: serde_json::Value = sqlx::query_scalar(
+        "SELECT ctx_envelope FROM workflow_run_info WHERE workflow_instance_id = $1",
+    )
+    .bind(wfi_id)
+    .fetch_one(pool.as_ref())
+    .await?;
+    assert_eq!(
+        archived_scope[0]["envelope_bytes"],
+        hex::encode(SCOPE_ENVELOPE),
+        "Compaction must archive the exact accepted scope bytes"
+    );
 
     // The drained (acked) job must be gone from the work queue.
     let js = async_nats::jetstream::new(nats.clone());
@@ -309,6 +545,32 @@ async fn drain_archives_a_staged_job() -> Result<(), Box<dyn std::error::Error>>
             "acked job must be removed from the WorkQueue stream"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let staging = js
+        .get_key_value(tickr_proto::coord::all_nats::COMPACTION_STAGING_BUCKET)
+        .await?;
+    assert!(
+        staging.get(&format!("payload.{wfi_id}")).await?.is_none(),
+        "raw Compaction staging must be cleaned after archive commit"
+    );
+    assert!(
+        staging.get(&format!("complete.{wfi_id}")).await?.is_some(),
+        "stable completion evidence must survive staging cleanup"
+    );
+    let scope_kv = js
+        .get_key_value(&tickr_ctx::scope::bucket_for_namespace("default"))
+        .await?;
+    let scope = tickr_ctx::nats_scope::NatsScopeStore::new(scope_kv, "default")?;
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if scope.keys(&format!("{wfi_id}/")).await?.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cleanup_deadline,
+            "scope cleanup must follow the committed archive and source acknowledgement"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     shutdown.cancel();
@@ -362,7 +624,7 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
     let js = async_nats::jetstream::new(nats.clone());
     let ctx = js
         .create_key_value(async_nats::jetstream::kv::Config {
-            bucket: "ctx-default".to_string(),
+            bucket: tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET.to_string(),
             ..Default::default()
         })
         .await?;
@@ -373,8 +635,31 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
     // Two copies of the same job: the shape a server re-ship produces, and
     // the shape a drain crash between archive-commit and queue-ack produces
     // (the first copy already archived, the second re-runs over it).
+    seed_scope(&nats, &payload).await?;
+    stage_log_batches(
+        &nats,
+        payload.workflow_id,
+        payload.instance_id,
+        &payload.tasks[0].id,
+        &[],
+    )
+    .await?;
+    publish_marker(
+        &nats,
+        payload.workflow_id,
+        payload.instance_id,
+        &payload.tasks[0].id,
+        1,
+    )
+    .await?;
     stage_compaction_payload(&nats, bytes.clone()).await?;
     stage_compaction_payload(&nats, bytes).await?;
+    let mut staged_stream = js.get_stream(compaction_drain::STREAM_NAME).await?;
+    assert_eq!(
+        staged_stream.info().await?.state.messages,
+        1,
+        "same-identity duplicate staging must converge on one queue entry"
+    );
 
     let shutdown = CancellationToken::new();
     let drain_handle = tokio::spawn(run_compaction_drain(
@@ -389,8 +674,7 @@ async fn duplicate_jobs_converge() -> Result<(), Box<dyn std::error::Error>> {
         "drain must archive the job"
     );
 
-    // Wait until both queue copies are consumed before asserting counts.
-    let js = async_nats::jetstream::new(nats.clone());
+    // Wait until the one stable-identity queue entry is consumed.
     let mut stream = js.get_stream(compaction_drain::STREAM_NAME).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while stream.info().await?.state.messages > 0 {
@@ -485,13 +769,14 @@ async fn signal_cleanup_sql_failure_is_non_fatal_after_archive_commit(
     let js = async_nats::jetstream::new(nats.clone());
     let ctx = js
         .create_key_value(async_nats::jetstream::kv::Config {
-            bucket: "ctx-default".to_string(),
+            bucket: tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET.to_string(),
             ..Default::default()
         })
         .await?;
     let signal_key = format!("{signal_id}/order");
     ctx.put(&signal_key, b"working-value".to_vec().into())
         .await?;
+    seed_scope(&nats, &payload).await?;
     stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
 
     let shutdown = CancellationToken::new();
@@ -531,7 +816,7 @@ async fn signal_cleanup_sql_failure_is_non_fatal_after_archive_commit(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_tasks_logs_are_archived_and_subject_purged(
+async fn failed_tasks_logs_are_archived_and_records_purged(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((_nats_container, nats)) = start_nats().await else {
         return Ok(());
@@ -561,6 +846,7 @@ async fn failed_tasks_logs_are_archived_and_subject_purged(
     publish_marker(&nats, payload.workflow_id, payload.instance_id, &ti.id, 1).await?;
 
     let storage = memory_operator();
+    seed_scope(&nats, &payload).await?;
     stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
 
     let shutdown = CancellationToken::new();
@@ -611,16 +897,15 @@ async fn failed_tasks_logs_are_archived_and_subject_purged(
         "sidecar must carry the marker's exit status"
     );
 
-    // The log subject is purged after archival. The log stream holds only
-    // this one subject in this test, so total message count reaching zero
-    // is the purge signal.
+    // Accepted Log records are purged after archival while the immutable
+    // terminal fence remains to reject a late writer.
     let js = async_nats::jetstream::new(nats.clone());
     let mut log_stream = js.get_stream(LOG_STREAM_NAME).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while log_stream.info().await?.state.messages > 0 {
+    while log_stream.info().await?.state.messages != 1 {
         assert!(
             std::time::Instant::now() < deadline,
-            "log subject must be purged after archival"
+            "Accepted Log records must be purged while one terminal fence remains"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -683,6 +968,7 @@ async fn retried_attempts_get_separate_subjects_and_blobs() -> Result<(), Box<dy
     .await?;
 
     let storage = memory_operator();
+    seed_scope(&nats, &payload).await?;
     stage_compaction_payload(&nats, encode_proto_job(&payload)).await?;
 
     let shutdown = CancellationToken::new();
@@ -734,9 +1020,9 @@ async fn retried_attempts_get_separate_subjects_and_blobs() -> Result<(), Box<dy
         "attempt 2's blob must hold only attempt 2's batches"
     );
 
-    // Marker isolation rides subject isolation: attempt 1's marker archives
-    // to attempt 1's sidecar; attempt 2 (no marker) gets no sidecar — its
-    // archived read stays marker-absent (the abnormal-end signal).
+    // Terminal isolation rides subject isolation: attempt 1's controlled end
+    // archives to its sidecar, while attempt 2 receives a durable abnormal
+    // terminal before Compaction archives it.
     assert!(
         storage
             .read(&sidecar_path(
@@ -748,16 +1034,18 @@ async fn retried_attempts_get_separate_subjects_and_blobs() -> Result<(), Box<dy
             .is_ok(),
         "attempt 1's sidecar must exist"
     );
-    assert!(
-        storage
-            .read(&sidecar_path(
-                payload.workflow_id,
-                payload.instance_id,
-                &attempt2.id
-            ))
-            .await
-            .is_err(),
-        "attempt 2 must have no sidecar"
+    let abnormal_sidecar = storage
+        .read(&sidecar_path(
+            payload.workflow_id,
+            payload.instance_id,
+            &attempt2.id,
+        ))
+        .await?;
+    let abnormal: serde_json::Value = serde_json::from_slice(&abnormal_sidecar.to_vec())?;
+    assert_eq!(abnormal["exit_status"], -1);
+    assert_eq!(
+        abnormal["reason"],
+        "Executor closed without controlled End-of-stream"
     );
 
     shutdown.cancel();

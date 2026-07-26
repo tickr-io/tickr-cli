@@ -1,7 +1,7 @@
-//! Durable definition-build processing for Tickr Lite.
+//! Durable definition-build reconciliation.
 //!
-//! SQLite lifecycle rows are the source of truth. The bounded channel only
-//! shortens scan latency; startup and periodic scans recover every committed
+//! Selected SQL lifecycle rows are the source of truth. Notifications only
+//! shorten scan latency; startup and periodic scans recover every committed
 //! eligible row after notification loss or process restart.
 
 use std::num::NonZeroUsize;
@@ -21,6 +21,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::{BuildExecutor, BuildOutcome, TaskBuildJob};
+use crate::lifecycle_work::{LifecycleClaimAdmission, LifecyclePipeline, OpenLifecycleClaims};
 use crate::waits_on_signal_lifecycle::apply_workflow_state;
 
 /// Bounded best-effort wakeup for newly committed definition-build work.
@@ -48,9 +49,9 @@ pub fn definition_build_notifications(
 
 impl DefinitionBuildNotifier {
     /// Request an immediate scan. Full or closed channels deliberately lose
-    /// only this hint; the committed SQLite row remains authoritative.
-    pub fn notify(&self) {
-        let _ = self.sender.try_send(());
+    /// only this hint; the committed SQL row remains authoritative.
+    pub fn notify(&self) -> bool {
+        self.sender.try_send(()).is_ok()
     }
 }
 
@@ -71,13 +72,34 @@ impl Default for LocalDefinitionBuildWorkerConfig {
     }
 }
 
-/// Run startup reconciliation followed by bounded notification- and timer-led
-/// scans until formation cancellation.
 pub async fn start_local_definition_build_worker(
     repositories: Arc<WriterRepositoryBundle>,
     executor: Arc<dyn BuildExecutor>,
     lease_owner: String,
+    notifications: DefinitionBuildNotificationStream,
+    config: LocalDefinitionBuildWorkerConfig,
+    cancel: CancellationToken,
+) -> Result<()> {
+    start_local_definition_build_worker_with_claim_admission(
+        repositories,
+        executor,
+        lease_owner,
+        notifications,
+        Arc::new(OpenLifecycleClaims),
+        config,
+        cancel,
+    )
+    .await
+}
+
+/// Run startup reconciliation followed by bounded notification- and timer-led
+/// scans until formation cancellation.
+pub async fn start_local_definition_build_worker_with_claim_admission(
+    repositories: Arc<WriterRepositoryBundle>,
+    executor: Arc<dyn BuildExecutor>,
+    lease_owner: String,
     mut notifications: DefinitionBuildNotificationStream,
+    claim_admission: Arc<dyn LifecycleClaimAdmission>,
     config: LocalDefinitionBuildWorkerConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -93,12 +115,13 @@ pub async fn start_local_definition_build_worker(
     let mut ticker = tokio::time::interval(config.scan_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await;
-    scan_once(
+    scan_once_with_claim_admission(
         repositories.as_ref(),
         executor.as_ref(),
         &lease_owner,
         lease_duration,
         config.batch_size,
+        claim_admission.as_ref(),
     )
     .await?;
 
@@ -107,22 +130,24 @@ pub async fn start_local_definition_build_worker(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                scan_once(
+                scan_once_with_claim_admission(
                     repositories.as_ref(),
                     executor.as_ref(),
                     &lease_owner,
                     lease_duration,
                     config.batch_size,
+                    claim_admission.as_ref(),
                 ).await?;
             }
             notification = notifications.receiver.recv(), if notifications_open => {
                 notifications_open = notification.is_some();
-                scan_once(
+                scan_once_with_claim_admission(
                     repositories.as_ref(),
                     executor.as_ref(),
                     &lease_owner,
                     lease_duration,
                     config.batch_size,
+                    claim_admission.as_ref(),
                 ).await?;
             }
         }
@@ -130,14 +155,20 @@ pub async fn start_local_definition_build_worker(
     Ok(())
 }
 
-async fn scan_once(
+async fn scan_once_with_claim_admission(
     repositories: &WriterRepositoryBundle,
     executor: &dyn BuildExecutor,
     lease_owner: &str,
     lease_duration: chrono::Duration,
     batch_size: NonZeroUsize,
+    claim_admission: &dyn LifecycleClaimAdmission,
 ) -> Result<()> {
     let now = Utc::now();
+    if !repositories.has_reclaimable_definition_build(now).await?
+        || !claim_admission.claims_open(LifecyclePipeline::DefinitionBuild)
+    {
+        return Ok(());
+    }
     let leases = repositories
         .lease_definition_build_tasks(DefinitionBuildLeaseRequest {
             owner: lease_owner,
@@ -184,7 +215,7 @@ async fn process_leased_task(
         ) => {
             if let Err(error) = apply_workflow_state(&intent.definition) {
                 eprintln!(
-                    "local build worker: waits-on-signal refresh failed for {}: {error}",
+                    "definition build worker: waits-on-signal refresh failed for {}: {error}",
                     intent.workflow_id
                 );
             }
@@ -194,7 +225,7 @@ async fn process_leased_task(
         ) => {
             if let BuildOutcome::Failure { error } = outcome {
                 eprintln!(
-                    "local build worker: workflow {} v{} task {} failed: {error}",
+                    "definition build worker: workflow {} v{} task {} failed: {error}",
                     lease.task.workflow_id, lease.task.workflow_version, lease.task.task_id
                 );
             }
@@ -209,7 +240,7 @@ async fn process_leased_task(
             DefinitionBuildSettlementOutcome::Absent,
         ) => {
             eprintln!(
-                "local build worker: definition build task disappeared for {} v{} task {}",
+                "definition build worker: definition build task disappeared for {} v{} task {}",
                 lease.task.workflow_id, lease.task.workflow_version, lease.task.task_id
             );
         }

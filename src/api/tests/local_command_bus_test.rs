@@ -125,7 +125,10 @@ async fn spawn_api(
         .region("us-east-1");
     let logs = Arc::new(tickr_api::http::logs_resolver::LogsResolver::new(
         opendal::Operator::new(storage).unwrap().finish(),
-        nats.clone(),
+        Arc::new(tickr_executor::log_stream::AllNatsLogStreamProvider::new(
+            Arc::new(nats.clone()),
+            Duration::from_secs(5),
+        )),
     ));
     let state = tickr_api::http::routes::build_app_state_with_command_bus(
         Arc::new(nats),
@@ -164,6 +167,13 @@ async fn http_register_reaches_the_sole_local_sqlite_writer() {
     let state = ApiCommandsState {
         definition_repository: Arc::new(writer_repository),
         nats: nats.clone(),
+        signal_applied_notifications:
+            tickr_conductor::signal_applied_notifier::all_nats_signal_applied_notifications(
+                nats.clone(),
+            )
+            .await
+            .unwrap()
+            .reconciliation(),
         relay_sender: Arc::new(DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),
         gate_index: gate_index(),

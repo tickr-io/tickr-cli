@@ -4,29 +4,30 @@
 
 The Task log shipper carries a Task instance's stdout telemetry into its selected Log staging stream. It is independent of task outcome reporting: a staging outage, bounded telemetry loss, or replay delay cannot block or revise the Task instance outcome.
 
-## Local Log staging stream
+## Accepted Log staging stream
 
-A Tickr Lite stream is identified by the Task-instance identity and pickup generation. Each accepted payload also carries a monotonic record sequence. Acceptance is reported only after the local journal has appended and synced the framed identity and payload under the admitted data-directory contract.
+Each pickup generation owns one Log staging stream identity. Every submitted payload carries a monotonic sequence identity, its SHA-256 content digest, and its bytes. Tickr Lite reports acceptance only after its framed journal record is appended and synced under the admitted data-directory contract. Fresh all-NATS reports acceptance only after the role's JetStream acknowledgement; its stable message identity is a duplicate-suppression aid, while replayed protocol identity and digest remain authoritative.
 
-A caller that cannot distinguish a completed acceptance from its own timeout looks up the stable identity before retrying. The same identity with identical bytes is already accepted; the same identity with different bytes is rejected. A retry never appends a second accepted record.
+A caller that cannot distinguish completed acceptance from its own timeout reopens the stream and looks up the stable identity before retrying. The same identity and digest is already accepted; the same identity with different content is rejected. Logical replay exposes one Accepted Log record even if a substrate physically contains a duplicate delivery.
 
-The committed frontier is the greatest contiguous sequence range beginning at zero. Replay exposes only records at or below that frontier, in sequence order. An accepted record beyond a hole remains durable but is not replayable until the missing range is accepted or explicitly covered by a durable pre-acceptance gap.
+The committed frontier is the greatest contiguous sequence range beginning at zero. Replay exposes accepted records and declared gaps through that frontier in identity order. An accepted record beyond a hole remains durable but is not replayable until the missing range is accepted or explicitly covered by a durable pre-acceptance gap.
 
-Telemetry discarded before acceptance is non-blocking loss. The shipper writes a durable pre-acceptance gap before any later record can move the frontier across that sequence range. A gap cannot overlap accepted data, so accepted bytes are never represented as loss.
+The stdout drain assigns sequence identity before copying a chunk into bounded memory and never waits for acceptance. An evicted chunk remains pre-acceptance telemetry loss. Before a later record can move the committed frontier across that sequence, the publisher durably declares the lost range as a pre-acceptance gap. A gap cannot overlap accepted data, so Accepted Log bytes are never represented as loss.
 
-The Executor writes the sole clean End-of-stream marker after stdout production ends and all known accepted identities are contiguous. On recovery, a stream without that marker receives a durable abnormal-closure record; recovery must not manufacture an End-of-stream marker. Replay places either terminal record after the committed payload and gap records.
+The Executor writes the sole controlled End-of-stream record only after stdout production ends and the bounded acceptance flush completes. A stream interrupted without a terminal receives a durable abnormal-closure record carrying its last committed frontier; recovery and Compaction must not manufacture a controlled end. Replay places either terminal record after committed payload and gap records.
 
 ## Ordering and lifecycle invariants
 
-- The stdout drain runs concurrently with child-process waiting. Task completion does not wait for local publication or replay.
-- The log path may drop only telemetry that has not crossed the acceptance boundary. It must record such loss before frontier progress hides it.
-- A clean End-of-stream marker and abnormal closure are mutually exclusive terminal records.
-- Reopening a journal after a partial trailing write truncates only that incomplete, unaccepted tail. A complete valid record is treated as accepted so an ambiguous caller can resolve by identity lookup.
+- Stdout and stderr drains run concurrently with child-process waiting and never acquire the acceptance path. A slow or unavailable staging backend cannot back-pressure the Task process or revise its outcome.
+- The Log path may drop only telemetry that has not crossed the acceptance boundary. It must durably declare such loss before frontier progress hides it.
+- A controlled End-of-stream record and abnormal closure are mutually exclusive durable terminal records.
+- Reconnect and process restart reconstruct accepted identities, declared gaps, the committed frontier, and terminal state from durable replay.
+- Reopening a local journal after a partial trailing write truncates only that incomplete, unaccepted tail. A complete valid record is treated as accepted so an ambiguous caller can resolve by identity lookup.
 
 ## Seal and final installation
 
-Compaction seals only a stream with one durable terminal record. The seal freezes every accepted record identity and bytes, including accepted records beyond a replay frontier, and stores their SHA-256 digest in the staging journal. Repeating a seal for the same stream returns that record set and digest; a mismatching recovered seal is corruption.
+Compaction seals only a stream with one durable terminal record. The immutable stream digest covers the stream identity, committed frontier, every Accepted Log record identity, content digest, and byte sequence including records beyond a replay hole, every declared pre-acceptance gap, and the terminal state. Repeating a seal over unchanged state returns the same identity; a mismatching recovered seal is corruption. The Workflow-instance Compaction seal combines every stream digest with the sealed tickr-ctx scope digest before final-Log installation begins.
 
-Final installation writes a protocol-identified record document and separate terminal metadata beneath the locked root. Each file is first created below `tmp/`, synced, atomically replaced into `logs/final/`, and followed by a destination-parent sync. The resulting reference carries only stream identity and verified record, final-log, and exit-metadata digests; it does not expose a backend location.
+Tickr Lite records the stream seal in its staging journal before installing the protocol-identified record document and separate terminal metadata beneath the locked root. Fresh all-NATS records the Compaction seal in its durable staging identity store, writes the existing deterministic S3-compatible objects, and retains each object's path, length, and SHA-256 digest as installation identity without changing the existing final-Log reference projection.
 
-An interrupted retry either completes an already-valid temporary file or verifies and re-syncs an already-installed destination. A partial or mismatching temporary file is moved into quarantine and returns an explicit failure for retry. Unknown protocol identity, unreadable files, and any digest or identity disagreement fail closed; no empty final Log is substituted.
+Every installed file or object is re-read and checked against its retained length and SHA-256 digest before the archive transaction may commit. An interrupted retry verifies the same identity or rewrites the same deterministic object bytes; any digest or identity disagreement fails closed. Purge is forbidden until verified installation and archive-commit evidence exist. Fresh all-NATS removes Accepted Log records and gaps but retains one terminal fence per sealed pickup generation so a late writer remains rejected after purge.

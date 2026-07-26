@@ -660,6 +660,7 @@ impl LocalTaskPickupWriterClient {
     }
 }
 
+#[async_trait::async_trait]
 impl SafePickupWriter for LocalTaskPickupWriterClient {
     async fn select_pending(&self) -> WriterResult<Option<PendingLocalDispatch>> {
         let (response, receive) = oneshot::channel();
@@ -724,6 +725,7 @@ impl SafePickupWriter for LocalTaskPickupWriterClient {
     async fn arm_liveness(
         &self,
         claim: &LocalPickupClaim,
+        _payload: &[u8],
         deadline: PickupTimestamp,
         now: PickupTimestamp,
     ) -> WriterResult<bool> {
@@ -788,6 +790,7 @@ impl SafePickupWriter for LocalTaskPickupWriterClient {
     }
 }
 
+#[async_trait::async_trait]
 impl SafeAttemptOutcomeHandoff for LocalTaskPickupWriterClient {
     async fn select_due_liveness(
         &self,
@@ -1032,21 +1035,23 @@ fn writer_stopped() -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/attempt_outcome_laws.rs"]
+mod attempt_outcome_laws;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::time::Duration;
 
     use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
     use tickr_executor::local_pickup::{
-        new_pickup_identity, CancellationReconciliation, ExecutorFleetStatus,
-        LocalExecutorFleetStatus, LocalTaskHandler, NoopPickupCheckpoint, PickupBoundary,
-        PickupCheckpoint, PickupOutcome, SafeCancellationCoordinator, SafePickupError,
-        SafePickupExecutor, TaskProcessLauncher,
+        new_pickup_identity, CancellationReconciliation, LocalExecutorCapacity, LocalTaskHandler,
+        NoopPickupCheckpoint, PickupBoundary, PickupCheckpoint, PickupOutcome,
+        SafeCancellationCoordinator, SafePickupError, SafePickupExecutor, TaskProcessLauncher,
     };
     use tickr_executor::wire::{
         encode_cancel_ack, encode_dispatch, encode_task_event, DispatchedTask, EmitKind,
@@ -1217,7 +1222,7 @@ mod tests {
     fn executor<C: PickupCheckpoint>(
         client: LocalTaskPickupWriterClient,
         launch_log: PathBuf,
-        fleet_status: LocalExecutorFleetStatus,
+        capacity: LocalExecutorCapacity,
         checkpoint: C,
     ) -> SafePickupExecutor<LocalTaskPickupWriterClient, RealChildLauncher, C> {
         SafePickupExecutor::with_checkpoint(
@@ -1227,7 +1232,7 @@ mod tests {
                 run_for: Duration::from_millis(150),
             },
             checkpoint,
-            fleet_status,
+            capacity,
             "executor-one",
             Duration::from_millis(200),
         )
@@ -1264,6 +1269,7 @@ mod tests {
         assert!(client
             .arm_liveness(
                 &claim,
+                &[],
                 now + Duration::from_secs(5),
                 now + Duration::from_millis(1),
             )
@@ -1294,7 +1300,7 @@ mod tests {
             client,
             task_handler.clone(),
             NoopPickupCheckpoint,
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             "executor-one",
             Duration::from_secs(5),
         );
@@ -1333,8 +1339,8 @@ mod tests {
         assert!(first_dispatch.1);
 
         let executor_id = new_pickup_identity();
-        let fleet_status =
-            LocalExecutorFleetStatus::new(executor_id, NonZeroUsize::new(1).unwrap());
+        let capacity = LocalExecutorCapacity::new(executor_id, NonZeroUsize::new(1).unwrap());
+        let fleet_status = capacity.observation();
         let pickup = SafePickupExecutor::with_checkpoint(
             runtime.client.clone(),
             RealChildLauncher {
@@ -1342,7 +1348,7 @@ mod tests {
                 run_for: Duration::from_millis(250),
             },
             NoopPickupCheckpoint,
-            fleet_status.clone(),
+            capacity,
             "executor-one",
             Duration::from_millis(200),
         );
@@ -1396,6 +1402,98 @@ mod tests {
         runtime.stop().await;
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum FleetObservationCase {
+        Missing,
+        Stale,
+        Duplicated,
+        Contradictory,
+    }
+
+    impl FleetObservationCase {
+        const ALL: [Self; 4] = [
+            Self::Missing,
+            Self::Stale,
+            Self::Duplicated,
+            Self::Contradictory,
+        ];
+    }
+
+    fn local_observations(
+        case: FleetObservationCase,
+        capacity: &LocalExecutorCapacity,
+    ) -> Vec<tickr_executor::local_pickup::ExecutorCapacitySnapshot> {
+        let current = capacity.observation().snapshot();
+        match case {
+            FleetObservationCase::Missing => Vec::new(),
+            FleetObservationCase::Stale => vec![current],
+            FleetObservationCase::Duplicated => vec![current, current],
+            FleetObservationCase::Contradictory => {
+                vec![tickr_executor::local_pickup::ExecutorCapacitySnapshot {
+                    executor_id: current.executor_id,
+                    configured_process_slots: 0,
+                    in_flight_count: usize::MAX,
+                }]
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lite_dispatch_is_unchanged_by_fleet_observation_matrix() {
+        for case in FleetObservationCase::ALL {
+            let temp = TempDir::new().unwrap();
+            let repository = open_repository(&temp).await;
+            let runtime = WriterRuntime::normal(repository.clone());
+            let (dispatch_key, inserted) = runtime
+                .client
+                .stage_dispatch(&encode_dispatch(&valid_task()))
+                .await
+                .unwrap();
+            assert!(inserted);
+
+            let capacity =
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap());
+            let observations = local_observations(case, &capacity);
+            let outcome = executor(
+                runtime.client.clone(),
+                temp.path().join("launches"),
+                capacity,
+                NoopPickupCheckpoint,
+            )
+            .run_one()
+            .await
+            .unwrap_or_else(|error| panic!("{case:?} fleet observation changed dispatch: {error}"));
+
+            assert!(
+                matches!(outcome, PickupOutcome::Launched { .. }),
+                "{case:?} fleet observation changed Task execution"
+            );
+            let claimed = snapshot(&repository, &dispatch_key).await;
+            assert_eq!(
+                (
+                    claimed.state.as_str(),
+                    claimed.pickup_generation,
+                    claimed.owner.as_deref()
+                ),
+                ("claimed", 1, Some("executor-one")),
+                "{case:?} fleet observation changed queue ownership"
+            );
+            assert_eq!(launch_count(&temp.path().join("launches")), 1);
+            match case {
+                FleetObservationCase::Missing => assert!(observations.is_empty()),
+                FleetObservationCase::Stale => assert_eq!(observations.len(), 1),
+                FleetObservationCase::Duplicated => {
+                    assert_eq!(observations, vec![observations[0], observations[0]])
+                }
+                FleetObservationCase::Contradictory => {
+                    assert_eq!(observations[0].configured_process_slots, 0);
+                    assert_eq!(observations[0].in_flight_count, usize::MAX);
+                }
+            }
+            runtime.stop().await;
+        }
+    }
+
     #[tokio::test]
     async fn poison_is_rejected_and_quarantined_before_any_claim() {
         let temp = TempDir::new().unwrap();
@@ -1409,7 +1507,7 @@ mod tests {
         let outcome = executor(
             runtime.client.clone(),
             temp.path().join("launches"),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         )
         .run_one()
@@ -1440,6 +1538,7 @@ mod tests {
             PickupBoundary::AfterAssignedStaging,
             PickupBoundary::AfterInitialLivenessArm,
             PickupBoundary::AfterClaimProof,
+            PickupBoundary::AfterSourceAcknowledgement,
             PickupBoundary::AfterSpawn,
             PickupBoundary::AfterStartedStaging,
             PickupBoundary::AfterFirstLivenessRenewal,
@@ -1458,7 +1557,7 @@ mod tests {
             let error = executor(
                 first.client.clone(),
                 launch_log.clone(),
-                LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
                 FailAt(boundary),
             )
             .run_one()
@@ -1474,7 +1573,7 @@ mod tests {
             let restart_outcome = executor(
                 restart.client.clone(),
                 launch_log.clone(),
-                LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
                 NoopPickupCheckpoint,
             )
             .run_one()
@@ -1544,6 +1643,7 @@ mod tests {
                 boundary,
                 PickupBoundary::AfterInitialLivenessArm
                     | PickupBoundary::AfterClaimProof
+                    | PickupBoundary::AfterSourceAcknowledgement
                     | PickupBoundary::AfterSpawn
                     | PickupBoundary::AfterStartedStaging
                     | PickupBoundary::AfterFirstLivenessRenewal
@@ -1580,7 +1680,7 @@ mod tests {
             let result = executor(
                 runtime.client.clone(),
                 launch_log.clone(),
-                LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
                 NoopPickupCheckpoint,
             )
             .run_one()
@@ -1600,7 +1700,7 @@ mod tests {
                 executor(
                     restart.client.clone(),
                     launch_log.clone(),
-                    LocalExecutorFleetStatus::new(
+                    LocalExecutorCapacity::new(
                         new_pickup_identity(),
                         NonZeroUsize::new(1).unwrap(),
                     ),
@@ -1637,7 +1737,7 @@ mod tests {
         let outcome = executor(
             runtime.client.clone(),
             launch_log.clone(),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         )
         .run_one()
@@ -1671,7 +1771,7 @@ mod tests {
         let outcome = SafePickupExecutor::new(
             runtime.client.clone(),
             FailingLauncher,
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             "executor-one",
             Duration::from_millis(200),
         )
@@ -1711,7 +1811,7 @@ mod tests {
         let error = executor(
             first.client.clone(),
             launch_log.clone(),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             FailAt(PickupBoundary::AfterClaimProof),
         )
         .run_one()
@@ -1732,7 +1832,7 @@ mod tests {
         let recovered = executor(
             restart.client.clone(),
             launch_log.clone(),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         );
         assert_eq!(
@@ -1791,7 +1891,7 @@ mod tests {
         let recovered = executor(
             restart.client.clone(),
             temp.path().join("launches"),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         )
         .reconcile_one_due_liveness(failed_at + Duration::from_millis(1))
@@ -1805,6 +1905,35 @@ mod tests {
         assert_eq!(recovered.1, TerminalElection::Won);
         assert_eq!(launch_count(&temp.path().join("launches")), 0);
         restart.stop().await;
+    }
+
+    #[tokio::test]
+    async fn lite_adapter_satisfies_backend_neutral_attempt_outcome_law() {
+        let temp = TempDir::new().unwrap();
+        let repository = open_repository(&temp).await;
+        let runtime = WriterRuntime::normal(repository.clone());
+        let task = valid_task();
+        let (dispatch_key, _) = runtime
+            .client
+            .stage_dispatch(&encode_dispatch(&task))
+            .await
+            .unwrap();
+        let (claim, _) = claim_without_spawn(&runtime.client, &task).await;
+        assert!(runtime
+            .client
+            .stage_started(&claim, b"backend-neutral Started", pickup_now())
+            .await
+            .unwrap());
+
+        let winner =
+            attempt_outcome_laws::assert_attempt_outcome_law(runtime.client.clone(), &claim).await;
+        let settled = snapshot(&repository, &dispatch_key).await;
+        assert!(matches!(
+            winner,
+            LocalAttemptOutcome::ProcessExitedFailure | LocalAttemptOutcome::LivenessExpired
+        ));
+        assert_eq!(settled.staged_event_kinds.len(), 3);
+        runtime.stop().await;
     }
 
     #[tokio::test]
@@ -1826,7 +1955,7 @@ mod tests {
             let error = executor(
                 first.client.clone(),
                 launch_log.clone(),
-                LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
                 FailAt(boundary),
             )
             .run_one()
@@ -1842,7 +1971,7 @@ mod tests {
             let recovered = executor(
                 restart.client.clone(),
                 launch_log.clone(),
-                LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+                LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
                 NoopPickupCheckpoint,
             );
             if boundary == PickupBoundary::AfterProcessExitObservation {
@@ -1896,7 +2025,7 @@ mod tests {
         let outcome = executor(
             runtime.client.clone(),
             launch_log.clone(),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         )
         .run_one()
@@ -1998,11 +2127,10 @@ mod tests {
         let (dispatch_key, _) = runtime.client.stage_dispatch(&payload).await.unwrap();
         let (pickup, task_handler) =
             long_running_pickup(runtime.client.clone(), temp.path().join("launches"));
-        let coordinator =
-            SafeCancellationCoordinator::new(runtime.client.clone(), task_handler.clone());
+        let coordinator = SafeCancellationCoordinator::new(runtime.client.clone());
 
         let outcome = coordinator
-            .cancel_request(cancel_request(&task))
+            .cancel_request(&task_handler, cancel_request(&task))
             .await
             .unwrap();
         assert_eq!(
@@ -2085,8 +2213,8 @@ mod tests {
                 .cancellation_ack_forwarded
         );
 
-        let duplicate = SafeCancellationCoordinator::new(restart.client.clone(), task_handler)
-            .cancel_request(cancel_request(&task))
+        let duplicate = SafeCancellationCoordinator::new(restart.client.clone())
+            .cancel_request(&task_handler, cancel_request(&task))
             .await
             .unwrap();
         assert_eq!(
@@ -2135,8 +2263,8 @@ mod tests {
             launch_log: temp.path().join("launches"),
             run_for: Duration::from_secs(30),
         });
-        let outcome = SafeCancellationCoordinator::new(runtime.client.clone(), task_handler)
-            .cancel_request(request)
+        let outcome = SafeCancellationCoordinator::new(runtime.client.clone())
+            .cancel_request(&task_handler, request)
             .await
             .unwrap();
         assert_eq!(
@@ -2186,8 +2314,8 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = SafeCancellationCoordinator::new(runtime.client.clone(), task_handler)
-            .cancel_request(cancel_request(&task))
+        let outcome = SafeCancellationCoordinator::new(runtime.client.clone())
+            .cancel_request(&task_handler, cancel_request(&task))
             .await
             .unwrap();
         assert_eq!(outcome.reconciliation, CancellationReconciliation::Killed);
@@ -2278,7 +2406,7 @@ mod tests {
         let recovered = executor(
             restart.client.clone(),
             temp.path().join("restart-launches"),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         )
         .reconcile_one_due_liveness(stopped_at + Duration::from_millis(1))
@@ -2321,11 +2449,10 @@ mod tests {
         let recovered = executor(
             restart.client.clone(),
             temp.path().join("launches"),
-            LocalExecutorFleetStatus::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
+            LocalExecutorCapacity::new(new_pickup_identity(), NonZeroUsize::new(1).unwrap()),
             NoopPickupCheckpoint,
         );
-        let coordinator =
-            SafeCancellationCoordinator::new(restart.client.clone(), recovered.task_handler());
+        let coordinator = SafeCancellationCoordinator::new(restart.client.clone());
         assert_eq!(coordinator.reconcile_one().await.unwrap(), None);
         assert!(recovered
             .reconcile_one_due_liveness(claim.liveness_deadline + Duration::from_millis(1))

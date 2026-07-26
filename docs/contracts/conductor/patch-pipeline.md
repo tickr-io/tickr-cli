@@ -2,13 +2,13 @@
 
 **Status:** Current.
 
-**Code:** `src/conductor/src/patch_pipeline.rs`, `src/conductor/src/patch_pipeline/local.rs`, and `src/migrations/src/patch_repository.rs`.
+**Code:** `src/conductor/src/patch_pipeline.rs`, `src/conductor/src/patch_pipeline/local.rs`, `src/conductor/src/patch_pipeline/worker.rs`, and `src/migrations/src/patch_repository.rs`.
 
 ## What this component is
 
 The Patch pipeline owns an accepted Patch document from durable ingress through optional per-Task builds, validate-and-apply relay, and terminal outcome correlation. Patch identity and published request and response shapes do not vary by formation.
 
-The distributed formation transports per-Task build pointers through the `conductor_patch_build_queue` NATS queue group and uses periodic durable Patch re-drive. Tickr Lite does not use that build queue. It selects committed Patch build and lifecycle rows through the one-writer SQLite repository.
+The distributed formation publishes the existing per-Task pointers through the `conductor_patch_build_queue` NATS queue group only to request an earlier scan. Tickr Lite uses a bounded in-process hint. Both formations select and settle committed Patch build and lifecycle rows through the selected SQL repository; neither notification transport owns work.
 
 ## Durable identity and lifecycle
 
@@ -22,15 +22,15 @@ A Patch follows the existing lifecycle:
 
 `Applied`, `Rejected`, and `BuildFailed` are terminal. A duplicate ingress returns the existing row. A late or duplicate outcome cannot reopen a terminal row.
 
-## Tickr Lite selection and notifications
+## Formation-neutral selection and notifications
 
-Tickr Lite runs one startup scan before its steady-state loop. Timer-led scans remain bounded. A bounded in-process notification may request an immediate scan after ingress commits, but a full channel, closed channel, dropped sender, or process exit loses only that latency hint.
+Every Patch reconciler runs one startup scan before its steady-state loop and repeats bounded timer-led scans. NATS pointers or a bounded in-process notification may request an immediate scan after ingress commits, but loss, duplication, delay, reordering, a malformed or stale payload, a full or closed channel, and process exit affect only scan latency.
 
 Build work is eligible when the per-Task row is `pending`, the parent Patch is `Building`, and its previous lease is absent or expired. Selection orders by `pending_since`, Patch identity, and Task identity.
 
 Lifecycle work is eligible when the Patch is `Validating` or `Submitted`, its backoff age is satisfied, and its previous lifecycle lease is absent or expired. Selection orders by `updated_at` and Patch identity. Startup and notification-led reconciliation use zero minimum age; steady-state scans apply the configured bounded backoff.
 
-Every selection has a fixed batch limit. Selection and lease acquisition commit an owner, opaque token, and expiry through the formation's sole SQLite writer before a build executor or relay sender runs.
+Every selection has a fixed batch limit. Selection and lease acquisition commit an owner, opaque token, and expiry before a build executor or relay sender runs. Postgres competitors use locked skip-locked selection; Tickr Lite serializes the same law through its sole SQLite writer.
 
 ## Build lease and finalizer law
 
@@ -50,18 +50,18 @@ Only the `Submitted` winner attempts the validate-and-apply relay. A crash after
 
 A lifecycle worker rebuilds the validate-and-apply envelope only from the leased committed row. A successful send conditionally records `Submitted`, refreshes `updated_at`, and clears the exact live lease. A failed send conditionally releases the lease and leaves the durable row eligible for a later scan. A stale worker cannot settle or clear another owner's lease.
 
-A process can fail after the relay accepts an envelope but before local lease settlement. Recovery may therefore send the same envelope again. Every retry carries the same `patch_key`; the existing server-side Patch identity absorbs redelivery so only one Patch application wins. The local lease prevents concurrent ordinary processing, while stable identity resolves the unavoidable post-effect crash ambiguity.
+A process can fail after the relay accepts an envelope but before lease settlement. Recovery may therefore send the same envelope again. Every retry carries the same `patch_key`; the existing server-side Patch identity absorbs redelivery so only one Patch application wins. The lifecycle lease prevents concurrent ordinary processing, while stable identity resolves the unavoidable post-effect crash ambiguity.
 
 Terminal outcome correlation remains a conditional transition over the same `patch_key` and Workflow-instance identity. Its winning transaction records the terminal state and clears any lifecycle lease. Duplicate outcomes return a typed non-winning correlation and create no second terminal transition.
 
 ## Invariants
 
 - **Durable source.** Channels and worker lifetimes never create, acknowledge, or remove Patch work.
-- **Stable bounded selection.** Every local scan leases a deterministic, bounded set of committed rows.
+- **Stable bounded selection.** Every scan leases a deterministic, bounded set of committed rows.
 - **Commit before execution.** Build or relay work starts only after lease acquisition commits.
 - **Lease-guarded settlement.** An expired or superseded lease cannot mutate a Task row, parent finalizer, or lifecycle marker.
 - **Exactly one finalizer.** Competing successful Task settlements yield one `Submitted` winner.
 - **Stable effect identity.** Ambiguous or repeated relay sends retain one `patch_key` and therefore one winning apply.
 - **Terminal monotonicity.** No notification, expired lease, build result, relay retry, or outcome correlation reopens a terminal Patch.
 
-The file-backed SQLite suite covers restart after ingress, claim survival and expiry, build execution, competing finalizers, committed apply intent recovery, terminal settlement, and full or closed notification channels.
+The file-backed SQLite suite covers restart after ingress, claim survival and expiry, build execution, competing finalizers, committed apply-intent recovery, terminal settlement, and full or closed notification channels. The Postgres suite suppresses notifications, competes reconcilers, expires crashed claims, and kills real worker processes before claim, during build, and on both sides of the atomic settlement/finalizer boundary.

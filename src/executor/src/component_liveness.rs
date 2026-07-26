@@ -17,8 +17,12 @@
 //! not coupled to dispatch/completion, so there is no real-time write churn.
 
 use anyhow::Result;
-use async_nats::jetstream::{self, kv};
+use async_nats::jetstream::{
+    self,
+    kv::{self, Operation},
+};
 use async_nats::Client as NatsClient;
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tickr_proto::coord::{
@@ -30,6 +34,9 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::local_pickup::{
+    ExecutorCapacityObservation, ExecutorFleetSnapshot, ExecutorFleetStatus, LocalExecutorCapacity,
+};
 use crate::self_reaping_key;
 use crate::task_liveness::LivenessConfig;
 
@@ -61,12 +68,159 @@ pub async fn ensure_component_liveness_bucket(nats: &NatsClient) -> Result<kv::S
     .map_err(|e| anyhow::anyhow!("create component-liveness KV bucket: {}", e))
 }
 
-/// Spawn the process-lifetime component-liveness re-arm loop. Arms the key once
-/// immediately (so the executor is counted without waiting a full cadence), then
-/// re-arms every `TTL/4`, reading `in_flight` off the shared dispatch `semaphore`
-/// at each beat. Cancelled by `shutdown`, at which point re-arming stops and the
-/// key self-reaps by TTL. The caller must ensure the bucket exists first — a
-/// missing bucket makes every arm's publish fail (logged, non-fatal).
+/// All-NATS implementation of the observational ExecutorFleetStatus role.
+///
+/// NATS keys remain private to this adapter. Callers receive only the common
+/// report/snapshot interface.
+#[derive(Clone)]
+pub struct NatsExecutorFleetStatus {
+    nats: NatsClient,
+    observation_ttl: Duration,
+}
+
+impl NatsExecutorFleetStatus {
+    pub fn new(nats: NatsClient, observation_ttl: Duration) -> Self {
+        Self {
+            nats,
+            observation_ttl,
+        }
+    }
+
+    pub async fn prepare(&self) -> Result<()> {
+        ensure_component_liveness_bucket(&self.nats).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutorFleetStatus for NatsExecutorFleetStatus {
+    fn observation_ttl(&self) -> Duration {
+        self.observation_ttl
+    }
+
+    async fn report(&self, observation: ExecutorCapacityObservation) -> Result<(), String> {
+        let value = ComponentLivenessValue {
+            cap: observation.configured_process_slots,
+            in_flight: observation.in_flight_count,
+        };
+        let bytes =
+            serde_json::to_vec(&value).map_err(|_| "invalid fleet observation".to_string())?;
+        let js = jetstream::new(self.nats.clone());
+        self_reaping_key::arm(
+            &js,
+            COMPONENT_LIVENESS_BUCKET,
+            &component_liveness_key(observation.executor_id),
+            &bytes,
+            self.observation_ttl,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn fleet_snapshot(&self) -> Result<ExecutorFleetSnapshot, String> {
+        let server_time_millis = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let observation_ttl_millis =
+            u64::try_from(self.observation_ttl.as_millis()).unwrap_or(u64::MAX);
+        let empty = || ExecutorFleetSnapshot {
+            server_time_millis,
+            observation_ttl_millis,
+            observations: Vec::new(),
+        };
+        let js = jetstream::new(self.nats.clone());
+        let store = match js.get_key_value(COMPONENT_LIVENESS_BUCKET).await {
+            Ok(store) => store,
+            Err(_) => return Ok(empty()),
+        };
+        let mut keys = match store.keys().await {
+            Ok(keys) => keys,
+            Err(_) => return Ok(empty()),
+        };
+        let mut observations = Vec::new();
+
+        while let Some(item) = keys.next().await {
+            let Ok(key) = item else { continue };
+            let Some(executor_id) = key
+                .strip_prefix("executor.")
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let entry = match store.entry(&key).await {
+                Ok(Some(entry)) if entry.operation == Operation::Put => entry,
+                _ => continue,
+            };
+            let Ok(value) = serde_json::from_slice::<ComponentLivenessValue>(&entry.value) else {
+                continue;
+            };
+            let observed_at_server_millis =
+                u64::try_from(entry.created.unix_timestamp_nanos().max(0) / 1_000_000)
+                    .unwrap_or(u64::MAX);
+            let expires_at_server_millis =
+                observed_at_server_millis.saturating_add(observation_ttl_millis);
+            if expires_at_server_millis <= server_time_millis {
+                continue;
+            }
+            observations.push(ExecutorCapacityObservation {
+                executor_id,
+                reporter_id: executor_id,
+                sequence: entry.revision,
+                configured_process_slots: value.cap,
+                in_flight_count: value.in_flight,
+                observed_at_server_millis,
+                expires_at_server_millis,
+            });
+        }
+        observations.sort_unstable_by_key(|observation| observation.executor_id);
+        Ok(ExecutorFleetSnapshot {
+            server_time_millis,
+            observation_ttl_millis,
+            observations,
+        })
+    }
+}
+
+/// Spawn one process-incarnation reporter over an observational role interface.
+///
+/// The loop owns one reporter identity and a monotonic sequence. Report
+/// outcomes never feed dispatch admission or local semaphore ownership.
+pub fn spawn_executor_fleet_reporting(
+    fleet_status: Arc<dyn ExecutorFleetStatus>,
+    capacity: LocalExecutorCapacity,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let reporter_id = Uuid::new_v4();
+        let cadence = fleet_status
+            .observation_ttl()
+            .checked_div(4)
+            .unwrap_or(Duration::ZERO);
+        let cadence = cadence.max(Duration::from_millis(1));
+        let mut sequence = 0u64;
+
+        loop {
+            sequence = sequence.saturating_add(1);
+            let snapshot = capacity.snapshot();
+            let observation = ExecutorCapacityObservation {
+                executor_id: snapshot.executor_id,
+                reporter_id,
+                sequence,
+                configured_process_slots: snapshot.configured_process_slots,
+                in_flight_count: snapshot.in_flight_count,
+                observed_at_server_millis: 0,
+                expires_at_server_millis: 0,
+            };
+            if let Err(error) = fleet_status.report(observation).await {
+                eprintln!("executor fleet observation failed: {error}");
+            }
+
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = sleep(cadence) => {}
+            }
+        }
+    })
+}
+/// Compatibility wrapper for the existing all-NATS fleet-observation suite.
 pub fn spawn_component_liveness(
     nats: Arc<NatsClient>,
     config: LivenessConfig,
@@ -75,44 +229,76 @@ pub fn spawn_component_liveness(
     executor_id: Uuid,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let js = jetstream::new((*nats).clone());
-        let key = component_liveness_key(executor_id);
-        let timeout = config.timeout;
-        let cadence = config.cadence();
-
-        // First arm at boot — before the first cadence tick — so a just-booted
-        // executor is counted immediately.
-        arm_once(&js, &key, &semaphore, cap, timeout).await;
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = sleep(cadence) => arm_once(&js, &key, &semaphore, cap, timeout).await,
-            }
-        }
-    })
+    let cap = std::num::NonZeroUsize::new(cap).expect("component capacity is positive");
+    let capacity = LocalExecutorCapacity::from_process_slots(executor_id, cap, semaphore);
+    spawn_executor_fleet_reporting(
+        Arc::new(NatsExecutorFleetStatus::new(
+            (*nats).clone(),
+            config.timeout,
+        )),
+        capacity,
+        shutdown,
+    )
 }
 
-/// Compute the current `{cap, in_flight}` and arm the key once.
-async fn arm_once(
-    js: &jetstream::Context,
-    key: &str,
-    semaphore: &Semaphore,
-    cap: usize,
-    timeout: Duration,
-) {
-    // in_flight = cap − available_permits, read straight off the shared dispatch
-    // semaphore — no separate counter to drift. Known coarse-gauge bias (document,
-    // don't fight): the drain acquires a permit *before* each speculative pull and
-    // holds it through the batch wait, so a fully idle executor reads
-    // in_flight = 1, not 0 — acceptable for a ~30s saturation gauge.
-    let in_flight = cap.saturating_sub(semaphore.available_permits());
-    let value = ComponentLivenessValue { cap, in_flight };
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => {
-            self_reaping_key::arm(js, COMPONENT_LIVENESS_BUCKET, key, &bytes, timeout).await
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    struct CapturingFleetStatus {
+        reports: mpsc::UnboundedSender<ExecutorCapacityObservation>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutorFleetStatus for CapturingFleetStatus {
+        fn observation_ttl(&self) -> Duration {
+            Duration::from_millis(4)
         }
-        Err(e) => eprintln!("component-liveness value serialize failed: {e}"),
+
+        async fn report(&self, observation: ExecutorCapacityObservation) -> Result<(), String> {
+            self.reports
+                .send(observation)
+                .map_err(|_| "capture closed".to_string())
+        }
+
+        async fn fleet_snapshot(&self) -> Result<ExecutorFleetSnapshot, String> {
+            Err("report-only test role".to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reporter_incarnation_is_monotonic_and_observes_local_capacity() {
+        let executor_id = Uuid::new_v4();
+        let capacity =
+            LocalExecutorCapacity::new(executor_id, NonZeroUsize::new(2).expect("non-zero"));
+        let (reports, mut received) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let handle = spawn_executor_fleet_reporting(
+            Arc::new(CapturingFleetStatus { reports }),
+            capacity.clone(),
+            shutdown.clone(),
+        );
+
+        let first = received.recv().await.expect("initial observation");
+        let permit = capacity
+            .acquire_process_slot()
+            .await
+            .expect("local slot remains available");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let second = received.recv().await.expect("replacement observation");
+
+        assert_eq!(first.executor_id, executor_id);
+        assert_eq!(first.reporter_id, second.reporter_id);
+        assert!(first.sequence < second.sequence);
+        assert_eq!(first.in_flight_count, 0);
+        assert_eq!(second.in_flight_count, 1);
+
+        drop(permit);
+        shutdown.cancel();
+        handle.await.expect("reporter exits");
     }
 }

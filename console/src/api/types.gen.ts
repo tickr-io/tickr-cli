@@ -737,13 +737,25 @@ export interface components {
             seq: number;
             ts: string;
         };
+        /**
+         * @description Public API contract.
+         * @enum {string}
+         */
+        ExecutorCapacityInterpretation: "observation_only";
         /** @description Public API contract. */
         ExecutorHealth: {
+            capacity_interpretation: components["schemas"]["ExecutorCapacityInterpretation"];
             configured_process_slots?: number | null;
             detail: string;
             detection_window: string;
+            /** Format: int64 */
+            freshest_observation_age_ms?: number | null;
             in_flight_count?: number | null;
+            /** Format: int64 */
+            observation_ttl_ms?: number | null;
             observed_executors?: number | null;
+            /** Format: int64 */
+            oldest_observation_age_ms?: number | null;
             status: components["schemas"]["ComponentStatus"];
         };
         /** @description Public API contract. */
@@ -828,6 +840,7 @@ export interface components {
             local_coordination?: null | components["schemas"]["ComponentHealth"];
             nats_kv: components["schemas"]["ComponentHealth"];
             readiness?: null | components["schemas"]["ReadinessHealth"];
+            redis_capability?: unknown;
         };
         /**
          * @description Public API contract.

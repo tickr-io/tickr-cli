@@ -1,8 +1,8 @@
-//! Durable Patch build and lifecycle processing for Tickr Lite.
+//! Durable Patch build and lifecycle reconciliation over authoritative rows.
 //!
-//! Committed SQLite rows are authoritative. The bounded channel only shortens
-//! scan latency; startup and periodic scans recover work after notification loss
-//! or process restart.
+//! The bounded local channel only shortens scan latency; startup and periodic
+//! scans recover work after notification loss or process restart. Distributed
+//! formation notifications use the same scan law.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{envelope_from_repository_row, PatchRelaySender};
 use crate::build_pipeline::{BuildExecutor, BuildOutcome, TaskBuildJob};
+use crate::lifecycle_work::{LifecycleClaimAdmission, LifecyclePipeline, OpenLifecycleClaims};
 
 /// Bounded best-effort wakeup for newly committed Patch work.
 #[derive(Clone)]
@@ -49,13 +50,13 @@ pub fn patch_work_notifications(
 impl PatchWorkNotifier {
     /// Request an immediate durable scan. A full or closed channel loses only
     /// this hint; no committed Patch row is acknowledged by the channel.
-    pub fn notify(&self) {
-        let _ = self.sender.try_send(());
+    pub fn notify(&self) -> bool {
+        self.sender.try_send(()).is_ok()
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct LocalPatchWorkerConfig {
+pub struct PatchReconcilerConfig {
     pub scan_interval: Duration,
     pub build_lease_duration: Duration,
     pub lifecycle_lease_duration: Duration,
@@ -63,7 +64,7 @@ pub struct LocalPatchWorkerConfig {
     pub batch_size: NonZeroUsize,
 }
 
-impl Default for LocalPatchWorkerConfig {
+impl Default for PatchReconcilerConfig {
     fn default() -> Self {
         Self {
             scan_interval: Duration::from_secs(5),
@@ -75,15 +76,38 @@ impl Default for LocalPatchWorkerConfig {
     }
 }
 
-/// Run startup reconciliation followed by bounded notification- and timer-led
-/// scans until formation cancellation.
 pub async fn start_local_patch_worker(
     repositories: Arc<WriterRepositoryBundle>,
     executor: Arc<dyn BuildExecutor>,
     sender: Arc<dyn PatchRelaySender>,
     lease_owner: String,
+    notifications: PatchWorkNotificationStream,
+    config: PatchReconcilerConfig,
+    cancel: CancellationToken,
+) -> Result<()> {
+    start_local_patch_worker_with_claim_admission(
+        repositories,
+        executor,
+        sender,
+        lease_owner,
+        notifications,
+        Arc::new(OpenLifecycleClaims),
+        config,
+        cancel,
+    )
+    .await
+}
+
+/// Run startup reconciliation followed by bounded notification- and timer-led
+/// scans until formation cancellation.
+pub async fn start_local_patch_worker_with_claim_admission(
+    repositories: Arc<WriterRepositoryBundle>,
+    executor: Arc<dyn BuildExecutor>,
+    sender: Arc<dyn PatchRelaySender>,
+    lease_owner: String,
     mut notifications: PatchWorkNotificationStream,
-    config: LocalPatchWorkerConfig,
+    claim_admission: Arc<dyn LifecycleClaimAdmission>,
+    config: PatchReconcilerConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
     if config.scan_interval.is_zero() {
@@ -105,7 +129,7 @@ pub async fn start_local_patch_worker(
     let mut ticker = tokio::time::interval(config.scan_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await;
-    scan_once(
+    scan_once_with_claim_admission(
         repositories.as_ref(),
         executor.as_ref(),
         sender.as_ref(),
@@ -114,6 +138,7 @@ pub async fn start_local_patch_worker(
         lifecycle_lease_duration,
         chrono::Duration::zero(),
         config.batch_size,
+        claim_admission.as_ref(),
     )
     .await?;
 
@@ -122,7 +147,7 @@ pub async fn start_local_patch_worker(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                scan_once(
+                scan_once_with_claim_admission(
                     repositories.as_ref(),
                     executor.as_ref(),
                     sender.as_ref(),
@@ -131,11 +156,12 @@ pub async fn start_local_patch_worker(
                     lifecycle_lease_duration,
                     lifecycle_min_age,
                     config.batch_size,
+                    claim_admission.as_ref(),
                 ).await?;
             }
             notification = notifications.receiver.recv(), if notifications_open => {
                 if notification.is_some() {
-                    scan_once(
+                    scan_once_with_claim_admission(
                         repositories.as_ref(),
                         executor.as_ref(),
                         sender.as_ref(),
@@ -144,6 +170,7 @@ pub async fn start_local_patch_worker(
                         lifecycle_lease_duration,
                         chrono::Duration::zero(),
                         config.batch_size,
+                        claim_admission.as_ref(),
                     ).await?;
                 } else {
                     notifications_open = false;
@@ -155,7 +182,7 @@ pub async fn start_local_patch_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn scan_once(
+async fn scan_once_with_claim_admission(
     repositories: &WriterRepositoryBundle,
     executor: &dyn BuildExecutor,
     sender: &dyn PatchRelaySender,
@@ -164,6 +191,7 @@ async fn scan_once(
     lifecycle_lease_duration: chrono::Duration,
     lifecycle_min_age: chrono::Duration,
     batch_size: NonZeroUsize,
+    claim_admission: &dyn LifecycleClaimAdmission,
 ) -> Result<()> {
     // Re-drive already committed apply intents before opening fresh build work.
     // This avoids a startup build finalizer and startup reconciliation racing to
@@ -175,6 +203,7 @@ async fn scan_once(
         lifecycle_lease_duration,
         lifecycle_min_age,
         batch_size,
+        claim_admission,
     )
     .await?;
     scan_builds(
@@ -184,6 +213,7 @@ async fn scan_once(
         lease_owner,
         build_lease_duration,
         batch_size,
+        claim_admission,
     )
     .await
 }
@@ -195,8 +225,14 @@ async fn scan_builds(
     lease_owner: &str,
     lease_duration: chrono::Duration,
     batch_size: NonZeroUsize,
+    claim_admission: &dyn LifecycleClaimAdmission,
 ) -> Result<()> {
     let now = Utc::now();
+    if !repositories.has_reclaimable_patch_build(now).await?
+        || !claim_admission.claims_open(LifecyclePipeline::PatchBuild)
+    {
+        return Ok(());
+    }
     let leases = repositories
         .lease_patch_build_tasks(PatchBuildLeaseRequest {
             owner: lease_owner,
@@ -242,7 +278,7 @@ async fn process_leased_build(
             let envelope = envelope_from_repository_row(&row);
             if let Err(error) = sender.send(&envelope).await {
                 eprintln!(
-                    "local Patch worker: apply relay failed for {} (will re-drive): {error}",
+                    "Patch reconciler: apply relay failed for {} (will re-drive): {error}",
                     lease.task.patch_key
                 );
             }
@@ -250,7 +286,7 @@ async fn process_leased_build(
         LeasedPatchBuildSettlementOutcome::Settled(PatchBuildSettlementOutcome::BuildFailed) => {
             if let BuildOutcome::Failure { error } = outcome {
                 eprintln!(
-                    "local Patch worker: Patch {} task {} failed: {error}",
+                    "Patch reconciler: Patch {} task {} failed: {error}",
                     lease.task.patch_key, lease.task.task_id
                 );
             }
@@ -263,7 +299,7 @@ async fn process_leased_build(
         | LeasedPatchBuildSettlementOutcome::LeaseLost => {}
         LeasedPatchBuildSettlementOutcome::Settled(PatchBuildSettlementOutcome::Absent) => {
             eprintln!(
-                "local Patch worker: build task disappeared for {}/{}",
+                "Patch reconciler: build task disappeared for {}/{}",
                 lease.task.patch_key, lease.task.task_id
             );
         }
@@ -278,8 +314,16 @@ async fn scan_lifecycle(
     lease_duration: chrono::Duration,
     min_age: chrono::Duration,
     batch_size: NonZeroUsize,
+    claim_admission: &dyn LifecycleClaimAdmission,
 ) -> Result<()> {
     let now = Utc::now();
+    if !repositories
+        .has_reclaimable_patch_lifecycle(now, now - min_age)
+        .await?
+        || !claim_admission.claims_open(LifecyclePipeline::PatchBuild)
+    {
+        return Ok(());
+    }
     let leases = repositories
         .lease_patch_lifecycle(PatchLifecycleLeaseRequest {
             owner: lease_owner,
@@ -313,7 +357,7 @@ async fn process_leased_lifecycle(
         }
         Err(error) => {
             eprintln!(
-                "local Patch worker: lifecycle relay failed for {} (will re-drive): {error}",
+                "Patch reconciler: lifecycle relay failed for {} (will re-drive): {error}",
                 lease.row.patch_key
             );
             repositories.release_patch_lifecycle_lease(&lease).await?;

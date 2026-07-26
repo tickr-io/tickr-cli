@@ -31,30 +31,37 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-async fn start_nats() -> Option<(
+async fn start_nats_with_url() -> Option<(
     testcontainers_modules::testcontainers::ContainerAsync<Nats>,
     async_nats::Client,
+    String,
 )> {
     let cmd = NatsServerCmd::default().with_jetstream();
     let container = match Nats::default().with_cmd(&cmd).start().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("skipping: NATS testcontainer unavailable: {}", e);
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("skipping: NATS testcontainer unavailable: {error}");
             return None;
         }
     };
     let port = container.get_host_port_ipv4(4222).await.ok()?;
-    let url = format!("nats://127.0.0.1:{}", port);
-
-    let mut client = None;
+    let url = format!("nats://127.0.0.1:{port}");
     for _ in 0..20 {
-        if let Ok(c) = async_nats::connect(&url).await {
-            client = Some(c);
-            break;
+        if let Ok(client) = async_nats::connect(&url).await {
+            return Some((container, client, url));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Some((container, client.expect("nats connect")))
+    panic!("nats connect");
+}
+
+async fn start_nats() -> Option<(
+    testcontainers_modules::testcontainers::ContainerAsync<Nats>,
+    async_nats::Client,
+)> {
+    start_nats_with_url()
+        .await
+        .map(|(container, client, _)| (container, client))
 }
 
 async fn start_postgres_with_migrations() -> Option<(common::DbGuard, sqlx::PgPool)> {
@@ -214,7 +221,10 @@ async fn trigger_envelope_flows_end_to_end() {
             // server records `External` provenance on the resulting instance.
             match t.source.and_then(|s| s.source) {
                 Some(sp::trigger_source::Source::External(e)) => {
-                    assert_eq!(e.subject, "tickr.external.signals");
+                    assert_eq!(
+                        e.subject,
+                        tickr_proto::coord::all_nats::EVENT_INGRESS_SUBJECT
+                    );
                 }
                 other => panic!("expected TriggerSource::External, got {:?}", other),
             }
@@ -1067,4 +1077,180 @@ async fn translator_restart_picks_up_pending_messages() {
 
     t2_shutdown.cancel();
     let _ = t2.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "subprocess entrypoint for the real-process ingress crash matrix"]
+async fn ingress_crash_worker() {
+    if std::env::var("TICKR_TEST_INGRESS_CRASH_WORKER").as_deref() != Ok("1") {
+        return;
+    }
+    let nats =
+        async_nats::connect(std::env::var("TICKR_TEST_INGRESS_NATS_URL").expect("worker NATS URL"))
+            .await
+            .expect("worker NATS connect");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&std::env::var("TICKR_TEST_INGRESS_DATABASE_URL").expect("worker database URL"))
+        .await
+        .expect("worker database connect");
+    let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(pool));
+    let (relay_tx, _relay_rx) = mpsc::channel::<sp::Signal>(32);
+    let sender = Arc::new(CapturingRelaySender { tx: relay_tx });
+    nats_ingress::run_translator_with_sender(nats, repositories, sender, CancellationToken::new())
+        .await
+        .expect("worker translator");
+    panic!("ingress crash boundary was not reached");
+}
+
+async fn wait_for_ingress_stream(js: &jetstream::Context) {
+    for _ in 0..100 {
+        if js.get_stream(nats_ingress::STREAM_NAME).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("ingress stream was not created");
+}
+
+async fn wait_until_ingress_delivery_is_acked(js: &jetstream::Context) {
+    for _ in 0..100 {
+        let mut stream = js
+            .get_stream(nats_ingress::STREAM_NAME)
+            .await
+            .expect("ingress stream");
+        if stream
+            .info()
+            .await
+            .expect("ingress stream info")
+            .state
+            .messages
+            == 0
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("ingress delivery remained pending");
+}
+
+/// Crashes the actual translator process at every Event-ingress durable
+/// boundary, then restarts the translator against the same Postgres and NATS
+/// state. Stable Signal ids keep capture effects singular while pending source
+/// deliveries and retained relay intents converge to acknowledgement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_process_crash_matrix_recovers_every_ingress_boundary() {
+    let Some((database, pool)) = start_postgres_with_migrations().await else {
+        return;
+    };
+    let Some((_nats_container, nats, nats_url)) = start_nats_with_url().await else {
+        return;
+    };
+    let workflow = empty_workflow("nats-ingress-crash-matrix");
+    let workflow_id = Uuid::parse_str(&workflow.id).expect("workflow id");
+    insert_workflow(&pool, &workflow).await;
+    let js = jetstream::new(nats.clone());
+    let database_url = database.database_url();
+    let executable = std::env::current_exe().expect("current integration-test executable");
+    let boundaries = [
+        ("after-reservation", true),
+        ("after-capture-persistence", true),
+        ("after-effects", true),
+        ("after-relay-intent-persistence", true),
+        ("after-permanent-rejection", false),
+        ("before-delivery-ack", true),
+    ];
+    let mut expected_capture_rows = 0_i64;
+
+    for (boundary, valid_trigger) in boundaries {
+        let mut child = tokio::process::Command::new(&executable)
+            .arg("--exact")
+            .arg("ingress_crash_worker")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("TICKR_TEST_INGRESS_CRASH_WORKER", "1")
+            .env("TICKR_TEST_INGRESS_CRASH_BOUNDARY", boundary)
+            .env("TICKR_TEST_INGRESS_CLAIM_LEASE_MS", "100")
+            .env("TICKR_TEST_INGRESS_ACK_WAIT_MS", "200")
+            .env("TICKR_TEST_INGRESS_NATS_URL", &nats_url)
+            .env("TICKR_TEST_INGRESS_DATABASE_URL", &database_url)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn ingress crash worker");
+        wait_for_ingress_stream(&js).await;
+
+        let producer_key = format!("crash-{boundary}-{}", Uuid::new_v4());
+        let bytes = if valid_trigger {
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "variant": "Trigger",
+                "idempotency_key": producer_key,
+                "workflow_id": workflow_id,
+            }))
+            .expect("encode crash trigger")
+        } else {
+            b"{permanent rejection".to_vec()
+        };
+        js.publish(nats_ingress::SUBJECT, bytes.into())
+            .await
+            .expect("publish crash-boundary delivery")
+            .await
+            .expect("publish crash-boundary ack");
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("crash worker exits")
+            .expect("wait crash worker");
+        assert_eq!(
+            status.code(),
+            Some(86),
+            "worker must exit at boundary {boundary}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (relay_tx, mut relay_rx) = mpsc::channel::<sp::Signal>(32);
+        let sender = Arc::new(CapturingRelaySender { tx: relay_tx });
+        let shutdown = CancellationToken::new();
+        let recovery_shutdown = shutdown.clone();
+        let recovery_nats = nats.clone();
+        let repositories = Arc::new(WriterRepositoryBundle::from_postgres_pool(pool.clone()));
+        let recovery = tokio::spawn(async move {
+            nats_ingress::run_translator_with_sender(
+                recovery_nats,
+                repositories,
+                sender,
+                recovery_shutdown,
+            )
+            .await
+        });
+
+        if valid_trigger && boundary != "before-delivery-ack" {
+            let signal = tokio::time::timeout(Duration::from_secs(10), relay_rx.recv())
+                .await
+                .expect("recovery forwards retained Signal intent")
+                .expect("recovery relay remains open");
+            assert_eq!(
+                signal.idempotency_key.as_deref(),
+                Some(producer_key.as_str())
+            );
+        }
+        wait_until_ingress_delivery_is_acked(&js).await;
+        shutdown.cancel();
+        recovery
+            .await
+            .expect("join recovery translator")
+            .expect("recovery translator");
+
+        if valid_trigger {
+            expected_capture_rows += 1;
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signal_captures")
+                .fetch_one(&pool)
+                .await
+                .expect("count producer-idempotent capture effects");
+            assert_eq!(
+                rows, expected_capture_rows,
+                "boundary {boundary} must retain one Signal capture effect"
+            );
+        }
+    }
 }

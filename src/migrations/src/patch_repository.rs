@@ -342,8 +342,6 @@ struct PatchLifecycleLeaseGuard<'a> {
 
 #[derive(Debug, thiserror::Error)]
 enum PatchLeaseError {
-    #[error("{0} leases require SQLite")]
-    RequiresSqlite(&'static str),
     #[error("{0} lease owner must contain 1 to 128 bytes")]
     InvalidOwner(&'static str),
     #[error("{0} lease expiry must be later than acquisition time")]
@@ -366,19 +364,25 @@ impl WriterRepositoryBundle {
     }
 
     /// Lease committed pending Patch builds in durable stable order.
-    ///
-    /// This operation belongs to Tickr Lite's one-writer SQLite formation;
-    /// distributed Postgres processing retains its NATS queue-group protocol.
     pub async fn lease_patch_build_tasks(
         &self,
         request: PatchBuildLeaseRequest<'_>,
     ) -> Result<Vec<LeasedPatchBuildTask>, RepositoryError> {
         validate_patch_build_lease_request(request)?;
         match &self.pool {
-            BackendPool::Postgres(_) => Err(patch_lease_error(PatchLeaseError::RequiresSqlite(
-                "Patch build",
-            ))),
+            BackendPool::Postgres(pool) => lease_patch_build_tasks_postgres(pool, request).await,
             BackendPool::Sqlite(pool) => lease_patch_build_tasks_sqlite(pool, request).await,
+        }
+    }
+
+    /// Discover reclaimable Patch-build work without acquiring a lease.
+    pub async fn has_reclaimable_patch_build(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(pool) => has_reclaimable_patch_build_postgres(pool, now).await,
+            BackendPool::Sqlite(pool) => has_reclaimable_patch_build_sqlite(pool, now).await,
         }
     }
 
@@ -388,19 +392,20 @@ impl WriterRepositoryBundle {
         task_id: Uuid,
         result: PatchTaskBuildResult<'_>,
     ) -> Result<PatchBuildSettlementOutcome, RepositoryError> {
-        match &self.pool {
+        let settlement = match &self.pool {
             BackendPool::Postgres(pool) => {
-                settle_task_build_postgres(pool, patch_key, task_id, result).await
+                settle_task_build_postgres(pool, patch_key, task_id, result, None).await?
             }
             BackendPool::Sqlite(pool) => {
-                match settle_task_build_sqlite(pool, patch_key, task_id, result, None).await? {
-                    LeasedPatchBuildSettlementOutcome::Settled(outcome) => Ok(outcome),
-                    LeasedPatchBuildSettlementOutcome::LeaseLost => Err(RepositoryError::new(
-                        RepositoryErrorKind::Internal,
-                        PatchLeaseError::UnexpectedLeaseLoss("Patch build"),
-                    )),
-                }
+                settle_task_build_sqlite(pool, patch_key, task_id, result, None).await?
             }
+        };
+        match settlement {
+            LeasedPatchBuildSettlementOutcome::Settled(outcome) => Ok(outcome),
+            LeasedPatchBuildSettlementOutcome::LeaseLost => Err(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                PatchLeaseError::UnexpectedLeaseLoss("Patch build"),
+            )),
         }
     }
 
@@ -411,21 +416,29 @@ impl WriterRepositoryBundle {
         result: PatchTaskBuildResult<'_>,
         now: DateTime<Utc>,
     ) -> Result<LeasedPatchBuildSettlementOutcome, RepositoryError> {
+        let guard = Some(PatchBuildLeaseGuard {
+            owner: &lease.lease_owner,
+            token: lease.lease_token,
+            now,
+        });
         match &self.pool {
-            BackendPool::Postgres(_) => Err(patch_lease_error(PatchLeaseError::RequiresSqlite(
-                "Patch build",
-            ))),
+            BackendPool::Postgres(pool) => {
+                settle_task_build_postgres(
+                    pool,
+                    lease.task.patch_key,
+                    lease.task.task_id,
+                    result,
+                    guard,
+                )
+                .await
+            }
             BackendPool::Sqlite(pool) => {
                 settle_task_build_sqlite(
                     pool,
                     lease.task.patch_key,
                     lease.task.task_id,
                     result,
-                    Some(PatchBuildLeaseGuard {
-                        owner: &lease.lease_owner,
-                        token: lease.lease_token,
-                        now,
-                    }),
+                    guard,
                 )
                 .await
             }
@@ -439,10 +452,24 @@ impl WriterRepositoryBundle {
     ) -> Result<Vec<LeasedPatchLifecycle>, RepositoryError> {
         validate_patch_lifecycle_lease_request(request)?;
         match &self.pool {
-            BackendPool::Postgres(_) => Err(patch_lease_error(PatchLeaseError::RequiresSqlite(
-                "Patch lifecycle",
-            ))),
+            BackendPool::Postgres(pool) => lease_patch_lifecycle_postgres(pool, request).await,
             BackendPool::Sqlite(pool) => lease_patch_lifecycle_sqlite(pool, request).await,
+        }
+    }
+
+    /// Discover reclaimable Patch apply/re-drive work without acquiring a lease.
+    pub async fn has_reclaimable_patch_lifecycle(
+        &self,
+        now: DateTime<Utc>,
+        eligible_before: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        match &self.pool {
+            BackendPool::Postgres(pool) => {
+                has_reclaimable_patch_lifecycle_postgres(pool, now, eligible_before).await
+            }
+            BackendPool::Sqlite(pool) => {
+                has_reclaimable_patch_lifecycle_sqlite(pool, now, eligible_before).await
+            }
         }
     }
 
@@ -462,34 +489,30 @@ impl WriterRepositoryBundle {
         lease: &LeasedPatchLifecycle,
         now: DateTime<Utc>,
     ) -> Result<LeasedPatchSubmissionOutcome, RepositoryError> {
+        let guard = PatchLifecycleLeaseGuard {
+            owner: &lease.lease_owner,
+            token: lease.lease_token,
+            now,
+        };
         match &self.pool {
-            BackendPool::Postgres(_) => Err(patch_lease_error(PatchLeaseError::RequiresSqlite(
-                "Patch lifecycle",
-            ))),
+            BackendPool::Postgres(pool) => {
+                settle_leased_patch_submission_postgres(pool, lease.row.patch_key, guard).await
+            }
             BackendPool::Sqlite(pool) => {
-                settle_leased_patch_submission_sqlite(
-                    pool,
-                    lease.row.patch_key,
-                    PatchLifecycleLeaseGuard {
-                        owner: &lease.lease_owner,
-                        token: lease.lease_token,
-                        now,
-                    },
-                )
-                .await
+                settle_leased_patch_submission_sqlite(pool, lease.row.patch_key, guard).await
             }
         }
     }
 
-    /// Release a failed local drive without treating the transient send as work.
+    /// Release a failed drive without treating the transient send as work.
     pub async fn release_patch_lifecycle_lease(
         &self,
         lease: &LeasedPatchLifecycle,
     ) -> Result<bool, RepositoryError> {
         match &self.pool {
-            BackendPool::Postgres(_) => Err(patch_lease_error(PatchLeaseError::RequiresSqlite(
-                "Patch lifecycle",
-            ))),
+            BackendPool::Postgres(pool) => {
+                release_patch_lifecycle_lease_postgres(pool, lease).await
+            }
             BackendPool::Sqlite(pool) => release_patch_lifecycle_lease_sqlite(pool, lease).await,
         }
     }
@@ -830,6 +853,124 @@ fn patch_lease_error(error: PatchLeaseError) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::Configuration, error)
 }
 
+async fn has_reclaimable_patch_build_postgres(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<bool, RepositoryError> {
+    let candidate: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 \
+         FROM workflow_patch_task_builds b \
+         JOIN workflow_patches p ON p.patch_key = b.patch_key \
+         WHERE b.status = 'pending' AND p.status = 'Building' \
+           AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= $1) \
+         ORDER BY b.pending_since, b.patch_key, b.task_id \
+         LIMIT 1",
+    )
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .map_err(repository_sqlx_error)?;
+    Ok(candidate.is_some())
+}
+
+async fn has_reclaimable_patch_build_sqlite(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<bool, RepositoryError> {
+    let candidate: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 \
+         FROM workflow_patch_task_builds b \
+         JOIN workflow_patches p ON p.patch_key = b.patch_key \
+         WHERE b.status = 'pending' AND p.status = 'Building' \
+           AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= ?1) \
+         ORDER BY b.pending_since, b.patch_key, b.task_id \
+         LIMIT 1",
+    )
+    .bind(encode_timestamp(now))
+    .fetch_optional(pool)
+    .await
+    .map_err(repository_sqlx_error)?;
+    Ok(candidate.is_some())
+}
+
+async fn lease_patch_build_tasks_postgres(
+    pool: &PgPool,
+    request: PatchBuildLeaseRequest<'_>,
+) -> Result<Vec<LeasedPatchBuildTask>, RepositoryError> {
+    let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
+    let rows: Vec<(Uuid, Uuid, Uuid, Value)> = sqlx::query_as(
+        "SELECT b.patch_key, b.task_id, p.workflow_instance_id, p.ops \
+         FROM workflow_patch_task_builds b \
+         JOIN workflow_patches p ON p.patch_key = b.patch_key \
+         WHERE b.status = 'pending' AND p.status = 'Building' \
+           AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= $1) \
+         ORDER BY b.pending_since, b.patch_key, b.task_id \
+         LIMIT $2 FOR UPDATE OF b SKIP LOCKED",
+    )
+    .bind(request.now)
+    .bind(request.limit as i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(repository_sqlx_error)?;
+
+    let mut leases = Vec::with_capacity(rows.len());
+    for (patch_key, task_id, workflow_instance_id, encoded_ops) in rows {
+        let ops: Vec<pp::AddressedPatchOp> =
+            serde_json::from_value(encoded_ops).map_err(corrupt_value)?;
+        let nix_expression_path = ops
+            .iter()
+            .find_map(|op| match &op.op {
+                Some(pp::addressed_patch_op::Op::AddNode(node))
+                    if node.node_id == task_id.to_string() =>
+                {
+                    node.task
+                        .as_ref()
+                        .map(|task| task.nix_expression_path.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                corrupt_value(CorruptPatchValue(format!(
+                    "missing leased Patch build task {task_id}"
+                )))
+            })?;
+        let lease_token = Uuid::new_v4();
+        let updated = sqlx::query(
+            "UPDATE workflow_patch_task_builds \
+             SET lease_owner = $3, lease_token = $4, lease_expires_at = $5 \
+             WHERE patch_key = $1 AND task_id = $2 AND status = 'pending' \
+               AND (lease_expires_at IS NULL OR lease_expires_at <= $6)",
+        )
+        .bind(patch_key)
+        .bind(task_id)
+        .bind(request.owner)
+        .bind(lease_token)
+        .bind(request.expires_at)
+        .bind(request.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(corrupt_value(CorruptPatchValue(format!(
+                "selected Patch build task {task_id} was not leaseable"
+            ))));
+        }
+        leases.push(LeasedPatchBuildTask {
+            task: PatchBuildTask {
+                patch_key,
+                workflow_instance_id,
+                task_id,
+                nix_expression_path,
+            },
+            lease_owner: request.owner.to_owned(),
+            lease_token,
+            lease_expires_at: request.expires_at,
+        });
+    }
+    transaction.commit().await.map_err(repository_sqlx_error)?;
+    Ok(leases)
+}
+
 async fn lease_patch_build_tasks_sqlite(
     pool: &SqlitePool,
     request: PatchBuildLeaseRequest<'_>,
@@ -919,7 +1060,8 @@ async fn settle_task_build_postgres(
     patch_key: Uuid,
     task_id: Uuid,
     result: PatchTaskBuildResult<'_>,
-) -> Result<PatchBuildSettlementOutcome, RepositoryError> {
+    lease_guard: Option<PatchBuildLeaseGuard<'_>>,
+) -> Result<LeasedPatchBuildSettlementOutcome, RepositoryError> {
     let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM workflow_patches WHERE patch_key = $1 FOR UPDATE")
@@ -929,42 +1071,75 @@ async fn settle_task_build_postgres(
             .map_err(repository_sqlx_error)?;
     let Some(status) = status else {
         transaction.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(PatchBuildSettlementOutcome::Absent);
+        return Ok(LeasedPatchBuildSettlementOutcome::Settled(
+            PatchBuildSettlementOutcome::Absent,
+        ));
     };
     let status = PatchLifecycleStatus::from_stored(&status)?;
     if status != PatchLifecycleStatus::Building {
         transaction.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(PatchBuildSettlementOutcome::AlreadySettled(status));
+        return Ok(LeasedPatchBuildSettlementOutcome::Settled(
+            PatchBuildSettlementOutcome::AlreadySettled(status),
+        ));
     }
 
+    let settled_at = lease_guard.map_or_else(Utc::now, |guard| guard.now);
     let (task_status, error) = task_build_values(result);
-    let updated = sqlx::query(
-        "UPDATE workflow_patch_task_builds \
-         SET status = $3, error = $4, built_at = now() \
-         WHERE patch_key = $1 AND task_id = $2 AND status = 'pending'",
-    )
-    .bind(patch_key)
-    .bind(task_id)
-    .bind(task_status)
-    .bind(error)
-    .execute(&mut *transaction)
-    .await
-    .map_err(repository_sqlx_error)?;
-    if updated.rows_affected() == 0 {
-        let task_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workflow_patch_task_builds \
-             WHERE patch_key = $1 AND task_id = $2)",
+    let updated = if let Some(guard) = lease_guard {
+        sqlx::query(
+            "UPDATE workflow_patch_task_builds \
+             SET status = $3, error = $4, built_at = $5, \
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+             WHERE patch_key = $1 AND task_id = $2 AND status = 'pending' \
+               AND lease_owner = $6 AND lease_token = $7 AND lease_expires_at > $8",
         )
         .bind(patch_key)
         .bind(task_id)
-        .fetch_one(&mut *transaction)
+        .bind(task_status)
+        .bind(error)
+        .bind(settled_at)
+        .bind(guard.owner)
+        .bind(guard.token)
+        .bind(guard.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?
+    } else {
+        sqlx::query(
+            "UPDATE workflow_patch_task_builds \
+             SET status = $3, error = $4, built_at = $5, \
+                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL \
+             WHERE patch_key = $1 AND task_id = $2 AND status = 'pending' \
+               AND lease_token IS NULL",
+        )
+        .bind(patch_key)
+        .bind(task_id)
+        .bind(task_status)
+        .bind(error)
+        .bind(settled_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?
+    };
+    if updated.rows_affected() == 0 {
+        let stored_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM workflow_patch_task_builds \
+             WHERE patch_key = $1 AND task_id = $2",
+        )
+        .bind(patch_key)
+        .bind(task_id)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(repository_sqlx_error)?;
         transaction.commit().await.map_err(repository_sqlx_error)?;
-        return Ok(if task_exists {
-            PatchBuildSettlementOutcome::TaskAlreadySettled
-        } else {
-            PatchBuildSettlementOutcome::Absent
+        return Ok(match stored_status.as_deref() {
+            Some("pending") if lease_guard.is_some() => {
+                LeasedPatchBuildSettlementOutcome::LeaseLost
+            }
+            Some(_) => LeasedPatchBuildSettlementOutcome::Settled(
+                PatchBuildSettlementOutcome::TaskAlreadySettled,
+            ),
+            None => LeasedPatchBuildSettlementOutcome::Settled(PatchBuildSettlementOutcome::Absent),
         });
     }
 
@@ -972,21 +1147,24 @@ async fn settle_task_build_postgres(
         PatchTaskBuildResult::Failure { error } => {
             sqlx::query(
                 "UPDATE workflow_patches \
-                 SET status = 'BuildFailed', outcome = $2, updated_at = now() \
+                 SET status = 'BuildFailed', outcome = $2, updated_at = $3 \
                  WHERE patch_key = $1 AND status = 'Building'",
             )
             .bind(patch_key)
             .bind(format!("build failed: {error}"))
+            .bind(settled_at)
             .execute(&mut *transaction)
             .await
             .map_err(repository_sqlx_error)?;
             transaction.commit().await.map_err(repository_sqlx_error)?;
-            Ok(PatchBuildSettlementOutcome::BuildFailed)
+            Ok(LeasedPatchBuildSettlementOutcome::Settled(
+                PatchBuildSettlementOutcome::BuildFailed,
+            ))
         }
         PatchTaskBuildResult::Success => {
             let updated = sqlx::query(
                 "UPDATE workflow_patches p \
-                 SET status = 'Submitted', updated_at = now() \
+                 SET status = 'Submitted', updated_at = $2 \
                  WHERE p.patch_key = $1 AND p.status = 'Building' \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM workflow_patch_task_builds b \
@@ -994,6 +1172,7 @@ async fn settle_task_build_postgres(
                    )",
             )
             .bind(patch_key)
+            .bind(settled_at)
             .execute(&mut *transaction)
             .await
             .map_err(repository_sqlx_error)?
@@ -1004,10 +1183,10 @@ async fn settle_task_build_postgres(
                 None
             };
             transaction.commit().await.map_err(repository_sqlx_error)?;
-            Ok(match intent {
+            Ok(LeasedPatchBuildSettlementOutcome::Settled(match intent {
                 Some(row) => PatchBuildSettlementOutcome::Submitted(row),
                 None => PatchBuildSettlementOutcome::AwaitingTasks,
-            })
+            }))
         }
     }
 }
@@ -1192,6 +1371,101 @@ async fn mark_submitted_sqlite(
     })
 }
 
+async fn has_reclaimable_patch_lifecycle_postgres(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    eligible_before: DateTime<Utc>,
+) -> Result<bool, RepositoryError> {
+    let candidate: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM workflow_patches \
+         WHERE status IN ('Validating', 'Submitted') AND updated_at <= $1 \
+           AND (lifecycle_lease_expires_at IS NULL OR lifecycle_lease_expires_at <= $2) \
+         ORDER BY updated_at, patch_key LIMIT 1",
+    )
+    .bind(eligible_before)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .map_err(repository_sqlx_error)?;
+    Ok(candidate.is_some())
+}
+
+async fn has_reclaimable_patch_lifecycle_sqlite(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    eligible_before: DateTime<Utc>,
+) -> Result<bool, RepositoryError> {
+    let candidate: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM workflow_patches \
+         WHERE status IN ('Validating', 'Submitted') AND updated_at <= ?1 \
+           AND (lifecycle_lease_expires_at IS NULL OR lifecycle_lease_expires_at <= ?2) \
+         ORDER BY updated_at, patch_key LIMIT 1",
+    )
+    .bind(encode_timestamp(eligible_before))
+    .bind(encode_timestamp(now))
+    .fetch_optional(pool)
+    .await
+    .map_err(repository_sqlx_error)?;
+    Ok(candidate.is_some())
+}
+
+async fn lease_patch_lifecycle_postgres(
+    pool: &PgPool,
+    request: PatchLifecycleLeaseRequest<'_>,
+) -> Result<Vec<LeasedPatchLifecycle>, RepositoryError> {
+    let mut transaction = pool.begin().await.map_err(repository_sqlx_error)?;
+    let rows: Vec<PostgresLifecycleTuple> = sqlx::query_as(
+        "SELECT patch_key, patch_id, workflow_instance_id, status, ops, reason, \
+                outcome, applied_version, provenance, operation \
+         FROM workflow_patches \
+         WHERE status IN ('Validating', 'Submitted') AND updated_at <= $1 \
+           AND (lifecycle_lease_expires_at IS NULL OR lifecycle_lease_expires_at <= $2) \
+         ORDER BY updated_at, patch_key \
+         LIMIT $3 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(request.eligible_before)
+    .bind(request.now)
+    .bind(request.limit as i64)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(repository_sqlx_error)?;
+
+    let mut leases = Vec::with_capacity(rows.len());
+    for row in rows {
+        let lifecycle = decode_postgres_lifecycle(row)?;
+        let lease_token = Uuid::new_v4();
+        let updated = sqlx::query(
+            "UPDATE workflow_patches \
+             SET lifecycle_lease_owner = $2, lifecycle_lease_token = $3, \
+                 lifecycle_lease_expires_at = $4 \
+             WHERE patch_key = $1 AND status IN ('Validating', 'Submitted') \
+               AND (lifecycle_lease_expires_at IS NULL OR lifecycle_lease_expires_at <= $5)",
+        )
+        .bind(lifecycle.patch_key)
+        .bind(request.owner)
+        .bind(lease_token)
+        .bind(request.expires_at)
+        .bind(request.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_sqlx_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(corrupt_value(CorruptPatchValue(format!(
+                "selected Patch lifecycle {} was not leaseable",
+                lifecycle.patch_key
+            ))));
+        }
+        leases.push(LeasedPatchLifecycle {
+            row: lifecycle,
+            lease_owner: request.owner.to_owned(),
+            lease_token,
+            lease_expires_at: request.expires_at,
+        });
+    }
+    transaction.commit().await.map_err(repository_sqlx_error)?;
+    Ok(leases)
+}
+
 async fn lease_patch_lifecycle_sqlite(
     pool: &SqlitePool,
     request: PatchLifecycleLeaseRequest<'_>,
@@ -1251,6 +1525,49 @@ async fn lease_patch_lifecycle_sqlite(
     Ok(leases)
 }
 
+async fn settle_leased_patch_submission_postgres(
+    pool: &PgPool,
+    patch_key: Uuid,
+    guard: PatchLifecycleLeaseGuard<'_>,
+) -> Result<LeasedPatchSubmissionOutcome, RepositoryError> {
+    let updated = sqlx::query(
+        "UPDATE workflow_patches \
+         SET status = 'Submitted', updated_at = $4, \
+             lifecycle_lease_owner = NULL, lifecycle_lease_token = NULL, \
+             lifecycle_lease_expires_at = NULL \
+         WHERE patch_key = $1 AND status IN ('Validating', 'Submitted') \
+           AND lifecycle_lease_owner = $2 AND lifecycle_lease_token = $3 \
+           AND lifecycle_lease_expires_at > $4",
+    )
+    .bind(patch_key)
+    .bind(guard.owner)
+    .bind(guard.token)
+    .bind(guard.now)
+    .execute(pool)
+    .await
+    .map_err(repository_sqlx_error)?
+    .rows_affected();
+    if updated == 1 {
+        return Ok(LeasedPatchSubmissionOutcome::Settled(
+            PatchSubmissionOutcome::Submitted,
+        ));
+    }
+    Ok(match patch_lifecycle_postgres(pool, patch_key).await? {
+        Some(row)
+            if matches!(
+                row.status,
+                PatchLifecycleStatus::Validating | PatchLifecycleStatus::Submitted
+            ) =>
+        {
+            LeasedPatchSubmissionOutcome::LeaseLost
+        }
+        Some(row) => LeasedPatchSubmissionOutcome::Settled(PatchSubmissionOutcome::AlreadySettled(
+            row.status,
+        )),
+        None => LeasedPatchSubmissionOutcome::Settled(PatchSubmissionOutcome::Absent),
+    })
+}
+
 async fn settle_leased_patch_submission_sqlite(
     pool: &SqlitePool,
     patch_key: Uuid,
@@ -1294,6 +1611,27 @@ async fn settle_leased_patch_submission_sqlite(
         )),
         None => LeasedPatchSubmissionOutcome::Settled(PatchSubmissionOutcome::Absent),
     })
+}
+
+async fn release_patch_lifecycle_lease_postgres(
+    pool: &PgPool,
+    lease: &LeasedPatchLifecycle,
+) -> Result<bool, RepositoryError> {
+    Ok(sqlx::query(
+        "UPDATE workflow_patches \
+         SET lifecycle_lease_owner = NULL, lifecycle_lease_token = NULL, \
+             lifecycle_lease_expires_at = NULL \
+         WHERE patch_key = $1 AND lifecycle_lease_owner = $2 \
+           AND lifecycle_lease_token = $3",
+    )
+    .bind(lease.row.patch_key)
+    .bind(&lease.lease_owner)
+    .bind(lease.lease_token)
+    .execute(pool)
+    .await
+    .map_err(repository_sqlx_error)?
+    .rows_affected()
+        == 1)
 }
 
 async fn release_patch_lifecycle_lease_sqlite(

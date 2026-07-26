@@ -1,5 +1,78 @@
 # Data-plane formation contract
 
+## Named profile resolution
+
+Formation selection admits exactly three complete named profiles:
+
+| Profile | Topology | SQL | final-Log store | writer topology | Executors | HTTP Commands | External Event ingress | Coordination roles | Choreography |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `all-nats` | distributed | Postgres | S3-compatible object store | distributed | distributed fleet | enabled | enabled | all thirteen use their versioned NATS protocols | all three proofs |
+| `lite-local` | single node | SQLite | local files | Conductor-owned | exactly one | enabled | disabled | role-specific local protocols | all three proofs |
+| `all-redis` | distributed | Postgres | S3-compatible object store | distributed | distributed fleet | enabled | enabled | all thirteen use their versioned Redis protocols | all three proofs |
+
+An omitted profile resolves to `all-nats`. Redis coordination is selected only by explicit `all-redis`; the presence of a Redis endpoint, credential, or role override cannot select it.
+
+Resolution compares the complete candidate descriptor with the selected profile before constructing a repository, client, listener, consumer, claim, relay loop, work producer, HTTP endpoint, or notification channel. A topology, SQL, final-Log store, writer-topology, Executor-fleet, HTTP-Command-ingress, Coordination-role implementation, role-protocol identity, or choreography-capability override is admissible only when it is exactly the profile-owned value. One missing or changed role rejects the descriptor; admission never returns a partially resolved formation.
+
+Each role protocol identity is a stable name and positive version. It contains no endpoint, username, credential, certificate, or other secret or location data. The Resolved formation descriptor is immutable runtime authority; callers do not infer a coordination implementation from environment state after admission.
+
+No profile represents automatic NATS/Redis fallback, dual reads or writes, state migration, shadow traffic, Redis Cluster, Redis Sentinel, multiple writable primaries, Redis-managed high availability, or a generic coordination-substrate switch. Profile resolution selects thirteen role-specific protocols; it does not introduce a universal broker interface.
+
+## Hardened all-NATS namespace admission
+
+Every `all-nats` Coordination role uses a `tickr.all-nats.*` protocol identity at version `2`. Its NATS resources are isolated below one fresh profile-qualified namespace: subjects start with `tickr.all_nats.v2.`, streams and KV buckets start with `TICKR_ALL_NATS_V2_`, and durable consumers start with `tickr-all-nats-v2-`. Scope buckets append only the admitted logical scope namespace to the fresh prefix.
+
+The marker `TICKR_ALL_NATS_V2_FORMATION/identity` binds the hardened protocol set and admitted scope bucket. Startup addresses only the exact fresh stream, consumer, and KV names declared by that set. It neither lists nor opens another namespace and has no discovery, adoption, inspection, migration, drain, repair, copy, or compatibility operation for an earlier deployment.
+
+An empty NATS account may install the marker and exact resources. A matching marker permits exact configuration verification and idempotent completion of an interrupted empty setup. A mismatched marker, a missing marker beside nonempty fresh state, or a mismatched stream, consumer, or KV configuration refuses startup without constructing runtime resources.
+
+The complete admission is bounded to twenty seconds and finishes before the API component, Conductor, or Executor starts a listener, consumer, claim, relay loop, work producer, or HTTP endpoint. A timeout or setup error is a formation-start failure; no component continues with a partial or unverified NATS resource set.
+
+## Redis transport, identity, topology, and time admission
+
+`all-redis` parses one external connection descriptor before creating a Redis client or opening a socket. The descriptor must select direct topology, contain at least one endpoint, keep each username and password in dedicated fields, and provide nonempty PEM trust roots. Endpoint URLs must use `rediss`, name a host, contain no credentials, query parameters, fragment, database path, or other location-bearing extension, and cannot request plaintext or Sentinel discovery.
+
+Capability admission accepts an already validated complete all-Redis candidate, then creates certificate-validating probe connections only. The configured trust roots must authenticate the server certificate and its hostname, and every endpoint credential must authenticate. A successful probe must produce consistent `HELLO 3`, server `INFO`, replication `INFO`, cluster `INFO`, and `ROLE` facts identifying Redis OSS 7.4.x in standalone mode as a writable primary with cluster mode disabled. The required `TIME` and `WAITAOF` commands must be present.
+
+A successful descriptor resolves to exactly one configured writable primary. A replica or read-only role, Cluster, Sentinel-mediated topology, a second writable endpoint, another server identity, or a version outside 7.4.x refuses admission. The `TIME` probe takes two samples, requires nondecreasing valid microsecond values within thirty seconds of the local admission interval, and retains the second sample for bounded claim, reservation, and liveness-deadline arbitration.
+
+The admission result contains only the admitted version, single-primary topology class, and sampled server time. Probe clients and connections are dropped; no runtime Redis client, listener, consumer, claim, relay loop, or producer exists at this boundary. Every failure is typed by capability and diagnostics contain no endpoint, query parameter, username, password, trust-root bytes, or certificate bytes.
+
+## Redis operation-manifest admission
+
+Every all-Redis role adapter supplies one versioned Redis operation manifest. The complete admission candidate accepts exactly one manifest for each of the thirteen Coordination roles; it never invents commands, scripts, or namespace patterns on an adapter's behalf. Each manifest binds its role and the exact protocol identity selected by the Resolved formation descriptor to its command set, named script SHA-256 identities, role-owned key and channel patterns, required-operation canaries, and representative cross-role and administrative denial probes.
+
+Manifest normalization is deterministic and independent of entry or role order. The manifest identity covers the role protocol, commands, scripts, patterns, required canaries, and forbidden probes. Changing a command, script digest, key pattern, or channel pattern therefore changes both the manifest identity and the formation capability fingerprint.
+
+Candidate construction rejects a missing or duplicate role, a duplicate manifest identity, a protocol mismatch, a malformed or duplicate entry, a namespace outside the manifest's role prefix, a same-role denial probe, an unregistered required operation or pattern, and omission of either a cross-role or administrative denial probe. This validation completes before namespace inspection, any Redis probe, or runtime construction. <!-- enforced-by: tickr-cli/src/redis_operation_manifest.rs::tests; tickr-cli/src/redis_formation_identity.rs::tests -->
+
+Manifest values are operational declarations only. They have no field for an endpoint, username, password, credential, trust root, certificate content, or concrete namespace identity. Patterns use the normalized `{namespace}` placeholder and the owning Coordination-role prefix; location-bearing or sensitive-looking values fail manifest construction.
+
+## Redis capacity admission and role quotas
+
+The all-Redis candidate declares one finite byte limit for every Coordination role. Omission, duplication, arithmetic overflow, or a value outside that role's calibrated minimum and maximum rejects the candidate. The normalized limits and the calibration inputs are fingerprinted; an override may narrow a role only within those measured bounds and cannot create an unbounded role.
+
+Each calibration is pinned from the Redis OSS 7.4.x TLS and ACL fixture using the adapter's protocol records and pending-delivery metadata. It separately reserves measured script memory, AOF progress headroom, and restart-reconstruction headroom. A calibration also names the adapter's accounted objects and terminal cleanup boundary. Defaults are admitted only when all thirteen completed adapters have a real-object pressure scenario that reaches soft pressure and the hard limit without losing an accepted identity.
+
+The configured Redis `maxmemory` must be nonzero, exactly match the admitted capacity, and use `maxmemory-policy noeviction`. The admitted role-limit sum plus the greater of eight mebibytes or five percent of configured capacity is the formation reserve. Runtime validation additionally includes current Redis memory before admitting the role-limit sum and reserve. A missing limit, an out-of-bound override, or a sum that consumes the reserve fails before runtime role construction.
+
+Every role accounts acceptance atomically with its stable identity. Replaying the same identity and units is idempotent; conflicting units fail. Soft pressure is diagnostic, while the hard limit fences the next acceptance before mutating accepted protocol state or acknowledging its source. Capacity is released only at the role's declared terminally safe cleanup boundary. Missing accepted identity, counter/cardinality disagreement, an unexpected accepted-state trim, Redis `OOM`, a read-only primary, or an unavailable accounting operation is capability loss: readiness clears and no durability acknowledgement crosses the closed formation fence.
+
+The runtime projection reports configured and used memory, required reserve, the admitted role-limit sum, and all thirteen normalized role limits. Each role row includes protocol identity, accounted objects, terminal cleanup boundary, admitted maximum, calibrated bounds, and the five measured capacity components. It contains no endpoint, credential, certificate, or ACL secret.
+
+## Distributed all-Redis composition and readiness
+
+Each distributed component process receives the same immutable admitted descriptor. `all-redis` admission completes descriptor parsing, TLS/topology/version and server-time probes, formation identity and namespace inspection, complete per-role ACL canaries and denials, durability proof, and capacity proof before Postgres, object storage, a runtime Coordination client, a listener, a consumer, a claim, a relay loop, or a producer is constructed. Probe credentials and connections are dropped at the admission boundary.
+
+Successful admission constructs exactly one role-authenticated runtime client for each of the thirteen Coordination roles. The process composer keeps those clients substrate-private and supplies the API component, Conductor, and distributed Executor only their role-specific interfaces. The descriptor continues to select Postgres, the S3-compatible final-Log store, the distributed Executor fleet, HTTP Commands, and External Event ingress. The composer neither opens a NATS client nor creates, verifies, or consumes a NATS resource for `all-redis`.
+
+The all-Redis Executor exposes `tickr-ctx` through a process-private Unix-domain endpoint backed by the admitted `ScopeStore` role. It binds only after role reconstruction, has mode `0600`, and grants each launched Task one ephemeral task/namespace/run/scope credential. Task processes receive the endpoint and grant rather than a NATS URL or any Redis endpoint, credential, command, or key surface. The endpoint and its bounded scope writer are critical Executor children; their exit cancels the component and closes formation readiness.
+
+The runtime capability monitor registers the complete role set while readiness remains closed. Its first capability pass reconstructs every role's pending Redis work before it opens the generation fence, publishes readiness, or starts a consumer, listener, claim, relay loop, or producer. Capability loss closes readiness and the generation fence before an operation can acknowledge durability. Recovery repeats the complete capability and reconstruction pass; only a successful pass opens a new generation. A callback set missing any role cannot publish readiness.
+
+Shutdown closes readiness and the work-admission fence before cancelling runtime consumers. Component children settle while the immutable descriptor, capability monitor, role clients, Postgres repositories, and final-Log operator remain owned; role clients and the monitor are released only after those children join.
+
+
 ## Tickr Lite data-directory ownership
 
 A Tickr Lite process owns local durable state through one `DataDirectory` lease. The lease is both the already-open root authority and the operating-system exclusive lock. A second handle or process cannot acquire a lease for the same directory until the owner drops its lease.
@@ -63,7 +136,7 @@ Every successful installation writes a new checksummed record to a same-device t
 
 ## Tickr Lite Command bus
 
-The resolved Tickr Lite formation selects bounded local request/reply for the API component-to-Conductor Command bus. Distributed formations continue to select NATS Core request/reply on `tickr.api.commands`. Both implementations carry the production `ApiCommandRequest` and `ApiCommandResponse` protobuf envelopes; selecting the formation cannot change the HTTP status or typed outcome.
+The resolved `lite-local` formation selects bounded local request/reply for the API component-to-Conductor Command bus. The `all-nats` formation selects NATS Core request/reply on `tickr.api.commands`; `all-redis` selects its versioned role-specific Redis request/reply protocol. All three implementations carry the production `ApiCommandRequest` and `ApiCommandResponse` protobuf envelopes; selecting the formation cannot change the HTTP status or typed outcome.
 
 The local Command bus has one bounded request queue and exactly one receiver owned by the Conductor writer. The receiver dispatches one request at a time through the same production Command dispatcher used by the NATS subscriber. Queue capacity and maximum encoded request size are finite formation inputs. The API component sees only the `CommandBus` request/reply interface; it cannot obtain the receiver, reply channel, repository, connection, row, or transaction.
 

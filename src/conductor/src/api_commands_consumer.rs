@@ -1,24 +1,31 @@
 //! Conductor side of the API Command bus.
 //!
-//! Both distributed NATS Core and Tickr Lite local request/reply carry an
-//! encoded `ApiCommandRequest` into the shared dispatcher and receive an
-//! encoded `ApiCommandResponse` with the HTTP-equivalent `status_code` and
-//! exactly one typed payload. The distributed adapter binds one queue-group
-//! subscriber on `tickr.api.commands`; the local adapter is called by the sole
-//! Conductor-owned writer.
+//! All-NATS, all-Redis, and Tickr Lite request/reply carry an encoded
+//! `ApiCommandRequest` into the shared dispatcher and receive an encoded
+//! `ApiCommandResponse` with the HTTP-equivalent `status_code` and exactly one
+//! typed payload. Each distributed adapter binds its own queue/group consumer;
+//! the local adapter is called by the sole Conductor-owned writer.
 //!
-//! Both adapters process Commands serially. An in-flight long Command can
+//! The adapters process Commands serially. An in-flight long Command can
 //! therefore head-of-line-block later requests, but every mutation passes
 //! through one ordered writer boundary.
 
 use anyhow::Result;
 use async_nats::Client as NatsClient;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use prost::Message as _;
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use tickr_ctx::envelope::SignalSource;
+use tickr_proto::coord::command_bus::{
+    CommandRequestMetadata, CORRELATION_HEADER, DEADLINE_HEADER, DEFAULT_MAX_IN_FLIGHT,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,22 +35,75 @@ use crate::wakeup_translator::WakeupRelaySender;
 use tickr_proto::tickr_api as api;
 
 /// The single distributed subject all Command kinds travel on.
-pub const COMMAND_SUBJECT: &str = "tickr.api.commands";
+pub const COMMAND_SUBJECT: &str = tickr_proto::coord::all_nats::COMMAND_SUBJECT;
 
 /// Queue group the conductor binds. One conductor per tenant today; the group
 /// makes adding replicas a no-op rather than a fan-out-to-all.
-pub const QUEUE_GROUP: &str = "tickr-conductor-api-commands";
+pub const QUEUE_GROUP: &str = tickr_proto::coord::all_nats::COMMAND_QUEUE_GROUP;
+
+/// Encoded Command dispatcher shared by the selected Command-bus consumer.
+///
+/// The transport receives only this role handler; repository and choreography
+/// dependencies remain owned by the Conductor.
+#[async_trait]
+pub trait CommandBusHandler: Send + Sync {
+    async fn handle(&self, payload: Vec<u8>) -> Vec<u8>;
+}
+
+/// Formation-selected Conductor side of the Command bus.
+///
+/// Implementations own their substrate client and protocol resources. The
+/// Conductor component receives only this role-specific serving interface.
+#[async_trait]
+pub trait CommandBusConsumer: Send + Sync {
+    async fn serve(
+        &self,
+        handler: Arc<dyn CommandBusHandler>,
+        cancel: CancellationToken,
+    ) -> Result<()>;
+}
+
+/// Fresh all-NATS Command-bus consumer.
+pub struct NatsCommandBusConsumer {
+    nats: NatsClient,
+}
+
+impl NatsCommandBusConsumer {
+    pub fn new(nats: NatsClient) -> Self {
+        Self { nats }
+    }
+
+    pub async fn connect(url: &str) -> Result<Self> {
+        Ok(Self::new(async_nats::connect(url).await?))
+    }
+}
+
+#[async_trait]
+impl CommandBusConsumer for NatsCommandBusConsumer {
+    async fn serve(
+        &self,
+        handler: Arc<dyn CommandBusHandler>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        start_with_handler(self.nats.clone(), cancel, move |payload| {
+            let handler = Arc::clone(&handler);
+            async move { handler.handle(payload).await }
+        })
+        .await
+    }
+}
 
 /// Everything the dispatch arms need that isn't a process-wide singleton. The
 /// relay sender and the gate index are carried so the trigger / cancel /
-/// wakeup arms reach the same machinery the HTTP handlers use. (The
-/// idempotency cache is a process-wide singleton, and the ByTag cancel
-/// relay-back correlates over the `signal_applied.<signal_id>` tenant-NATS
-/// subject reached via `nats` inside the pipeline, not threaded here.)
+/// wakeup arms reach the same machinery the HTTP handlers use. ByTag cancel
+/// materialization is reconciled from the shared SQL repository; the selected
+/// Signal-applied notifier remains an optional latency hint.
 #[derive(Clone)]
 pub struct ApiCommandsState {
     pub definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     pub nats: NatsClient,
+    pub signal_applied_notifications:
+        crate::signal_applied_notifier::SharedSignalAppliedReconciliationStream,
     pub relay_sender: Arc<dyn WakeupRelaySender>,
     /// Outbound seam for `PatchWorkflowInstance` envelopes — trait-carried so
     /// the patch dispatch arm is testable without the relay client, matching
@@ -61,7 +121,7 @@ pub struct LiteApiCommandsState {
     pub patch_relay_sender: Arc<dyn crate::patch_pipeline::PatchRelaySender>,
     pub replay_relay_sender: Arc<dyn crate::replay_pipeline::ReplayRelaySender>,
     pub signal_applied_notifications:
-        Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
+        crate::signal_applied_notifier::SharedSignalAppliedReconciliationStream,
     pub gate_index: GateIndex,
 }
 
@@ -74,9 +134,7 @@ pub trait ApiCommandDispatchState {
     fn replay_relay_sender(&self) -> Option<&Arc<dyn crate::replay_pipeline::ReplayRelaySender>>;
     fn signal_applied_notifications(
         &self,
-    ) -> Option<
-        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
-    >;
+    ) -> &crate::signal_applied_notifier::SharedSignalAppliedReconciliationStream;
     fn gate_index(&self) -> &GateIndex;
 }
 
@@ -103,10 +161,8 @@ impl ApiCommandDispatchState for ApiCommandsState {
 
     fn signal_applied_notifications(
         &self,
-    ) -> Option<
-        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
-    > {
-        None
+    ) -> &crate::signal_applied_notifier::SharedSignalAppliedReconciliationStream {
+        &self.signal_applied_notifications
     }
 
     fn gate_index(&self) -> &GateIndex {
@@ -137,10 +193,8 @@ impl ApiCommandDispatchState for LiteApiCommandsState {
 
     fn signal_applied_notifications(
         &self,
-    ) -> Option<
-        &Arc<tokio::sync::Mutex<crate::signal_applied_notifier::SignalAppliedNotificationStream>>,
-    > {
-        Some(&self.signal_applied_notifications)
+    ) -> &crate::signal_applied_notifier::SharedSignalAppliedReconciliationStream {
+        &self.signal_applied_notifications
     }
 
     fn gate_index(&self) -> &GateIndex {
@@ -148,56 +202,264 @@ impl ApiCommandDispatchState for LiteApiCommandsState {
     }
 }
 
+#[async_trait]
+impl CommandBusHandler for ApiCommandsState {
+    async fn handle(&self, payload: Vec<u8>) -> Vec<u8> {
+        handle_local_request(self, &payload).await
+    }
+}
+
 /// Bind the queue-group subscriber and process commands serially until the
 /// cancellation token fires.
 pub async fn start(state: ApiCommandsState, cancel: CancellationToken) -> Result<()> {
-    let mut sub = state
-        .nats
+    NatsCommandBusConsumer::new(state.nats.clone())
+        .serve(Arc::new(state), cancel)
+        .await
+}
+
+struct PendingCommand {
+    metadata: CommandRequestMetadata,
+    payload: Vec<u8>,
+    reply: async_nats::Subject,
+}
+
+/// Serve the all-NATS Command bus through one bounded, serial mutation path.
+///
+/// Public only so the backend-law suite can exercise the real transport with
+/// a deterministic handler; production uses [`start`].
+pub async fn start_with_handler<F, Fut>(
+    nats: NatsClient,
+    cancel: CancellationToken,
+    handler: F,
+) -> Result<()>
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Vec<u8>> + Send + 'static,
+{
+    let mut sub = nats
         .queue_subscribe(COMMAND_SUBJECT, QUEUE_GROUP.into())
         .await?;
+    nats.flush().await?;
     println!(
         "api_commands_consumer: subscribed, subject={}, queue_group={}",
         COMMAND_SUBJECT, QUEUE_GROUP
     );
 
+    let correlations = Arc::new(Mutex::new(HashSet::with_capacity(DEFAULT_MAX_IN_FLIGHT)));
+    let (sender, mut receiver) = mpsc::channel::<PendingCommand>(DEFAULT_MAX_IN_FLIGHT);
+    let worker_nats = nats.clone();
+    let worker_correlations = Arc::clone(&correlations);
+    let worker_cancel = cancel.child_token();
+    let worker_cancelled = worker_cancel.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let pending = tokio::select! {
+                _ = worker_cancelled.cancelled() => break,
+                pending = receiver.recv() => {
+                    let Some(pending) = pending else { break };
+                    pending
+                }
+            };
+            let correlation_id = pending.metadata.correlation_id;
+            let response = if pending.metadata.is_expired() {
+                admission_error(
+                    408,
+                    api::CommandErrorCode::BadRequest,
+                    "command deadline expired before dispatch",
+                )
+            } else {
+                tokio::select! {
+                    _ = worker_cancelled.cancelled() => break,
+                    response = handler(pending.payload) => response,
+                }
+            };
+            publish_reply(&worker_nats, pending.reply, response).await;
+            remove_correlation(&worker_correlations, correlation_id);
+        }
+        match worker_correlations.lock() {
+            Ok(mut active) => active.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    });
+
     loop {
-        tokio::select! {
+        let msg = tokio::select! {
             _ = cancel.cancelled() => {
                 println!("api_commands_consumer: shutdown signal received");
                 break;
             }
             maybe_msg = sub.next() => {
-                match maybe_msg {
-                    Some(msg) => process_one(&state, msg).await,
-                    None => {
-                        println!("api_commands_consumer: subscription ended");
-                        break;
-                    }
-                }
+                let Some(msg) = maybe_msg else {
+                    println!("api_commands_consumer: subscription ended");
+                    break;
+                };
+                msg
             }
+        };
+        let Some(reply) = msg.reply.clone() else {
+            eprintln!("api_commands_consumer: message without reply subject, dropping");
+            continue;
+        };
+        if msg.payload.len() > DEFAULT_MAX_PAYLOAD_BYTES {
+            publish_reply(
+                &nats,
+                reply,
+                admission_error(
+                    413,
+                    api::CommandErrorCode::BadRequest,
+                    "command payload too large",
+                ),
+            )
+            .await;
+            continue;
+        }
+        let metadata = match request_metadata(&msg) {
+            Ok(metadata) => metadata,
+            Err(message) => {
+                publish_reply(
+                    &nats,
+                    reply,
+                    admission_error(400, api::CommandErrorCode::BadRequest, message),
+                )
+                .await;
+                continue;
+            }
+        };
+        if metadata.is_expired() {
+            publish_reply(
+                &nats,
+                reply,
+                admission_error(
+                    408,
+                    api::CommandErrorCode::BadRequest,
+                    "command deadline expired before admission",
+                ),
+            )
+            .await;
+            continue;
+        }
+
+        let admission_error_message =
+            match reserve_correlation(&correlations, metadata.correlation_id) {
+                CorrelationAdmission::Accepted => None,
+                CorrelationAdmission::Duplicate => Some((
+                    409,
+                    api::CommandErrorCode::BadRequest,
+                    "duplicate command correlation",
+                )),
+                CorrelationAdmission::Saturated => Some((
+                    503,
+                    api::CommandErrorCode::Unavailable,
+                    "command consumer saturated",
+                )),
+                CorrelationAdmission::Unavailable => Some((
+                    503,
+                    api::CommandErrorCode::Unavailable,
+                    "command consumer unavailable",
+                )),
+            };
+        if let Some((status, code, message)) = admission_error_message {
+            publish_reply(&nats, reply, admission_error(status, code, message)).await;
+            continue;
+        }
+
+        let correlation_id = metadata.correlation_id;
+        if sender
+            .try_send(PendingCommand {
+                metadata,
+                payload: msg.payload.to_vec(),
+                reply: reply.clone(),
+            })
+            .is_err()
+        {
+            remove_correlation(&correlations, correlation_id);
+            publish_reply(
+                &nats,
+                reply,
+                admission_error(
+                    503,
+                    api::CommandErrorCode::Unavailable,
+                    "command consumer saturated",
+                ),
+            )
+            .await;
         }
     }
+
+    sub.unsubscribe().await?;
+    nats.flush().await?;
+    worker_cancel.cancel();
+    drop(sender);
+    let _ = worker.await;
     Ok(())
 }
 
-/// Decode one inbound request, dispatch it, and publish the reply on the
-/// message's reply inbox. A request with no reply subject can't be a NATS
-/// request/reply call; log and drop it.
-async fn process_one(state: &ApiCommandsState, msg: async_nats::Message) {
-    let Some(reply) = msg.reply.clone() else {
-        eprintln!("api_commands_consumer: message without reply subject, dropping");
-        return;
-    };
+fn request_metadata(msg: &async_nats::Message) -> Result<CommandRequestMetadata, &'static str> {
+    let headers = msg.headers.as_ref().ok_or("missing command metadata")?;
+    let correlation_id = headers
+        .get(CORRELATION_HEADER)
+        .ok_or("missing command correlation")?
+        .as_str()
+        .parse()
+        .map_err(|_| "invalid command correlation")?;
+    let deadline_unix_ms = headers
+        .get(DEADLINE_HEADER)
+        .ok_or("missing command deadline")?
+        .as_str()
+        .parse()
+        .map_err(|_| "invalid command deadline")?;
+    Ok(CommandRequestMetadata {
+        correlation_id,
+        deadline_unix_ms,
+    })
+}
 
-    let bytes = handle_local_request(state, &msg.payload).await;
-    if let Err(e) = state.nats.publish(reply, bytes.into()).await {
+fn admission_error(status: u32, code: api::CommandErrorCode, message: &str) -> Vec<u8> {
+    error_response(status, code, message.to_string()).encode_to_vec()
+}
+
+async fn publish_reply(nats: &NatsClient, reply: async_nats::Subject, response: Vec<u8>) {
+    if let Err(e) = nats.publish(reply, response.into()).await {
         eprintln!("api_commands_consumer: failed to publish reply: {}", e);
         return;
     }
-    // Flush so the synchronous HTTP caller's request resolves promptly rather
-    // than waiting on the client's periodic writer flush.
-    if let Err(e) = state.nats.flush().await {
+    if let Err(e) = nats.flush().await {
         eprintln!("api_commands_consumer: flush after reply failed: {}", e);
+    }
+}
+
+enum CorrelationAdmission {
+    Accepted,
+    Duplicate,
+    Saturated,
+    Unavailable,
+}
+
+fn reserve_correlation(
+    correlations: &Mutex<HashSet<Uuid>>,
+    correlation_id: Uuid,
+) -> CorrelationAdmission {
+    let Ok(mut active) = correlations.lock() else {
+        return CorrelationAdmission::Unavailable;
+    };
+    if active.contains(&correlation_id) {
+        CorrelationAdmission::Duplicate
+    } else if active.len() >= DEFAULT_MAX_IN_FLIGHT {
+        CorrelationAdmission::Saturated
+    } else {
+        active.insert(correlation_id);
+        CorrelationAdmission::Accepted
+    }
+}
+
+fn remove_correlation(correlations: &Mutex<HashSet<Uuid>>, correlation_id: Uuid) {
+    match correlations.lock() {
+        Ok(mut active) => {
+            active.remove(&correlation_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(&correlation_id);
+        }
     }
 }
 
@@ -673,13 +935,17 @@ async fn dispatch_trigger(
         Err(e @ TriggerError::WorkflowLookup(_))
         | Err(e @ TriggerError::Idempotency(_))
         | Err(e @ TriggerError::RepositoryWrite(_))
-        | Err(e @ TriggerError::NatsWrite(_)) => {
+        | Err(e @ TriggerError::NatsWrite(_))
+        | Err(e @ TriggerError::ScopeWrite(_))
+        | Err(e @ TriggerError::EffectsEncoding(_)) => {
             return error_response(500, api::CommandErrorCode::Internal, e.to_string())
         }
     };
 
     match outcome {
-        TriggerOutcome::Fresh { signal_id, signal } => {
+        TriggerOutcome::Fresh {
+            signal_id, signal, ..
+        } => {
             // The HTTP trigger path blocks on the relay send and surfaces a
             // failure as 503; mirror that here.
             if let Err(e) = state.relay_sender().send(&signal).await {
@@ -803,9 +1069,8 @@ async fn dispatch_wakeup(
 }
 
 /// Run the cancel pipeline and project its outcome onto the wire envelope.
-/// The pipeline (`cancel_pipeline::process_cancel`) owns the idempotency
-/// check, the ByTag register-before-forward ordering, the `SignalApplied`
-/// await, and the audit-row write.
+/// The pipeline owns idempotency, durable ByTag Signal staging, relay
+/// forwarding, bounded materialization reconciliation, and audit projection.
 async fn dispatch_cancel(
     state: &impl ApiCommandDispatchState,
     req: api::CancelRequest,
@@ -861,14 +1126,17 @@ async fn dispatch_cancel(
     };
 
     let result = if let Some(nats) = state.nats() {
-        process_cancel(state.repositories().as_ref(), nats, pipeline_req).await
+        process_cancel(
+            state.repositories().as_ref(),
+            nats,
+            state.signal_applied_notifications().as_ref(),
+            pipeline_req,
+        )
+        .await
     } else {
         crate::cancel_pipeline::process_cancel_local(
             state.repositories().as_ref(),
-            state
-                .signal_applied_notifications()
-                .expect("Tickr Lite Command state carries SignalApplied notifications")
-                .as_ref(),
+            state.signal_applied_notifications().as_ref(),
             pipeline_req,
         )
         .await
@@ -908,15 +1176,10 @@ async fn dispatch_cancel(
                 your_input_hash: your_hash,
             }),
         ),
-        // ByTag timeout: the signal_id rides in the error message (the API has
-        // no structured field for it on the error path).
         Err(CancelError::ByTagTimeout { signal_id }) => error_response(
             503,
             api::CommandErrorCode::Unavailable,
-            format!(
-                "timed out waiting for server-side SignalApplied; signal_id={}",
-                signal_id
-            ),
+            format!("timed out waiting for durable Signal materialization; signal_id={signal_id}"),
         ),
         Err(e @ CancelError::RelayUnreachable(_)) => {
             error_response(503, api::CommandErrorCode::Unavailable, e.to_string())
@@ -924,7 +1187,8 @@ async fn dispatch_cancel(
         Err(
             e @ CancelError::SerializeTarget(_)
             | e @ CancelError::IdempotencyBucket(_)
-            | e @ CancelError::IdempotencyCheck(_),
+            | e @ CancelError::IdempotencyCheck(_)
+            | e @ CancelError::DurableSignalState(_),
         ) => error_response(500, api::CommandErrorCode::Internal, e.to_string()),
     }
 }

@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// Bucket name carrying the conductor's per-tenant idempotency-key cache.
 /// Distinct from the `ctx-<ns>` bucket so cache rows can have their own TTL
 /// without affecting captures retention.
-pub const IDEMPOTENCY_BUCKET: &str = "signal_idempotency";
+pub const IDEMPOTENCY_BUCKET: &str = tickr_proto::coord::all_nats::INGRESS_IDEMPOTENCY_BUCKET;
 
 /// Cache-row value. The original signal_id is what dedup retries return; the
 /// input_sha256 is what differentiates a "same logical request" retry from
@@ -62,7 +62,7 @@ pub enum CacheOutcome {
 /// Default TTL — 10 minutes is a typical producer retry window and bounds
 /// the orphan-captures window when a producer retries through a relay
 /// outage.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_TTL: Duration = tickr_proto::coord::all_nats::INGRESS_IDEMPOTENCY_TTL;
 
 /// Get-or-create the idempotency-cache bucket. Mirrors the get-or-create
 /// pattern used by `tickr_ctx::store::Store::open` and the executor's

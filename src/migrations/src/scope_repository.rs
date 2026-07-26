@@ -1,4 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    error::Error,
+    future::Future,
+    pin::Pin,
+};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -199,6 +204,72 @@ pub enum ScopeCleanupOutcome {
     Missing,
     SnapshotRequired,
     Quarantined { scope_id: Uuid, diagnostic: String },
+}
+
+pub type ScopeStoreError = Box<dyn Error + Send + Sync>;
+pub type ScopeStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ScopeStoreError>> + Send + 'a>>;
+
+/// Backend-neutral access to the selected tickr-ctx ScopeStore role.
+///
+/// Callers own scope semantics and opaque envelope bytes; adapters alone own
+/// their repository, NATS, or Redis substrate.
+pub trait ScopeStore: Send + Sync {
+    fn create_tickr_ctx_scope<'a>(
+        &'a self,
+        input: CreateTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeCreationOutcome>;
+
+    fn write_tickr_ctx_scope<'a>(
+        &'a self,
+        input: WriteTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeWriteOutcome>;
+
+    fn delete_tickr_ctx_scope_value<'a>(
+        &'a self,
+        input: DeleteTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeDeleteOutcome>;
+
+    fn read_tickr_ctx_scope(
+        &self,
+        scope_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'_, ScopeReadOutcome>;
+
+    fn snapshot_tickr_ctx_scope_for_run<'a>(
+        &'a self,
+        namespace: &'a str,
+        run_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'a, ScopeSnapshotOutcome>;
+
+    fn record_verified_archive_commit<'a>(
+        &'a self,
+        _scope_id: Uuid,
+        _snapshot_digest: &'a str,
+        _archive_identity: &'a [u8],
+        _now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'a, ()> {
+        Box::pin(async {
+            Err(Box::new(std::io::Error::other(
+                "selected ScopeStore adapter does not expose archive evidence",
+            )) as ScopeStoreError)
+        })
+    }
+
+    fn cleanup_after_verified_archive_commit<'a>(
+        &'a self,
+        _scope_id: Uuid,
+        _snapshot_digest: &'a str,
+        _archive_identity: &'a [u8],
+        _now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'a, ScopeCleanupOutcome> {
+        Box::pin(async {
+            Err(Box::new(std::io::Error::other(
+                "selected ScopeStore adapter does not expose verified archive cleanup",
+            )) as ScopeStoreError)
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -548,15 +619,6 @@ impl WriterRepositoryBundle {
         }
 
         let values = load_scope_values(&mut tx, &encoded_scope_id).await?;
-        if values.is_empty() {
-            let diagnostic = "active scope has no accepted values".to_owned();
-            quarantine_scope(&mut tx, &encoded_scope_id, &diagnostic, now).await?;
-            tx.commit().await.map_err(repository_sqlx_error)?;
-            return Ok(ScopeReadOutcome::Quarantined {
-                scope_id,
-                diagnostic,
-            });
-        }
         if let Some(bound) = stored_bounds(&values) {
             tx.commit().await.map_err(repository_sqlx_error)?;
             return Ok(ScopeReadOutcome::Bound(bound));
@@ -750,6 +812,66 @@ impl WriterRepositoryBundle {
         .map_err(repository_sqlx_error)?;
         tx.commit().await.map_err(repository_sqlx_error)?;
         Ok(ScopeCleanupOutcome::Cleaned)
+    }
+}
+
+impl ScopeStore for WriterRepositoryBundle {
+    fn create_tickr_ctx_scope<'a>(
+        &'a self,
+        input: CreateTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeCreationOutcome> {
+        Box::pin(async move {
+            WriterRepositoryBundle::create_tickr_ctx_scope(self, input)
+                .await
+                .map_err(|error| Box::new(error) as ScopeStoreError)
+        })
+    }
+
+    fn write_tickr_ctx_scope<'a>(
+        &'a self,
+        input: WriteTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeWriteOutcome> {
+        Box::pin(async move {
+            WriterRepositoryBundle::write_tickr_ctx_scope(self, input)
+                .await
+                .map_err(|error| Box::new(error) as ScopeStoreError)
+        })
+    }
+
+    fn delete_tickr_ctx_scope_value<'a>(
+        &'a self,
+        input: DeleteTickrCtxScopeInput<'a>,
+    ) -> ScopeStoreFuture<'a, ScopeDeleteOutcome> {
+        Box::pin(async move {
+            WriterRepositoryBundle::delete_tickr_ctx_scope_value(self, input)
+                .await
+                .map_err(|error| Box::new(error) as ScopeStoreError)
+        })
+    }
+
+    fn read_tickr_ctx_scope(
+        &self,
+        scope_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'_, ScopeReadOutcome> {
+        Box::pin(async move {
+            WriterRepositoryBundle::read_tickr_ctx_scope(self, scope_id, now)
+                .await
+                .map_err(|error| Box::new(error) as ScopeStoreError)
+        })
+    }
+
+    fn snapshot_tickr_ctx_scope_for_run<'a>(
+        &'a self,
+        namespace: &'a str,
+        run_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> ScopeStoreFuture<'a, ScopeSnapshotOutcome> {
+        Box::pin(async move {
+            WriterRepositoryBundle::snapshot_tickr_ctx_scope_for_run(self, namespace, run_id, now)
+                .await
+                .map_err(|error| Box::new(error) as ScopeStoreError)
+        })
     }
 }
 
