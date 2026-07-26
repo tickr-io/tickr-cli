@@ -22,6 +22,15 @@ pub struct Scope {
     pub signal_id: Option<String>,
 }
 
+/// Build the fresh all-NATS KV bucket for one logical scope namespace.
+pub fn bucket_for_namespace(namespace: &str) -> String {
+    format!(
+        "{}{}",
+        tickr_proto::coord::all_nats::SCOPE_BUCKET_PREFIX,
+        sanitize_segment(namespace)
+    )
+}
+
 impl Scope {
     /// Resolve from env, with optional CLI overrides.
     pub fn resolve(
@@ -91,7 +100,7 @@ impl Scope {
 
     /// Build the JetStream KV bucket name for this namespace.
     pub fn bucket(&self) -> String {
-        format!("ctx-{}", sanitize_segment(&self.ns))
+        bucket_for_namespace(&self.ns)
     }
 
     /// Build the JetStream KV key for a run-scoped key.
@@ -163,7 +172,7 @@ mod tests {
             outputs: vec![],
             signal_id: None,
         };
-        assert_eq!(s.bucket(), "ctx-default");
+        assert_eq!(s.bucket(), "TICKR_ALL_NATS_V2_SCOPE_default");
     }
 
     #[test]

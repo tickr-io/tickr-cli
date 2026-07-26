@@ -2,21 +2,29 @@
 
 use crate::proto::conductor_relay_service_client::ConductorRelayServiceClient;
 use crate::proto::{ConductorRelayMessage, EntityType};
-use crate::system_tasks::{build_ack, stage_compaction_payload};
-use anyhow::Result;
+use crate::signal_applied_notifier::SignalAppliedNotifier;
+use crate::system_tasks::build_ack;
+use crate::system_tasks::compaction_drain::{
+    observe_compaction_boundary, AllNatsCompactionStaging, CompactionBoundary,
+};
+use anyhow::{Context, Result};
 use async_nats::jetstream;
+use async_nats::HeaderMap;
 use async_stream;
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use prost::Message;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tickr_proto::codec::compaction::decode_envelope;
+use tickr_proto::coord::all_nats::{ElectionDecision, TaskPickupRecord, TASK_PICKUP_BUCKET};
 use tickr_proto::coord::{
-    parse_liveness_key, LIVENESS_BUCKET, LIVENESS_MARKER_CONSUMER, LIVENESS_MARKER_TTL,
-    MARKER_REASON_EXPIRY, TASK_CANCEL_ACK_CONSUMER, TASK_CANCEL_ACK_STREAM,
-    TASK_CANCEL_ACK_SUBJECT, TASK_CANCEL_STREAM, TASK_CANCEL_SUBJECT, TASK_DISPATCH_STREAM,
-    TASK_DISPATCH_SUBJECT, TASK_EVENT_CONSUMER, TASK_EVENT_STREAM, TASK_EVENT_SUBJECT,
+    CompactionStaging, TaskCancellationAckConsumer, TaskCancellationAckDelivery,
+    TaskCancellationFuture, TaskCancellationPublisher, TaskDispatchFuture, TaskDispatchPublisher,
+    TaskEventConsumer, TaskEventDelivery, TaskEventFuture, TaskEventWriter, LIVENESS_BUCKET,
+    LIVENESS_MARKER_CONSUMER, LIVENESS_MARKER_TTL, TASK_CANCEL_ACK_CONSUMER,
+    TASK_CANCEL_ACK_STREAM, TASK_CANCEL_ACK_SUBJECT, TASK_CANCEL_STREAM, TASK_CANCEL_SUBJECT,
+    TASK_DISPATCH_STREAM, TASK_DISPATCH_SUBJECT, TASK_EVENT_CONSUMER, TASK_EVENT_STREAM,
+    TASK_EVENT_SUBJECT,
 };
 use tickr_proto::patch as pp;
 use tickr_proto::signal as sp;
@@ -30,12 +38,15 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 // Global channel for sending relay messages
-static RELAY_TX: Lazy<Arc<Mutex<Option<mpsc::Sender<ConductorRelayMessage>>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+static RELAY_TX: LazyLock<Arc<Mutex<Option<mpsc::Sender<ConductorRelayMessage>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 /// Prevent a durable definition-lookup fault from hot-looping its JetStream
 /// message and exhausting local log storage before an Operator can repair it.
 const LOOKUP_INTEGRITY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const OUTCOME_SWEEP_BATCH: usize = 64;
+const OUTCOME_ELECTION_RETRIES: usize = 8;
+const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";
 
 /// Inject the relay-tx slot directly. Production sets it via `run_streaming`
 /// once the gRPC stream is established; integration tests that don't want
@@ -44,6 +55,46 @@ const LOOKUP_INTEGRITY_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub async fn init_relay_tx(tx: mpsc::Sender<ConductorRelayMessage>) {
     let mut guard = RELAY_TX.lock().await;
     *guard = Some(tx);
+}
+
+#[cfg(test)]
+pub(crate) async fn stage_compaction_and_send_ack(
+    nats: &async_nats::Client,
+    payload: Vec<u8>,
+    ack_tx: &mpsc::Sender<ConductorRelayMessage>,
+) -> Result<(String, String)> {
+    stage_compaction_through_role_and_send_ack(
+        &AllNatsCompactionStaging::new(nats.clone()),
+        payload,
+        ack_tx,
+    )
+    .await
+}
+
+async fn stage_compaction_through_role_and_send_ack(
+    staging: &dyn CompactionStaging,
+    payload: Vec<u8>,
+    ack_tx: &mpsc::Sender<ConductorRelayMessage>,
+) -> Result<(String, String)> {
+    let envelope = decode_envelope(&payload)?;
+    let projection = envelope
+        .projection
+        .as_ref()
+        .expect("decode_envelope guarantees a projection");
+    let workflow_instance_id = projection.id.clone();
+    let state = projection.state.clone();
+    staging
+        .stage(&payload)
+        .await
+        .map_err(|error| anyhow::anyhow!("stage Compaction through selected role: {error}"))?;
+    let acknowledgement = build_ack(&workflow_instance_id, &envelope.correlation);
+    observe_compaction_boundary(CompactionBoundary::BeforeCrossPlaneAcknowledgement);
+    ack_tx
+        .send(acknowledgement)
+        .await
+        .map_err(|error| anyhow::anyhow!("send CompactionAck: {error}"))?;
+    observe_compaction_boundary(CompactionBoundary::AfterCrossPlaneAcknowledgement);
+    Ok((workflow_instance_id, state))
 }
 
 /// Register a protobuf workflow definition through the coordinator relay.
@@ -127,6 +178,27 @@ pub async fn try_send_signal(signal: &sp::Signal) -> Result<TrySendOutcome> {
         tenant_id: None,
     };
 
+    match tx.try_send(msg) {
+        Ok(()) => Ok(TrySendOutcome::Sent),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(TrySendOutcome::Saturated),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(anyhow::anyhow!("Relay outbound channel closed"))
+        }
+    }
+}
+
+/// Saturation-aware GateOutcome forward used by durable Event-ingress relay
+/// intents. A full or unavailable relay must preserve source redelivery.
+pub async fn try_send_gate_outcome(outcome: &sp::GateOutcome) -> Result<TrySendOutcome> {
+    let tx_guard = RELAY_TX.lock().await;
+    let Some(tx) = tx_guard.as_ref() else {
+        return Err(anyhow::anyhow!("Relay channel not initialized"));
+    };
+    let msg = ConductorRelayMessage {
+        entity_type: EntityType::GateOutcome as i32,
+        payload: outcome.encode_to_vec(),
+        tenant_id: None,
+    };
     match tx.try_send(msg) {
         Ok(()) => Ok(TrySendOutcome::Sent),
         Err(mpsc::error::TrySendError::Full(_)) => Ok(TrySendOutcome::Saturated),
@@ -247,6 +319,308 @@ pub async fn task_event_consumer(
     Ok(consumer)
 }
 
+#[derive(Clone)]
+pub struct NatsTaskEventConsumer {
+    consumer: jetstream::consumer::PullConsumer,
+}
+
+impl NatsTaskEventConsumer {
+    pub fn new(consumer: jetstream::consumer::PullConsumer) -> Self {
+        Self { consumer }
+    }
+}
+
+struct NatsTaskEventDelivery {
+    message: jetstream::Message,
+}
+
+impl TaskEventDelivery for NatsTaskEventDelivery {
+    fn payload(&self) -> &[u8] {
+        &self.message.payload
+    }
+
+    fn complete(self: Box<Self>) -> TaskEventFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            self.message
+                .ack()
+                .await
+                .map_err(|error| format!("task-event acknowledgement failed: {error}"))
+        })
+    }
+
+    fn retry(
+        self: Box<Self>,
+        delay: Option<Duration>,
+    ) -> TaskEventFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            self.message
+                .ack_with(jetstream::AckKind::Nak(delay))
+                .await
+                .map_err(|error| format!("task-event retry failed: {error}"))
+        })
+    }
+}
+
+impl TaskEventConsumer for NatsTaskEventConsumer {
+    fn next(&self) -> TaskEventFuture<'_, Result<Option<Box<dyn TaskEventDelivery>>, String>> {
+        Box::pin(async move {
+            let mut batch = self
+                .consumer
+                .batch()
+                .max_messages(1)
+                .expires(Duration::from_secs(1))
+                .messages()
+                .await
+                .map_err(|error| format!("open task-event delivery batch: {error}"))?;
+            match batch.next().await {
+                Some(Ok(message)) => Ok(Some(
+                    Box::new(NatsTaskEventDelivery { message }) as Box<dyn TaskEventDelivery>
+                )),
+                Some(Err(error)) => Err(format!("task-event pull failed: {error}")),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct NatsTaskEventWriter {
+    js: jetstream::Context,
+}
+
+impl NatsTaskEventWriter {
+    pub fn new(nats: &async_nats::Client) -> Self {
+        Self {
+            js: jetstream::new(nats.clone()),
+        }
+    }
+}
+
+impl TaskEventWriter for NatsTaskEventWriter {
+    fn prepare(&self) -> TaskEventFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.js
+                .get_or_create_stream(jetstream::stream::Config {
+                    name: TASK_EVENT_STREAM.to_owned(),
+                    subjects: vec![TASK_EVENT_SUBJECT.to_owned()],
+                    retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("get_or_create task-event stream: {error}"))
+        })
+    }
+
+    fn stage<'a>(
+        &'a self,
+        identity: &'a str,
+        encoded_task_event: &'a [u8],
+    ) -> TaskEventFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(MESSAGE_ID_HEADER, identity);
+            self.js
+                .publish_with_headers(
+                    TASK_EVENT_SUBJECT,
+                    headers,
+                    encoded_task_event.to_vec().into(),
+                )
+                .await
+                .map_err(|error| format!("stage TaskEvent: {error}"))?
+                .await
+                .map_err(|error| format!("prove staged TaskEvent: {error}"))?;
+            Ok(())
+        })
+    }
+}
+#[derive(Clone)]
+pub struct NatsTaskDispatchPublisher {
+    js: jetstream::Context,
+}
+
+impl NatsTaskDispatchPublisher {
+    pub fn new(nats: &async_nats::Client) -> Self {
+        Self {
+            js: jetstream::new(nats.clone()),
+        }
+    }
+}
+
+impl TaskDispatchPublisher for NatsTaskDispatchPublisher {
+    fn prepare(&self) -> TaskDispatchFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.js
+                .get_or_create_stream(jetstream::stream::Config {
+                    name: TASK_DISPATCH_STREAM.to_owned(),
+                    subjects: vec![TASK_DISPATCH_SUBJECT.to_owned()],
+                    retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("get_or_create task-dispatch stream: {error}"))
+        })
+    }
+
+    fn stage<'a>(
+        &'a self,
+        identity: &'a str,
+        encoded_dispatch: &'a [u8],
+    ) -> TaskDispatchFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(MESSAGE_ID_HEADER, identity);
+            self.js
+                .publish_with_headers(
+                    TASK_DISPATCH_SUBJECT,
+                    headers,
+                    encoded_dispatch.to_vec().into(),
+                )
+                .await
+                .map_err(|error| format!("stage TaskDispatch: {error}"))?
+                .await
+                .map_err(|error| format!("prove staged TaskDispatch: {error}"))?;
+            Ok(())
+        })
+    }
+}
+
+pub enum TaskEventProjection {
+    Forward(Option<crate::patch_pipeline::ParsedPatch>),
+    Retry(Duration),
+}
+
+pub trait TaskEventProjector: Send + Sync {
+    fn project<'a>(
+        &'a self,
+        task_event: &'a mut tc::TaskEvent,
+    ) -> TaskEventFuture<'a, TaskEventProjection>;
+
+    fn after_forwarded(
+        &self,
+        workflow_instance_id: Uuid,
+        task_id: Uuid,
+        patch: crate::patch_pipeline::ParsedPatch,
+    ) -> TaskEventFuture<'static, ()>;
+}
+
+#[derive(Clone)]
+pub struct NatsTaskEventProjector {
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    nats: async_nats::Client,
+}
+
+impl NatsTaskEventProjector {
+    pub fn new(
+        definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+        nats: async_nats::Client,
+    ) -> Self {
+        Self {
+            definition_repository,
+            nats,
+        }
+    }
+}
+
+impl TaskEventProjector for NatsTaskEventProjector {
+    fn project<'a>(
+        &'a self,
+        task_event: &'a mut tc::TaskEvent,
+    ) -> TaskEventFuture<'a, TaskEventProjection> {
+        Box::pin(async move {
+            match crate::routing_enrichment::enrich_completed_task_event(
+                self.definition_repository.as_ref(),
+                &self.nats,
+                task_event,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e @ crate::routing_enrichment::EnrichmentError::LookupIntegrity { .. }) => {
+                    eprintln!(
+                        "routing-variable enrichment failed for task {:?}: {} (fail closed: not forwarding; delayed redelivery)",
+                        task_event.task_instance_id, e
+                    );
+                    return TaskEventProjection::Retry(LOOKUP_INTEGRITY_RETRY_DELAY);
+                }
+                Err(e @ crate::routing_enrichment::EnrichmentError::SplitStageDrop { .. }) => {
+                    tracing::error!(
+                        "routing-variable enrichment failed for task {:?}: {} (fail closed: \
+                         escalating completion to a terminal task failure)",
+                        task_event.task_instance_id,
+                        e
+                    );
+                    task_event.kind = Some(tc::task_event::Kind::Failed(tc::task_event::Failed {}));
+                }
+                Err(crate::routing_enrichment::EnrichmentError::Forwardable(e)) => {
+                    eprintln!(
+                        "routing-variable enrichment failed for task {:?}: {:#} (forwarding un-enriched)",
+                        task_event.task_instance_id, e
+                    );
+                }
+            }
+
+            let mut pending_self_patch = None;
+            if matches!(task_event.kind, Some(tc::task_event::Kind::Completed(_))) {
+                let workflow_instance_id =
+                    Uuid::parse_str(&task_event.workflow_instance_id).expect("validated TaskEvent");
+                let task_instance_id =
+                    Uuid::parse_str(&task_event.task_instance_id).expect("validated TaskEvent");
+                let task_id = Uuid::parse_str(&task_event.task_id).expect("validated TaskEvent");
+                if let Some(doc) = crate::routing_enrichment::read_self_patch_output(
+                    &self.nats,
+                    workflow_instance_id,
+                    task_instance_id,
+                )
+                .await
+                {
+                    match crate::patch_pipeline::parse_self_patch_document(&doc).await {
+                        Ok(parsed) => {
+                            let key =
+                                crate::patch_pipeline::patch_key(workflow_instance_id, task_id);
+                            if let Some(tc::task_event::Kind::Completed(completed)) =
+                                &mut task_event.kind
+                            {
+                                completed.self_patch = Some(key.to_string());
+                            }
+                            pending_self_patch = Some(parsed);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "self-patch document from task {:?} failed to parse: {} \
+                                 (reshape lost; completion forwards unmarked)",
+                                task_event.task_instance_id, e
+                            );
+                        }
+                    }
+                }
+            }
+            TaskEventProjection::Forward(pending_self_patch)
+        })
+    }
+
+    fn after_forwarded(
+        &self,
+        workflow_instance_id: Uuid,
+        task_id: Uuid,
+        patch: crate::patch_pipeline::ParsedPatch,
+    ) -> TaskEventFuture<'static, ()> {
+        let definition_repository = Arc::clone(&self.definition_repository);
+        let nats = self.nats.clone();
+        Box::pin(async move {
+            fork_self_patch(
+                definition_repository.as_ref(),
+                &nats,
+                workflow_instance_id,
+                task_id,
+                patch,
+            )
+            .await;
+        })
+    }
+}
+
 /// Get-or-create the durable task-dispatch **work queue** the conductor
 /// publishes dispatched tasks into. A JetStream work queue: an unpicked or
 /// relay-blipped dispatch waits durably here instead of being lost on
@@ -328,6 +702,108 @@ pub async fn cancel_ack_consumer(
     Ok(consumer)
 }
 
+#[derive(Clone)]
+pub struct NatsTaskCancellationPublisher {
+    nats: async_nats::Client,
+}
+
+impl NatsTaskCancellationPublisher {
+    pub fn new(nats: &async_nats::Client) -> Self {
+        Self { nats: nats.clone() }
+    }
+}
+
+impl TaskCancellationPublisher for NatsTaskCancellationPublisher {
+    fn prepare(&self) -> TaskCancellationFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            ensure_task_cancel_stream(&self.nats)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn stage<'a>(
+        &'a self,
+        encoded_cancellation: &'a [u8],
+    ) -> TaskCancellationFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            publish_task_cancel(&self.nats, encoded_cancellation.to_vec())
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct NatsTaskCancellationAckConsumer {
+    consumer: jetstream::consumer::PullConsumer,
+}
+
+impl NatsTaskCancellationAckConsumer {
+    pub fn new(consumer: jetstream::consumer::PullConsumer) -> Self {
+        Self { consumer }
+    }
+}
+
+struct NatsTaskCancellationAckDelivery {
+    message: jetstream::Message,
+}
+
+impl TaskCancellationAckDelivery for NatsTaskCancellationAckDelivery {
+    fn payload(&self) -> &[u8] {
+        &self.message.payload
+    }
+
+    fn complete(self: Box<Self>) -> TaskCancellationFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            self.message
+                .ack()
+                .await
+                .map_err(|error| format!("cancellation acknowledgement failed: {error}"))
+        })
+    }
+
+    fn retry(
+        self: Box<Self>,
+        delay: Option<Duration>,
+    ) -> TaskCancellationFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            self.message
+                .ack_with(jetstream::AckKind::Nak(delay))
+                .await
+                .map_err(|error| format!("cancellation acknowledgement retry failed: {error}"))
+        })
+    }
+}
+
+impl TaskCancellationAckConsumer for NatsTaskCancellationAckConsumer {
+    fn next(
+        &self,
+    ) -> TaskCancellationFuture<'_, Result<Option<Box<dyn TaskCancellationAckDelivery>>, String>>
+    {
+        Box::pin(async move {
+            let mut batch = self
+                .consumer
+                .batch()
+                .max_messages(1)
+                .expires(Duration::from_secs(1))
+                .messages()
+                .await
+                .map_err(|error| format!("open cancellation acknowledgement batch: {error}"))?;
+            match batch.next().await {
+                Some(Ok(message)) => {
+                    Ok(Some(Box::new(NatsTaskCancellationAckDelivery { message })
+                        as Box<dyn TaskCancellationAckDelivery>))
+                }
+                Some(Err(error)) => {
+                    Err(format!("cancellation acknowledgement pull failed: {error}"))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+}
+
 /// Drain executor cancel-acks off the durable queue and forward each onto the
 /// relay as a `CANCEL_TASK_ACK` envelope, **acking on forward** (the durability
 /// boundary is the conductor, same as `drain_task_events`). A relay blip leaves
@@ -391,6 +867,54 @@ pub async fn drain_cancel_acks(
     }
 }
 
+pub async fn drain_cancellation_ack_source(
+    consumer: Arc<dyn TaskCancellationAckConsumer>,
+    relay_tx: mpsc::Sender<ConductorRelayMessage>,
+    token: CancellationToken,
+) {
+    loop {
+        let delivery = tokio::select! {
+            _ = token.cancelled() => break,
+            delivery = consumer.next() => match delivery {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("cancellation acknowledgement pull failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            },
+        };
+        if tc::CancelTaskAck::decode(delivery.payload()).is_err() {
+            eprintln!("dropping undeserializable cancellation acknowledgement");
+            if let Err(error) = delivery.complete().await {
+                eprintln!("failed to complete poison cancellation acknowledgement: {error}");
+            }
+            continue;
+        }
+        let conductor_msg = ConductorRelayMessage {
+            entity_type: EntityType::CancelTaskAck as i32,
+            payload: delivery.payload().to_vec(),
+            tenant_id: None,
+        };
+        if let Err(error) = relay_tx.send(conductor_msg).await {
+            eprintln!(
+                "Error forwarding cancellation acknowledgement: {error} (pending; redelivers)"
+            );
+            let _ = delivery.retry(None).await;
+            break;
+        }
+        if let Err(error) = delivery.complete().await {
+            eprintln!(
+                "cancellation acknowledgement completion failed: {error} (redelivery converges)"
+            );
+        }
+    }
+}
+
 /// Publish a dispatched task into the durable task-dispatch work queue and,
 /// **only after the publish ack**, emit the conductor's `Delivered` task event
 /// onto the relay. Awaiting the ack is what sharpens `Delivered` from
@@ -399,7 +923,7 @@ pub async fn drain_cancel_acks(
 /// event now means the work won't be lost even if no executor is up yet.
 /// `delivered` carries no `executor_id` — no executor has picked it up.
 pub async fn publish_dispatch_and_deliver(
-    nats: &async_nats::Client,
+    task_dispatch: &dyn TaskDispatchPublisher,
     relay_tx: &mpsc::Sender<ConductorRelayMessage>,
     payload: Vec<u8>,
     task_instance_id: Uuid,
@@ -407,14 +931,11 @@ pub async fn publish_dispatch_and_deliver(
     workflow_instance_id: Uuid,
     workflow_id: Uuid,
 ) -> Result<()> {
-    let js = jetstream::new(nats.clone());
-    // Publish into the work queue and await the publish ack — the dispatch is
-    // durably staged in the substrate before we declare it Delivered.
-    js.publish(TASK_DISPATCH_SUBJECT, payload.into())
+    let identity = format!("dispatch:{task_instance_id}");
+    task_dispatch
+        .stage(&identity, &payload)
         .await
-        .map_err(|e| anyhow::anyhow!("publish task dispatch: {}", e))?
-        .await
-        .map_err(|e| anyhow::anyhow!("await task-dispatch publish ack: {}", e))?;
+        .map_err(anyhow::Error::msg)?;
 
     // Post-ack: emit the `delivered` hand-off so the server publishes the
     // `TaskDelivered` milestone (durably-staged semantics). Authored directly on
@@ -456,159 +977,64 @@ pub async fn publish_dispatch_and_deliver(
 /// event loudly rather than dropping the completion. The residual
 /// conductor→server relay-hop gap (forwarded ≠ applied) is documented, not
 /// closed.
-pub async fn drain_task_events(
-    consumer: jetstream::consumer::PullConsumer,
+pub async fn drain_task_event_source(
+    consumer: Arc<dyn TaskEventConsumer>,
     relay_tx: mpsc::Sender<ConductorRelayMessage>,
-    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
-    nats: async_nats::Client,
+    projector: Arc<dyn TaskEventProjector>,
     token: CancellationToken,
 ) {
-    let mut messages = match consumer
-        .stream()
-        .max_messages_per_batch(16)
-        .messages()
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to open task-event consumer stream: {}", e);
-            return;
-        }
-    };
     loop {
-        let msg = tokio::select! {
+        let delivery = tokio::select! {
             _ = token.cancelled() => break,
-            next = messages.next() => match next {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => {
-                    eprintln!("task-event pull error: {}", e);
+            next = consumer.next() => match next {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("task-event pull error: {error}");
                     continue;
                 }
-                None => break,
             },
         };
 
-        let mut task_event = match tc::TaskEvent::decode(&msg.payload[..]) {
+        let mut task_event = match tc::TaskEvent::decode(delivery.payload()) {
             Ok(ev) => ev,
             Err(e) => {
-                // Poison message: ack to drop it rather than redeliver an
-                // undeserializable event forever.
+                // Poison delivery is completed so it cannot redeliver forever.
                 eprintln!("dropping undeserializable task event: {}", e);
-                let _ = msg.ack().await;
+                let _ = delivery.complete().await;
                 continue;
             }
         };
         // Identity rides the wire as UUID strings. Parse the ids the drain acts
         // on once; a malformed id on an otherwise-decodable event is poison
         // (ack-drop) rather than an endless redelivery.
-        let (event_wfi, event_tii, event_tid) = match (
+        let (event_wfi, event_tid) = match (
             Uuid::parse_str(&task_event.workflow_instance_id),
             Uuid::parse_str(&task_event.task_instance_id),
             Uuid::parse_str(&task_event.task_id),
         ) {
-            (Ok(wfi), Ok(tii), Ok(tid)) => (wfi, tii, tid),
+            (Ok(wfi), Ok(_), Ok(tid)) => (wfi, tid),
             _ => {
                 eprintln!(
                     "dropping task event with malformed id(s): task_instance_id={:?}",
                     task_event.task_instance_id
                 );
-                let _ = msg.ack().await;
+                let _ = delivery.complete().await;
                 continue;
             }
         };
         println!(
-            "Received TaskEvent from JetStream: task_id={:?}, kind={:?}",
+            "Received TaskEvent from durable source: task_id={:?}, kind={:?}",
             task_event.task_instance_id, task_event.kind
         );
 
-        // Enrich the completing task's declared routing variables onto the
-        // event before relaying (the executor stays dumb and publishes a bare
-        // event). Forwarding a completion without a routing variable the task
-        // actually produced would silently strand any loop gated on it, so
-        // both genuine faults fail closed: a lookup-integrity fault is NAK'd
-        // back to the durable queue after a bounded delay, recoverable once
-        // the fault is fixed without creating a hot redelivery loop; and an
-        // emitted-but-dropped declared variable — deterministic, so redelivery
-        // can never enrich it — is escalated to a conductor-minted terminal
-        // task failure. A bag-read failure is surfaced loudly and the
-        // un-enriched event forwarded, so task completion is never dropped on
-        // a routing-var bug.
-        match crate::routing_enrichment::enrich_completed_task_event(
-            definition_repository.as_ref(),
-            &nats,
-            &mut task_event,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e @ crate::routing_enrichment::EnrichmentError::LookupIntegrity { .. }) => {
-                eprintln!(
-                    "routing-variable enrichment failed for task {:?}: {} (fail closed: not forwarding; delayed redelivery)",
-                    task_event.task_instance_id, e
-                );
-                let _ = msg
-                    .ack_with(jetstream::AckKind::Nak(Some(LOOKUP_INTEGRITY_RETRY_DELAY)))
-                    .await;
+        let mut pending_self_patch = match projector.project(&mut task_event).await {
+            TaskEventProjection::Forward(pending_self_patch) => pending_self_patch,
+            TaskEventProjection::Retry(delay) => {
+                let _ = delivery.retry(Some(delay)).await;
                 continue;
             }
-            Err(e @ crate::routing_enrichment::EnrichmentError::SplitStageDrop { .. }) => {
-                // Rewrite the completion into the conductor-minted failure
-                // verdict — the same relay channel the liveness verdict rides,
-                // no new envelope — so the server grounds a terminal task
-                // failure that cascades through the existing loop machinery
-                // instead of the stuck loop reading as a slow run.
-                tracing::error!(
-                    "routing-variable enrichment failed for task {:?}: {} (fail closed: \
-                     escalating completion to a terminal task failure)",
-                    task_event.task_instance_id,
-                    e
-                );
-                task_event.kind = Some(tc::task_event::Kind::Failed(tc::task_event::Failed {}));
-            }
-            Err(crate::routing_enrichment::EnrichmentError::Forwardable(e)) => {
-                eprintln!(
-                    "routing-variable enrichment failed for task {:?}: {:#} (forwarding un-enriched)",
-                    task_event.task_instance_id, e
-                );
-            }
-        }
-
-        // Self-patch detection (emit-and-exit): a completing task may carry a
-        // raw Patch document on its reserved `tickr_patch` output. The
-        // conductor detects it HERE, on the completion drain — it is upstream
-        // of the server and owns the parser — parses it, and stamps the
-        // attempt-invariant `patch_key` onto the forwarded completion so the
-        // server arms the Stall on presence alone, atomically with the
-        // completion and before its cascade walk. The pipeline fork itself
-        // runs AFTER the completion forwards (below): the relay channel is
-        // FIFO, so the Stall is always armed before any patch envelope can
-        // ask to apply. A document that fails to parse stamps nothing — the
-        // reshape is lost-but-logged and the instance never stalls for it.
-        let mut pending_self_patch: Option<crate::patch_pipeline::ParsedPatch> = None;
-        if matches!(task_event.kind, Some(tc::task_event::Kind::Completed(_))) {
-            if let Some(doc) =
-                crate::routing_enrichment::read_self_patch_output(&nats, event_wfi, event_tii).await
-            {
-                match crate::patch_pipeline::parse_self_patch_document(&doc).await {
-                    Ok(parsed) => {
-                        let key = crate::patch_pipeline::patch_key(event_wfi, event_tid);
-                        if let Some(tc::task_event::Kind::Completed(completed)) =
-                            &mut task_event.kind
-                        {
-                            completed.self_patch = Some(key.to_string());
-                        }
-                        pending_self_patch = Some(parsed);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "self-patch document from task {:?} failed to parse: {} \
-                             (reshape lost; completion forwards unmarked)",
-                            task_event.task_instance_id, e
-                        );
-                    }
-                }
-            }
-        }
+        };
 
         // Re-encode on the published contract (the event may now carry routing
         // variables) and forward to the conductor relay stream, then ack on
@@ -623,9 +1049,9 @@ pub async fn drain_task_events(
                 };
                 match relay_tx.send(conductor_msg).await {
                     Ok(()) => {
-                        // Ack-on-forward: the durability boundary is here.
-                        if let Err(e) = msg.ack().await {
-                            eprintln!("task-event ack failed: {} (redelivery converges)", e);
+                        // Complete only after relay-channel forwarding.
+                        if let Err(e) = delivery.complete().await {
+                            eprintln!("task-event completion failed: {e} (redelivery converges)");
                         }
                         // Fork the detected self-patch into the patch
                         // pipeline, AFTER the completion forwarded (FIFO: the
@@ -637,14 +1063,9 @@ pub async fn drain_task_events(
                         // here leaves the Stall to the server's TTL backstop:
                         // loud, and the reshape is lost-but-logged.
                         if let Some(parsed) = pending_self_patch.take() {
-                            fork_self_patch(
-                                definition_repository.as_ref(),
-                                &nats,
-                                event_wfi,
-                                event_tid,
-                                parsed,
-                            )
-                            .await;
+                            projector
+                                .after_forwarded(event_wfi, event_tid, parsed)
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -656,13 +1077,31 @@ pub async fn drain_task_events(
                             "Error forwarding task event to conductor: {} (no ack; redelivers)",
                             e
                         );
-                        let _ = msg.ack_with(jetstream::AckKind::Nak(None)).await;
+                        let _ = delivery.retry(None).await;
                         break;
                     }
                 }
             }
         }
     }
+}
+
+/// Fresh all-NATS compatibility entry point used by existing focused laws.
+pub async fn drain_task_events(
+    consumer: jetstream::consumer::PullConsumer,
+    relay_tx: mpsc::Sender<ConductorRelayMessage>,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    nats: async_nats::Client,
+    token: CancellationToken,
+) {
+    let projector = Arc::new(NatsTaskEventProjector::new(definition_repository, nats));
+    drain_task_event_source(
+        Arc::new(NatsTaskEventConsumer::new(consumer)),
+        relay_tx,
+        projector,
+        token,
+    )
+    .await;
 }
 
 /// Ingress a self-patch parsed off a completion drain into the patch
@@ -800,118 +1239,225 @@ pub async fn liveness_marker_consumer(
     Ok(consumer)
 }
 
-/// Drain liveness delete markers off the bucket wildcard and forward each true
-/// **expiry** as a conductor-origin `Unhealthy` `TaskEvent` onto the relay,
-/// **acking on forward** — the durability boundary, identical to
-/// `drain_task_events`. A forward failure (relay outbound closed, conductor
-/// dies before ack) leaves the marker un-acked, so the durable consumer
-/// redelivers it on recovery: a verdict can't be lost to a relay/conductor
-/// blip, and a marker that fired while every conductor was down is still
-/// pending when one returns.
-///
-/// Classification keys on the `Nats-Marker-Reason` header: forward **only**
-/// `MaxAge` (true expiry — the executor went dark). A re-arm is a plain PUT (no
-/// marker at all) and the executor's terminal delete is a `KV-Operation: DEL`
-/// tombstone; both are skipped-and-acked as noise. Correctness does not rest on
-/// the filter — even a delete that slipped through as `Unhealthy` is a server-
-/// side no-op on the already-terminal task (idempotency).
-pub async fn drain_liveness_markers(
-    consumer: jetstream::consumer::PullConsumer,
-    relay_tx: mpsc::Sender<ConductorRelayMessage>,
+async fn pickup_server_time(pickup: &jetstream::kv::Store) -> Result<i64> {
+    let key = format!("watchdog.clock.{}", Uuid::new_v4().simple());
+    pickup
+        .put(&key, Vec::new().into())
+        .await
+        .map_err(|error| anyhow::anyhow!("write NATS server-time probe: {error}"))?;
+    let entry = pickup
+        .entry(&key)
+        .await
+        .map_err(|error| anyhow::anyhow!("read NATS server-time probe: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("NATS server-time probe disappeared"))?;
+    let _ = pickup.delete(&key).await;
+    i64::try_from(entry.created.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| anyhow::anyhow!("NATS server time does not fit milliseconds"))
+}
+
+async fn load_pickup_record(
+    pickup: &jetstream::kv::Store,
+    key: &str,
+) -> Result<Option<(TaskPickupRecord, u64)>> {
+    let Some(entry) = pickup
+        .entry(key)
+        .await
+        .map_err(|error| anyhow::anyhow!("read pickup outcome `{key}`: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let record = serde_json::from_slice(&entry.value)
+        .map_err(|error| anyhow::anyhow!("decode pickup outcome `{key}`: {error}"))?;
+    Ok(Some((record, entry.revision)))
+}
+
+async fn update_pickup_record(
+    pickup: &jetstream::kv::Store,
+    key: &str,
+    record: &TaskPickupRecord,
+    revision: u64,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| anyhow::anyhow!("encode pickup outcome `{key}`: {error}"))?;
+    pickup
+        .update(key, bytes.into(), revision)
+        .await
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("update pickup outcome `{key}`: {error}"))
+}
+
+fn unhealthy_event(record: &TaskPickupRecord) -> Result<Vec<u8>> {
+    let task = tc::TaskDispatch::decode(&record.payload[..])
+        .map_err(|error| anyhow::anyhow!("decode due TaskDispatch: {error}"))?;
+    Ok(tc::TaskEvent {
+        task_instance_id: task.task_instance_id,
+        task_id: task.task_id,
+        workflow_instance_id: task.workflow_instance_id,
+        workflow_id: task.workflow_id,
+        executor_id: None,
+        kind: Some(tc::task_event::Kind::Unhealthy(
+            tc::task_event::Unhealthy {},
+        )),
+    }
+    .encode_to_vec())
+}
+
+async fn reconcile_pickup_outcome(
+    task_events: &dyn TaskEventWriter,
+    pickup: &jetstream::kv::Store,
+    key: &str,
+    server_time_ms: i64,
+) -> Result<()> {
+    let Some((mut record, revision)) = load_pickup_record(pickup, key).await? else {
+        return Ok(());
+    };
+    if record.liveness_is_due(server_time_ms) {
+        let event = unhealthy_event(&record)?;
+        match record.elect_due_liveness(server_time_ms, &event) {
+            ElectionDecision::Won => {
+                if update_pickup_record(pickup, key, &record, revision)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            ElectionDecision::Settled(_) | ElectionDecision::Rejected => {}
+        }
+    }
+
+    for _ in 0..OUTCOME_ELECTION_RETRIES {
+        let Some((mut record, revision)) = load_pickup_record(pickup, key).await? else {
+            return Ok(());
+        };
+        let Some(elected) = record.terminal.as_mut() else {
+            return Ok(());
+        };
+        if elected.event_enqueued {
+            return Ok(());
+        }
+        let event = elected.event.clone();
+        let identity = format!("{}.terminal", record.dispatch_key);
+        task_events
+            .stage(&identity, &event)
+            .await
+            .map_err(|error| anyhow::anyhow!("stage elected terminal TaskEvent: {error}"))?;
+        record
+            .terminal
+            .as_mut()
+            .expect("elected outcome was checked above")
+            .event_enqueued = true;
+        if update_pickup_record(pickup, key, &record, revision)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "terminal TaskEvent enqueue kept losing conditional updates for `{key}`"
+    ))
+}
+
+async fn sweep_attempt_outcomes_once(
+    task_events: &dyn TaskEventWriter,
+    pickup: &jetstream::kv::Store,
+) -> Result<()> {
+    let server_time_ms = pickup_server_time(pickup).await?;
+    let mut keys = pickup
+        .keys()
+        .await
+        .map_err(|error| anyhow::anyhow!("list all-NATS pickup deadlines: {error}"))?;
+    let mut scanned = 0;
+    while scanned < OUTCOME_SWEEP_BATCH {
+        let Some(key) = keys.next().await else {
+            break;
+        };
+        let key = key.map_err(|error| anyhow::anyhow!("scan all-NATS pickup deadline: {error}"))?;
+        if !key.starts_with("dispatch.") {
+            continue;
+        }
+        scanned += 1;
+        if let Err(error) =
+            reconcile_pickup_outcome(task_events, pickup, &key, server_time_ms).await
+        {
+            eprintln!("all-NATS outcome reconciliation failed for `{key}`: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// Periodically reconcile durable pickup deadlines and enqueue elected terminal
+/// TaskEvents. Per-key TTL markers only accelerate this scan; their identity and
+/// timing never author a verdict. The TaskEvent work queue remains authoritative
+/// until `drain_task_events` acknowledges relay-channel forwarding.
+pub async fn drain_attempt_outcomes(
+    nats: async_nats::Client,
+    consumer: Option<jetstream::consumer::PullConsumer>,
     token: CancellationToken,
 ) {
-    let prefix = format!("$KV.{}.", LIVENESS_BUCKET);
-    let mut messages = match consumer
-        .stream()
-        .max_messages_per_batch(16)
-        .messages()
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to open liveness marker consumer stream: {}", e);
+    let task_events = Arc::new(NatsTaskEventWriter::new(&nats));
+    if let Err(error) = task_events.prepare().await {
+        eprintln!("prepare all-NATS TaskEvents writer: {error}");
+        return;
+    }
+    drain_attempt_outcomes_with_writer(nats, consumer, task_events, token).await;
+}
+
+pub async fn drain_attempt_outcomes_with_writer(
+    nats: async_nats::Client,
+    consumer: Option<jetstream::consumer::PullConsumer>,
+    task_events: Arc<dyn TaskEventWriter>,
+    token: CancellationToken,
+) {
+    let js = jetstream::new(nats);
+    let pickup = match js.get_key_value(TASK_PICKUP_BUCKET).await {
+        Ok(pickup) => pickup,
+        Err(error) => {
+            eprintln!("open all-NATS pickup outcome store: {error}");
             return;
         }
     };
+    let mut markers = match consumer {
+        Some(consumer) => match consumer
+            .stream()
+            .max_messages_per_batch(OUTCOME_SWEEP_BATCH)
+            .messages()
+            .await
+        {
+            Ok(markers) => Some(markers),
+            Err(error) => {
+                eprintln!("optional liveness wakeup stream unavailable: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut cadence = tokio::time::interval(Duration::from_secs(1));
     loop {
-        let msg = tokio::select! {
+        tokio::select! {
             _ = token.cancelled() => break,
-            next = messages.next() => match next {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => {
-                    eprintln!("liveness marker pull error: {}", e);
-                    continue;
+            _ = cadence.tick() => {}
+            marker = async {
+                markers
+                    .as_mut()
+                    .expect("marker branch is disabled without a stream")
+                    .next()
+                    .await
+            }, if markers.is_some() => {
+                match marker {
+                    Some(Ok(marker)) => {
+                        let _ = marker.ack().await;
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("optional liveness wakeup pull failed: {error}");
+                    }
+                    None => markers = None,
                 }
-                None => break,
-            },
-        };
-
-        // Forward only true expiry markers; skip-and-ack the noise (re-arm
-        // PUTs, terminal DEL tombstones).
-        let is_expiry = msg
-            .headers
-            .as_ref()
-            .and_then(|h| h.get(async_nats::header::NATS_MARKER_REASON))
-            .map(|v| v.to_string() == MARKER_REASON_EXPIRY)
-            .unwrap_or(false);
-        if !is_expiry {
-            let _ = msg.ack().await;
-            continue;
+            }
         }
-
-        // The identity rides the marker subject (`$KV.<bucket>.<wf>.<wi>.<ti>`)
-        // for free — no per-task state on the conductor.
-        let Some(identity) = msg
-            .subject
-            .strip_prefix(&prefix)
-            .and_then(parse_liveness_key)
-        else {
-            eprintln!(
-                "liveness marker with unparseable subject {:?}; acking",
-                msg.subject.as_str()
-            );
-            let _ = msg.ack().await;
-            continue;
-        };
-
-        // Conductor-origin `Unhealthy` — identity-only. `executor_id` is unknown
-        // (the executor is gone); `task_id` is not part of the liveness key, and
-        // the server reads the real one off the instance it fetches by
-        // `task_instance_id`, so a nil placeholder here is never read.
-        let event = tc::TaskEvent {
-            task_instance_id: identity.task_instance_id.to_string(),
-            task_id: Uuid::nil().to_string(),
-            workflow_instance_id: identity.workflow_instance_id.to_string(),
-            workflow_id: identity.workflow_id.to_string(),
-            executor_id: None,
-            kind: Some(tc::task_event::Kind::Unhealthy(
-                tc::task_event::Unhealthy {},
-            )),
-        };
-        // Author the conductor-origin `Unhealthy` on the published contract.
-        let payload = event.encode_to_vec();
-        let conductor_msg = ConductorRelayMessage {
-            entity_type: EntityType::TaskEvent as i32,
-            payload,
-            tenant_id: None,
-        };
-        match relay_tx.send(conductor_msg).await {
-            Ok(()) => {
-                // Ack-on-forward: the durability boundary.
-                if let Err(e) = msg.ack().await {
-                    eprintln!("liveness marker ack failed: {} (redelivery converges)", e);
-                }
-            }
-            Err(e) => {
-                // Relay outbound closed (cycle ending). Do NOT ack — NAK so the
-                // marker stays pending and redelivers on the next cycle.
-                eprintln!(
-                    "Error forwarding Unhealthy task event: {} (no ack; redelivers)",
-                    e
-                );
-                let _ = msg.ack_with(jetstream::AckKind::Nak(None)).await;
-                break;
-            }
+        if let Err(error) = sweep_attempt_outcomes_once(task_events.as_ref(), &pickup).await {
+            eprintln!("all-NATS outcome sweep failed: {error}");
         }
     }
 }
@@ -921,9 +1467,108 @@ pub async fn drain_liveness_markers(
 /// Self-healing wrapper around the relay stream. Retries the connect+stream
 /// loop on any error so that startup ordering against the coordinator gRPC server
 /// (and transient mid-flight drops) doesn't leave the conductor wedged.
+#[derive(Clone)]
+enum TaskEventRoles {
+    AllNats,
+    Selected {
+        consumer: Arc<dyn TaskEventConsumer>,
+        writer: Arc<dyn TaskEventWriter>,
+    },
+}
+#[derive(Clone)]
+enum TaskDispatchRole {
+    AllNats,
+    Selected(Arc<dyn TaskDispatchPublisher>),
+}
+#[derive(Clone)]
+enum TaskCancellationRoles {
+    AllNats,
+    Selected {
+        publisher: Arc<dyn TaskCancellationPublisher>,
+        acknowledgements: Arc<dyn TaskCancellationAckConsumer>,
+    },
+}
+#[derive(Clone)]
+enum CompactionStagingRole {
+    AllNats,
+    Selected(Arc<dyn CompactionStaging>),
+}
+
 pub async fn run_streaming(
     shutdown_token: CancellationToken,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+) -> Result<()> {
+    run_streaming_with_role_selection(
+        shutdown_token,
+        definition_repository,
+        signal_applied_notifier,
+        TaskEventRoles::AllNats,
+        TaskDispatchRole::AllNats,
+        TaskCancellationRoles::AllNats,
+        CompactionStagingRole::AllNats,
+    )
+    .await
+}
+
+pub async fn run_streaming_with_task_events(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    task_event_consumer: Arc<dyn TaskEventConsumer>,
+    task_event_writer: Arc<dyn TaskEventWriter>,
+    signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+) -> Result<()> {
+    run_streaming_with_role_selection(
+        shutdown_token,
+        definition_repository,
+        signal_applied_notifier,
+        TaskEventRoles::Selected {
+            consumer: task_event_consumer,
+            writer: task_event_writer,
+        },
+        TaskDispatchRole::AllNats,
+        TaskCancellationRoles::AllNats,
+        CompactionStagingRole::AllNats,
+    )
+    .await
+}
+pub async fn run_streaming_with_roles(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    task_event_consumer: Arc<dyn TaskEventConsumer>,
+    task_event_writer: Arc<dyn TaskEventWriter>,
+    task_dispatch: Arc<dyn TaskDispatchPublisher>,
+    task_cancellation: Arc<dyn TaskCancellationPublisher>,
+    cancellation_acknowledgements: Arc<dyn TaskCancellationAckConsumer>,
+    compaction_staging: Arc<dyn CompactionStaging>,
+    signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+) -> Result<()> {
+    run_streaming_with_role_selection(
+        shutdown_token,
+        definition_repository,
+        signal_applied_notifier,
+        TaskEventRoles::Selected {
+            consumer: task_event_consumer,
+            writer: task_event_writer,
+        },
+        TaskDispatchRole::Selected(task_dispatch),
+        TaskCancellationRoles::Selected {
+            publisher: task_cancellation,
+            acknowledgements: cancellation_acknowledgements,
+        },
+        CompactionStagingRole::Selected(compaction_staging),
+    )
+    .await
+}
+
+async fn run_streaming_with_role_selection(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    task_events: TaskEventRoles,
+    task_dispatch: TaskDispatchRole,
+    task_cancellation: TaskCancellationRoles,
+    compaction_staging: CompactionStagingRole,
 ) -> Result<()> {
     use std::time::{Duration, Instant};
 
@@ -939,7 +1584,17 @@ pub async fn run_streaming(
         }
 
         let started = Instant::now();
-        match try_run_streaming(shutdown_token.clone(), Arc::clone(&definition_repository)).await {
+        match try_run_streaming(
+            shutdown_token.clone(),
+            Arc::clone(&definition_repository),
+            Arc::clone(&signal_applied_notifier),
+            task_events.clone(),
+            task_dispatch.clone(),
+            task_cancellation.clone(),
+            compaction_staging.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 if shutdown_token.is_cancelled() {
                     return Ok(());
@@ -973,9 +1628,62 @@ pub async fn run_streaming(
 async fn try_run_streaming(
     shutdown_token: CancellationToken,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    task_events: TaskEventRoles,
+    task_dispatch: TaskDispatchRole,
+    task_cancellation: TaskCancellationRoles,
+    compaction_staging: CompactionStagingRole,
 ) -> Result<()> {
     // Connect to NATS
     let nats = async_nats::connect(tickr_proto::config::nats_url()).await?;
+    let (task_event_consumer, task_event_writer): (
+        Arc<dyn TaskEventConsumer>,
+        Arc<dyn TaskEventWriter>,
+    ) = match task_events {
+        TaskEventRoles::AllNats => (
+            Arc::new(NatsTaskEventConsumer::new(
+                task_event_consumer(&nats).await?,
+            )),
+            Arc::new(NatsTaskEventWriter::new(&nats)),
+        ),
+        TaskEventRoles::Selected { consumer, writer } => (consumer, writer),
+    };
+    let task_dispatch: Arc<dyn TaskDispatchPublisher> = match task_dispatch {
+        TaskDispatchRole::AllNats => Arc::new(NatsTaskDispatchPublisher::new(&nats)),
+        TaskDispatchRole::Selected(publisher) => publisher,
+    };
+    let (task_cancellation, cancellation_acknowledgements): (
+        Arc<dyn TaskCancellationPublisher>,
+        Arc<dyn TaskCancellationAckConsumer>,
+    ) = match task_cancellation {
+        TaskCancellationRoles::AllNats => (
+            Arc::new(NatsTaskCancellationPublisher::new(&nats)),
+            Arc::new(NatsTaskCancellationAckConsumer::new(
+                cancel_ack_consumer(&nats).await?,
+            )),
+        ),
+        TaskCancellationRoles::Selected {
+            publisher,
+            acknowledgements,
+        } => (publisher, acknowledgements),
+    };
+    let compaction_staging: Arc<dyn CompactionStaging> = match compaction_staging {
+        CompactionStagingRole::AllNats => Arc::new(AllNatsCompactionStaging::new(nats.clone())),
+        CompactionStagingRole::Selected(staging) => staging,
+    };
+    compaction_staging
+        .prepare()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    task_dispatch.prepare().await.map_err(anyhow::Error::msg)?;
+    task_cancellation
+        .prepare()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    task_event_writer
+        .prepare()
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     // Connect to the configured coordinator's public relay endpoint.
     let channel = Channel::from_shared(tickr_proto::config::coordinator_relay_url())?
@@ -993,26 +1701,11 @@ async fn try_run_streaming(
         *tx_guard = Some(tx.clone());
     }
 
-    // Durable task-dispatch work queue. The conductor publishes dispatched
-    // tasks into it (awaiting the publish ack before emitting `Delivered`); the
-    // executor drains it pull-to-capacity. Ensure it exists before the first
-    // dispatch — a publish to a subject with no stream would otherwise fail.
-    ensure_task_dispatch_stream(&nats).await?;
-
-    // Durable conductor→executor cancel-request work queue. The conductor
-    // publishes cancel-requests into it (on inbound `CANCEL_TASK` envelopes);
-    // the executor drains it. Ensure it exists before the first publish.
-    ensure_task_cancel_stream(&nats).await?;
-
-    // Durable task-event update leg. The executor publishes typed `TaskEvent`s
-    // into this JetStream work queue; the conductor drains via a shared durable
-    // pull consumer and acks on forward (see `task_event_consumer` /
-    // `drain_task_events`).
-    let consumer = task_event_consumer(&nats).await?;
-
     let tx_for_nats = tx_for_updates.clone();
-    let definitions_for_forwarder = Arc::clone(&definition_repository);
-    let nats_for_forwarder = nats.clone();
+    let projector = Arc::new(NatsTaskEventProjector::new(
+        Arc::clone(&definition_repository),
+        nats.clone(),
+    ));
 
     // Per-cycle token: cancelled when this attempt ends so the forwarder task
     // doesn't outlive its mpsc receiver across reconnects.
@@ -1020,36 +1713,38 @@ async fn try_run_streaming(
     let forwarder_token = cycle_token.clone();
     let _drop_guard = cycle_token.clone().drop_guard();
 
-    let _forwarder_handle = tokio::spawn(drain_task_events(
-        consumer,
+    let _forwarder_handle = tokio::spawn(drain_task_event_source(
+        task_event_consumer,
         tx_for_nats,
-        definitions_for_forwarder,
-        nats_for_forwarder,
+        projector,
         forwarder_token,
     ));
 
-    // Liveness marker-consumer: a third `TaskEvent` producer alongside the
-    // executor's updates and the `Delivered` producer. The shared durable
-    // consumer drains the bucket-wildcard delete markers and forwards each
-    // expiry as an `Unhealthy` verdict, ack-on-forward — bound once here, on the
-    // same per-cycle relay channel as `drain_task_events`.
-    let liveness_consumer = liveness_marker_consumer(&nats).await?;
-    let liveness_tx = tx_for_updates.clone();
-    let liveness_token = cycle_token.clone();
-    let _liveness_handle = tokio::spawn(drain_liveness_markers(
+    // Durable pickup deadlines are authoritative. Per-key TTL markers are only
+    // optional wakeups for the bounded competing sweep; marker loss or consumer
+    // setup failure cannot erase or author a verdict.
+    let liveness_consumer = match liveness_marker_consumer(&nats).await {
+        Ok(consumer) => Some(consumer),
+        Err(error) => {
+            eprintln!("optional liveness wakeup consumer unavailable: {error}");
+            None
+        }
+    };
+    let outcome_nats = nats.clone();
+    let outcome_token = cycle_token.clone();
+    let _outcome_handle = tokio::spawn(drain_attempt_outcomes_with_writer(
+        outcome_nats,
         liveness_consumer,
-        liveness_tx,
-        liveness_token,
+        task_event_writer,
+        outcome_token,
     ));
 
-    // Cancel-ack drain: forwards each executor `CancelTaskAck` onto the relay
-    // as a `CANCEL_TASK_ACK` envelope (ack-on-forward), the mirror of
-    // `drain_task_events`. Bound once here on the same per-cycle relay channel.
-    let cancel_ack_consumer = cancel_ack_consumer(&nats).await?;
+    // The selected acknowledgement source remains pending until the exact
+    // retained bytes cross the Conductor relay forwarding boundary.
     let cancel_ack_tx = tx_for_updates.clone();
     let cancel_ack_token = cycle_token.clone();
-    let _cancel_ack_handle = tokio::spawn(drain_cancel_acks(
-        cancel_ack_consumer,
+    let _cancel_ack_handle = tokio::spawn(drain_cancellation_ack_source(
+        cancellation_acknowledgements,
         cancel_ack_tx,
         cancel_ack_token,
     ));
@@ -1079,6 +1774,9 @@ async fn try_run_streaming(
     let response = client.stream_conductor_relay(outbound).await?;
     let mut inbound = response.into_inner();
     let nats_clone = nats.clone();
+    let task_dispatch_clone = task_dispatch.clone();
+    let compaction_staging_clone = compaction_staging.clone();
+    let task_cancellation_clone = task_cancellation.clone();
 
     tokio::select! {
         res = async {
@@ -1156,7 +1854,7 @@ async fn try_run_streaming(
                                     //    the task waits in the substrate for an
                                     //    executor to pull, surviving a relay blip.
                                     if let Err(e) = publish_dispatch_and_deliver(
-                                        &nats_clone,
+                                        task_dispatch_clone.as_ref(),
                                         &tx_for_updates,
                                         msg.payload.to_vec(),
                                         Uuid::parse_str(&task_queue_item.task_instance_id)?,
@@ -1172,17 +1870,17 @@ async fn try_run_streaming(
                                 }
                             },
                             Ok(EntityType::CancelTask) => {
-                                // Server→conductor cancel-request: republish it
-                                // onto the durable task-cancel work queue the
-                                // executor drains (the dispatch-leg mirror).
-                                // Best-effort — the task's state is already
-                                // grounded; a publish failure only leaves the
-                                // kill unconfirmed, never stalls the cancel.
-                                if let Err(e) = publish_task_cancel(
-                                    &nats_clone,
-                                    msg.payload.to_vec(),
-                                ).await {
-                                    eprintln!("Failed to publish cancel-request into work queue: {}", e);
+                                // The selected TaskCancellation adapter fsync-proves
+                                // the exact request/generation/owner fence before
+                                // owner notification. Failure leaves the request
+                                // recoverable and crosses no source acknowledgement.
+                                if let Err(error) = task_cancellation_clone
+                                    .stage(&msg.payload)
+                                    .await
+                                {
+                                    eprintln!(
+                                        "Failed to stage cancellation through selected role: {error}"
+                                    );
                                 }
                             },
                             Ok(EntityType::Compaction) => {
@@ -1194,53 +1892,25 @@ async fn try_run_streaming(
                                 // SQL repository latency. The Compaction drain worker performs
                                 // the archival from the staged queue.
                                 let ack_tx = tx_for_updates.clone();
-                                let nats_for_stage = nats_clone.clone();
+                                let staging = compaction_staging_clone.clone();
                                 tokio::spawn(async move {
-                                    // Decode the proto envelope only for the ack correlation +
-                                    // the instance id; the raw bytes are staged verbatim so the
-                                    // drain decodes the same encoding the server shipped.
-                                    match decode_envelope(&msg.payload) {
-                                        Ok(envelope) => {
-                                            let projection = envelope
-                                                .projection
-                                                .as_ref()
-                                                .expect("decode_envelope guarantees a projection");
-                                            let wfi_id = projection.id.clone();
-                                            let state = projection.state.clone();
-                                            match stage_compaction_payload(
-                                                &nats_for_stage,
-                                                msg.payload.to_vec(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(()) => {
-                                                    let ack_msg =
-                                                        build_ack(&wfi_id, &envelope.correlation);
-                                                    if let Err(e) = ack_tx.send(ack_msg).await {
-                                                        eprintln!(
-                                                            "Failed to send COMPACTION_ACK for {}: {}",
-                                                            wfi_id, e
-                                                        );
-                                                    } else {
-                                                        println!(
-                                                            "Staged compaction job for workflow {} (state={})",
-                                                            wfi_id, state
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    // No ACK means durable staging was not confirmed.
-                                                    eprintln!(
-                                                        "compaction staging failed for {}: {} (no ACK; server will re-ship)",
-                                                        wfi_id, e
-                                                    );
-                                                }
-                                            }
+                                    match stage_compaction_through_role_and_send_ack(
+                                        staging.as_ref(),
+                                        msg.payload.to_vec(),
+                                        &ack_tx,
+                                    )
+                                    .await
+                                    {
+                                        Ok((wfi_id, state)) => {
+                                            println!(
+                                                "Staged compaction job for workflow {} (state={})",
+                                                wfi_id, state
+                                            );
                                         }
-                                        Err(e) => {
+                                        Err(error) => {
+                                            // No ACK means durable staging was not confirmed.
                                             eprintln!(
-                                                "Failed to decode compaction envelope: {}",
-                                                e
+                                                "compaction staging failed: {error:#} (no ACK; server will re-ship)"
                                             );
                                         }
                                     }
@@ -1309,40 +1979,35 @@ async fn try_run_streaming(
                                 }
                             },
                             Ok(EntityType::SignalApplied) => {
-                                // Server-emitted relay-back stamping the
-                                // materialized impact count of a signal
-                                // (today: ByTag-cancel fan-out). Relay
-                                // routing is uniform `Any`, so the conductor
-                                // that receives this relay-back need not be
-                                // the one holding the open HTTP wait —
-                                // re-publish it onto tenant NATS keyed by
-                                // signal_id so whichever conductor is waiting
-                                // picks it up. Correlation lives off the
-                                // relay stream, so it survives a reconnect.
-                                match sp::SignalApplied::decode(&msg.payload[..])
-                                    .map_err(anyhow::Error::from)
-                                    .and_then(|a| Ok(uuid::Uuid::parse_str(&a.signal_id)?))
-                                {
-                                    Ok(signal_id) => {
-                                        let subject =
-                                            crate::cancel_pipeline::signal_applied_subject(signal_id);
-                                        if let Err(e) = nats_clone
-                                            .publish(subject, msg.payload.clone().into())
+                                // Persist materialization before emitting the
+                                // optional latency hint. A hint failure cannot
+                                // erase or acknowledge durable Signal state.
+                                match sp::SignalApplied::decode(&msg.payload[..]) {
+                                    Ok(applied) => match Uuid::parse_str(&applied.signal_id) {
+                                        Ok(signal_id) => {
+                                            crate::signal_cancels::materialize(
+                                                definition_repository.as_ref(),
+                                                signal_id,
+                                                applied.matched_count,
+                                            )
                                             .await
-                                        {
+                                            .with_context(|| {
+                                                format!(
+                                                    "persist SignalApplied materialization for {signal_id}"
+                                                )
+                                            })?;
+
+                                            signal_applied_notifier
+                                                .notify_bytag_cancel_materialized(signal_id);
+                                        }
+                                        Err(error) => {
                                             eprintln!(
-                                                "Failed to publish SignalApplied for signal_id={} onto tenant NATS: {}",
-                                                signal_id, e
-                                            );
-                                        } else if let Err(e) = nats_clone.flush().await {
-                                            eprintln!(
-                                                "Failed to flush SignalApplied for signal_id={} onto tenant NATS: {}",
-                                                signal_id, e
+                                                "SignalApplied carries invalid signal_id: {error}"
                                             );
                                         }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to deserialize SignalApplied: {}", e);
+                                    },
+                                    Err(error) => {
+                                        eprintln!("Failed to deserialize SignalApplied: {error}");
                                     }
                                 }
                             },
@@ -1459,7 +2124,7 @@ pub trait LiteRelayRoles: Send + Sync {
     /// Durably stage one Compaction and return its published acknowledgement.
     async fn stage_compaction(&self, payload: &[u8]) -> Result<ConductorRelayMessage>;
 
-    /// Wake an in-process waiter for one materialized ByTag cancellation.
+    /// Emit an advisory wake after durable ByTag materialization is recorded.
     fn signal_applied(&self, signal_id: Uuid);
 }
 
@@ -1619,7 +2284,17 @@ async fn try_run_streaming_lite(
                     }
                     Ok(EntityType::SignalApplied) => {
                         let applied = sp::SignalApplied::decode(&message.payload[..])?;
-                        roles.signal_applied(Uuid::parse_str(&applied.signal_id)?);
+                        let signal_id = Uuid::parse_str(&applied.signal_id)?;
+                        crate::signal_cancels::materialize(
+                            definition_repository.as_ref(),
+                            signal_id,
+                            applied.matched_count,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("persist SignalApplied materialization for {signal_id}")
+                        })?;
+                        roles.signal_applied(signal_id);
                     }
                     Ok(EntityType::PatchOutcome) => {
                         let outcome = pp::PatchOutcome::decode(&message.payload[..])?;

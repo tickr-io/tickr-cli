@@ -18,13 +18,13 @@ use uuid::Uuid;
 /// The dedicated KV bucket holding one *liveness key* per running task
 /// instance. Shared name so the executor's producer and the conductor's
 /// marker-consumer address the same bucket.
-pub const LIVENESS_BUCKET: &str = "tickr_task_liveness";
+pub const LIVENESS_BUCKET: &str = super::all_nats::LIVENESS_BUCKET;
 
 /// Durable pull-consumer name the conductor binds on the bucket's backing
 /// stream. Shared across conductor instances — NATS load-balances delivery
 /// across whoever binds the same durable name, so the consumer holds no
 /// per-task state (the `task_event_consumer` pattern).
-pub const LIVENESS_MARKER_CONSUMER: &str = "tickr-conductor-liveness-markers";
+pub const LIVENESS_MARKER_CONSUMER: &str = super::all_nats::LIVENESS_MARKER_CONSUMER;
 
 /// `SubjectDeleteMarkerTTL` for the bucket — the **verdict-durability window**.
 /// A delete marker that fires while *every* conductor is down is still pending

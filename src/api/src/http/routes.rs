@@ -17,11 +17,15 @@ use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tickr_executor::log_stream::LogStreamProvider;
 use tickr_proto::tickr_api as api;
 use tokio::sync::watch;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
+
+pub type FormationReadiness = Arc<dyn Fn() -> bool + Send + Sync>;
+pub type FormationDiagnostics = Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
 
 /// Header name signaling whether the live half of a merged-list response was
 /// successfully fetched. Picked instead of a body envelope so existing UI
@@ -75,8 +79,10 @@ pub struct AppState {
     deadlines: CommandDeadlines,
     // Tickr Lite publishes this only after complete formation admission.
     lite_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    distributed_ready: Option<FormationReadiness>,
+    distributed_diagnostics: Option<FormationDiagnostics>,
     console_root: Option<Arc<std::path::PathBuf>>,
-    executor_fleet: Option<tickr_executor::local_pickup::LocalExecutorFleetStatus>,
+    executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
     // Immutable, location-free projection of the admitted formation descriptor.
     lite_formation: Option<super::health::ResolvedFormationHealth>,
 }
@@ -124,15 +130,36 @@ async fn lite_admission_guard(
     next.run(request).await
 }
 
+async fn formation_admission_guard(
+    State(ready): State<FormationReadiness>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !lite_admits_request(request.uri().path(), ready()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "the selected formation is not ready"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// Readiness probe — `GET /health`. A real readiness signal for operators,
 /// distinct from the marginal hello. Returns `{"status": "ok"}` once the
 /// server is accepting connections.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/health", responses((status = 200, body = ReadinessResponse)))]
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let ready = state
-        .lite_ready
+        .distributed_ready
         .as_ref()
-        .map(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+        .map(|ready| ready())
+        .or_else(|| {
+            state
+                .lite_ready
+                .as_ref()
+                .map(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+        })
         .unwrap_or(true);
     let status = readiness_status(ready);
     (
@@ -151,34 +178,33 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 async fn api_health_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<super::health::HealthResponse> {
-    let report = if let Some(nats) = state.nats.as_deref() {
-        super::health::build_health_report_with_command_bus(
-            &state.repositories,
-            nats,
-            &state.command_bus,
-            &state.coordinator,
-            state.deadlines.ping,
-        )
-        .await
-    } else {
+    let report = if let Some(formation) = state.lite_formation.as_ref() {
         super::health::build_lite_health_report(
             &state.repositories,
             &state.command_bus,
             &state.coordinator,
-            state
-                .executor_fleet
-                .as_ref()
-                .expect("Tickr Lite AppState carries Executor fleet status"),
-            state
-                .lite_formation
-                .as_ref()
-                .expect("Tickr Lite AppState carries resolved formation health"),
+            state.executor_fleet.as_ref(),
+            formation,
             state
                 .lite_ready
                 .as_ref()
                 .expect("Tickr Lite AppState carries readiness")
                 .load(std::sync::atomic::Ordering::Acquire),
             state.deadlines.ping,
+        )
+        .await
+    } else {
+        super::health::build_health_report_with_fleet_status(
+            &state.repositories,
+            state.nats.as_deref(),
+            &state.command_bus,
+            &state.coordinator,
+            state.executor_fleet.as_ref(),
+            state.deadlines.ping,
+            state
+                .distributed_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics()),
         )
         .await
     };
@@ -3023,16 +3049,65 @@ pub fn build_app_state_with_command_bus(
     coordinator: Arc<super::coordinator_client::CoordinatorClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
 ) -> Arc<AppState> {
+    let fleet_status = Arc::new(
+        tickr_executor::component_liveness::NatsExecutorFleetStatus::new(
+            nats.as_ref().clone(),
+            tickr_executor::task_liveness::LivenessConfig::from_env().timeout,
+        ),
+    );
+    build_app_state_with_fleet_status(
+        Some(nats),
+        command_bus,
+        repositories,
+        coordinator,
+        logs,
+        fleet_status,
+    )
+}
+
+/// Construct distributed state from formation-selected observational roles.
+pub fn build_app_state_with_fleet_status(
+    nats: Option<Arc<Client>>,
+    command_bus: CommandBus,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    logs: Arc<super::logs_resolver::LogsResolver>,
+    executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
+) -> Arc<AppState> {
+    build_app_state_with_runtime_readiness(
+        nats,
+        command_bus,
+        repositories,
+        coordinator,
+        logs,
+        executor_fleet,
+        None,
+        None,
+    )
+}
+
+pub fn build_app_state_with_runtime_readiness(
+    nats: Option<Arc<Client>>,
+    command_bus: CommandBus,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    logs: Arc<super::logs_resolver::LogsResolver>,
+    executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
+    distributed_ready: Option<FormationReadiness>,
+    distributed_diagnostics: Option<FormationDiagnostics>,
+) -> Arc<AppState> {
     Arc::new(AppState {
-        nats: Some(nats),
+        nats,
         command_bus,
         repositories,
         coordinator,
         logs,
         deadlines: CommandDeadlines::default(),
         lite_ready: None,
+        distributed_ready,
+        distributed_diagnostics,
         console_root: None,
-        executor_fleet: None,
+        executor_fleet,
         lite_formation: None,
     })
 }
@@ -3056,8 +3131,10 @@ pub fn build_lite_app_state(
         logs,
         deadlines: CommandDeadlines::default(),
         lite_ready: Some(ready),
+        distributed_ready: None,
+        distributed_diagnostics: None,
         console_root: Some(Arc::new(console_root)),
-        executor_fleet: Some(executor_fleet),
+        executor_fleet: Arc::new(executor_fleet),
         lite_formation: Some(formation),
     })
 }
@@ -3098,33 +3175,92 @@ pub fn build_lite_router(state: Arc<AppState>) -> Router {
         .layer(from_fn_with_state(ready, lite_admission_guard))
 }
 
-/// Start the API HTTP server with the configured routes.
+/// All-NATS compatibility composer.
 #[cfg(not(madsim))]
 pub async fn start_http_server(
     shutdown_rx: watch::Receiver<bool>,
     nats: Client,
+    log_streams: Arc<dyn LogStreamProvider>,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    command_bus: CommandBus,
 ) -> Result<()> {
-    // Live-state subquery client. Constructed once at startup and shared across
-    // handlers via the `AppState` so the connection pool and the 1.5s timeout
-    // policy are uniform.
+    let fleet_status = Arc::new(
+        tickr_executor::component_liveness::NatsExecutorFleetStatus::new(
+            nats.clone(),
+            tickr_executor::task_liveness::LivenessConfig::from_env().timeout,
+        ),
+    );
+    start_http_server_with_fleet_status(
+        shutdown_rx,
+        Some(nats),
+        log_streams,
+        repositories,
+        command_bus,
+        fleet_status,
+    )
+    .await
+}
+
+/// Start the API HTTP server with formation-selected fleet observation.
+#[cfg(not(madsim))]
+pub async fn start_http_server_with_fleet_status(
+    shutdown_rx: watch::Receiver<bool>,
+    nats: Option<Client>,
+    log_streams: Arc<dyn LogStreamProvider>,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    command_bus: CommandBus,
+    executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
+) -> Result<()> {
+    start_http_server_with_runtime_readiness(
+        shutdown_rx,
+        nats,
+        log_streams,
+        repositories,
+        command_bus,
+        executor_fleet,
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(not(madsim))]
+pub async fn start_http_server_with_runtime_readiness(
+    shutdown_rx: watch::Receiver<bool>,
+    nats: Option<Client>,
+    log_streams: Arc<dyn LogStreamProvider>,
+    repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    command_bus: CommandBus,
+    executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
+    readiness: Option<FormationReadiness>,
+    diagnostics: Option<FormationDiagnostics>,
+) -> Result<()> {
     let coordinator = Arc::new(super::coordinator_client::CoordinatorClient::new(
         tickr_proto::config::coordinator_http_url(),
     ));
-
     let storage = crate::config::LogStorageConfig::from_env()?;
     let minio = storage.operator()?;
-
-    let logs = Arc::new(super::logs_resolver::LogsResolver::new(minio, nats.clone()));
-
-    let state = build_app_state(Arc::new(nats), repositories, coordinator, logs);
-    let app = build_router(state);
+    let logs = Arc::new(super::logs_resolver::LogsResolver::new(minio, log_streams));
+    let state = build_app_state_with_runtime_readiness(
+        nats.map(Arc::new),
+        command_bus,
+        repositories,
+        coordinator,
+        logs,
+        executor_fleet,
+        readiness.clone(),
+        diagnostics,
+    );
+    let app = match readiness {
+        Some(readiness) => {
+            build_router(state).layer(from_fn_with_state(readiness, formation_admission_guard))
+        }
+        None => build_router(state),
+    };
 
     let addr = crate::config::api_bind_addr()?;
     println!("Starting tickr API HTTP server on {}", addr);
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
-
     let mut shutdown_rx_clone = shutdown_rx.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -3132,7 +3268,6 @@ pub async fn start_http_server(
             println!("API HTTP server received shutdown signal");
         })
         .await?;
-
     println!("API HTTP server stopped gracefully");
     Ok(())
 }
@@ -3143,7 +3278,21 @@ pub async fn start_http_server(
 pub async fn start_http_server(
     _shutdown_rx: watch::Receiver<bool>,
     _nats: Client,
+    _log_streams: Arc<dyn LogStreamProvider>,
     _repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    _command_bus: CommandBus,
+) -> Result<()> {
+    anyhow::bail!("the API HTTP server is unavailable under madsim")
+}
+
+#[cfg(madsim)]
+pub async fn start_http_server_with_fleet_status(
+    _shutdown_rx: watch::Receiver<bool>,
+    _nats: Option<Client>,
+    _log_streams: Arc<dyn LogStreamProvider>,
+    _repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
+    _command_bus: CommandBus,
+    _executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
 ) -> Result<()> {
     anyhow::bail!("the API HTTP server is unavailable under madsim")
 }

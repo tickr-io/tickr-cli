@@ -85,6 +85,7 @@ async fn heartbeat_arms_at_start_is_marker_silent_and_deletes_on_stop() {
         workflow_id,
         workflow_instance_id,
         task_instance_id,
+        pickup_generation: 1,
     };
     let key = liveness_key(workflow_id, workflow_instance_id, task_instance_id);
 

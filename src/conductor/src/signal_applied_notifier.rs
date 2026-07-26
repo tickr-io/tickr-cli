@@ -5,9 +5,12 @@
 //! notification loss, duplication, delay, or closure cannot mutate either.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use async_trait::async_trait;
+use futures::StreamExt as _;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -15,8 +18,158 @@ use uuid::Uuid;
 ///
 /// Returning `()` is deliberate: notification delivery cannot participate in
 /// relay acknowledgement, audit mutation, or materialization settlement.
-pub trait SignalAppliedNotifier: Clone + Send + Sync + 'static {
+pub trait SignalAppliedNotifier: Send + Sync + 'static {
     fn notify_bytag_cancel_materialized(&self, signal_id: Uuid);
+}
+
+/// Backend-neutral wake source for bounded durable Signal-state reconciliation.
+#[async_trait]
+pub trait SignalAppliedReconciliationStream: Send {
+    async fn next_reconciliation(
+        &mut self,
+        maximum_delay: Duration,
+    ) -> SignalAppliedReconciliationWake;
+}
+
+#[async_trait]
+impl<T> SignalAppliedReconciliationStream for Box<T>
+where
+    T: SignalAppliedReconciliationStream + ?Sized,
+{
+    async fn next_reconciliation(
+        &mut self,
+        maximum_delay: Duration,
+    ) -> SignalAppliedReconciliationWake {
+        (**self).next_reconciliation(maximum_delay).await
+    }
+}
+
+pub type SharedSignalAppliedReconciliationStream =
+    Arc<Mutex<Box<dyn SignalAppliedReconciliationStream>>>;
+
+/// Formation-selected publication and observation surfaces with substrate
+/// details erased before either production caller receives them.
+#[derive(Clone)]
+pub struct SignalAppliedNotificationRoles {
+    notifier: Arc<dyn SignalAppliedNotifier>,
+    reconciliation: SharedSignalAppliedReconciliationStream,
+}
+
+impl SignalAppliedNotificationRoles {
+    pub fn new<N, S>(notifier: N, reconciliation: S) -> Self
+    where
+        N: SignalAppliedNotifier,
+        S: SignalAppliedReconciliationStream + 'static,
+    {
+        Self {
+            notifier: Arc::new(notifier),
+            reconciliation: Arc::new(Mutex::new(Box::new(reconciliation))),
+        }
+    }
+
+    pub fn notifier(&self) -> Arc<dyn SignalAppliedNotifier> {
+        Arc::clone(&self.notifier)
+    }
+
+    pub fn reconciliation(&self) -> SharedSignalAppliedReconciliationStream {
+        Arc::clone(&self.reconciliation)
+    }
+}
+
+const ALL_NATS_SIGNAL_APPLIED_SUBJECT_PREFIX: &str =
+    tickr_proto::coord::all_nats::SIGNAL_APPLIED_SUBJECT_PREFIX;
+
+fn all_nats_signal_applied_subject(signal_id: Uuid) -> String {
+    format!("{ALL_NATS_SIGNAL_APPLIED_SUBJECT_PREFIX}.{signal_id}")
+}
+
+/// Fresh all-NATS transient notifier. The bounded local queue deliberately
+/// drops pressure rather than turning an advisory wake into acknowledgement.
+#[derive(Clone)]
+pub struct NatsSignalAppliedNotifier {
+    sender: mpsc::Sender<Uuid>,
+}
+
+impl SignalAppliedNotifier for NatsSignalAppliedNotifier {
+    fn notify_bytag_cancel_materialized(&self, signal_id: Uuid) {
+        let _ = self.sender.try_send(signal_id);
+    }
+}
+
+pub struct NatsSignalAppliedNotificationStream {
+    subscriber: async_nats::Subscriber,
+    closed: bool,
+}
+
+/// Open the fresh all-NATS advisory resource behind the same role interfaces
+/// used by Redis and Tickr Lite.
+pub async fn all_nats_signal_applied_notifications(
+    nats: async_nats::Client,
+) -> anyhow::Result<SignalAppliedNotificationRoles> {
+    let subscriber = nats
+        .subscribe(format!("{ALL_NATS_SIGNAL_APPLIED_SUBJECT_PREFIX}.*"))
+        .await?;
+    nats.flush().await?;
+    let (sender, mut receiver) = mpsc::channel::<Uuid>(64);
+    tokio::spawn(async move {
+        while let Some(signal_id) = receiver.recv().await {
+            if nats
+                .publish(
+                    all_nats_signal_applied_subject(signal_id),
+                    Vec::<u8>::new().into(),
+                )
+                .await
+                .is_ok()
+            {
+                let _ = nats.flush().await;
+            }
+        }
+    });
+    Ok(SignalAppliedNotificationRoles::new(
+        NatsSignalAppliedNotifier { sender },
+        NatsSignalAppliedNotificationStream {
+            subscriber,
+            closed: false,
+        },
+    ))
+}
+
+#[async_trait]
+impl SignalAppliedReconciliationStream for NatsSignalAppliedNotificationStream {
+    async fn next_reconciliation(
+        &mut self,
+        maximum_delay: Duration,
+    ) -> SignalAppliedReconciliationWake {
+        let deadline = tokio::time::Instant::now() + maximum_delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return SignalAppliedReconciliationWake::Deadline;
+            }
+            if self.closed {
+                sleep(remaining).await;
+                return SignalAppliedReconciliationWake::Deadline;
+            }
+            match timeout(remaining, self.subscriber.next()).await {
+                Err(_) => return SignalAppliedReconciliationWake::Deadline,
+                Ok(None) => self.closed = true,
+                Ok(Some(message)) => {
+                    let Some(signal_id) = message
+                        .subject
+                        .as_str()
+                        .strip_prefix(ALL_NATS_SIGNAL_APPLIED_SUBJECT_PREFIX)
+                        .and_then(|suffix| suffix.strip_prefix('.'))
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                    else {
+                        continue;
+                    };
+                    return SignalAppliedReconciliationWake::Notification(
+                        ByTagCancelMaterialization { signal_id },
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Best-effort local implementation backed by one bounded channel.
@@ -62,6 +215,16 @@ impl SignalAppliedNotifier for LocalSignalAppliedNotifier {
         let _ = self
             .sender
             .try_send(ByTagCancelMaterialization { signal_id });
+    }
+}
+
+#[async_trait]
+impl SignalAppliedReconciliationStream for SignalAppliedNotificationStream {
+    async fn next_reconciliation(
+        &mut self,
+        maximum_delay: Duration,
+    ) -> SignalAppliedReconciliationWake {
+        SignalAppliedNotificationStream::next_reconciliation(self, maximum_delay).await
     }
 }
 

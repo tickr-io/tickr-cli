@@ -25,6 +25,7 @@ use async_nats::{jetstream, Client as NatsClient};
 use serde_json::Value;
 use tickr_ctx::envelope::SignalSource;
 use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::scope_repository::ScopeStore;
 use tickr_proto::signal as sp;
 use uuid::Uuid;
 
@@ -34,6 +35,7 @@ use crate::captures_extractor::{
 use crate::gate_index::{Entry as GateEntry, GateIndex};
 use crate::idempotency;
 use crate::predicate;
+use crate::scope_working_set::write_event_captures;
 use crate::signal_captures;
 use crate::subscription_index::Entry;
 use crate::waits_on_signal_lifecycle::signal_subscription_index;
@@ -118,7 +120,16 @@ pub async fn process_wakeup(
     gate_index: &GateIndex,
     req: WakeupRequest,
 ) -> Result<WakeupOutcome> {
-    process_wakeup_with_working_set(repositories, Some(nats), sender, gate_index, req).await
+    process_wakeup_with_working_set(
+        repositories,
+        Some(nats),
+        None,
+        sender,
+        gate_index,
+        req,
+        None,
+    )
+    .await
 }
 
 /// Tickr Lite wakeups preserve relay and SQL effects while the profile-disabled
@@ -129,15 +140,59 @@ pub async fn process_wakeup_local(
     gate_index: &GateIndex,
     req: WakeupRequest,
 ) -> Result<WakeupOutcome> {
-    process_wakeup_with_working_set(repositories, None, sender, gate_index, req).await
+    process_wakeup_with_working_set(repositories, None, None, sender, gate_index, req, None).await
+}
+
+/// Run an External Event wakeup under its durable producer reservation.
+/// The supplied sender persists each relay intent before reporting success.
+pub async fn process_reserved_wakeup(
+    repositories: &WriterRepositoryBundle,
+    nats: &NatsClient,
+    sender: &dyn WakeupRelaySender,
+    gate_index: &GateIndex,
+    req: WakeupRequest,
+    signal_id: Uuid,
+) -> Result<WakeupOutcome> {
+    process_wakeup_with_working_set(
+        repositories,
+        Some(nats),
+        None,
+        sender,
+        gate_index,
+        req,
+        Some(signal_id),
+    )
+    .await
+}
+/// Run a reserved External Event wakeup through the selected ScopeStore role.
+pub async fn process_reserved_wakeup_with_scope_store(
+    repositories: &WriterRepositoryBundle,
+    scope_store: &dyn ScopeStore,
+    sender: &dyn WakeupRelaySender,
+    gate_index: &GateIndex,
+    req: WakeupRequest,
+    signal_id: Uuid,
+) -> Result<WakeupOutcome> {
+    process_wakeup_with_working_set(
+        repositories,
+        None,
+        Some(scope_store),
+        sender,
+        gate_index,
+        req,
+        Some(signal_id),
+    )
+    .await
 }
 
 async fn process_wakeup_with_working_set(
     repositories: &WriterRepositoryBundle,
     nats: Option<&NatsClient>,
+    scope_store: Option<&dyn ScopeStore>,
     sender: &dyn WakeupRelaySender,
     gate_index: &GateIndex,
     req: WakeupRequest,
+    reserved_signal_id: Option<Uuid>,
 ) -> Result<WakeupOutcome> {
     let payload_value = req.payload.unwrap_or(Value::Object(Default::default()));
     let hash_payload = serde_json::json!({
@@ -146,32 +201,34 @@ async fn process_wakeup_with_working_set(
     });
     let input_hash = crate::canonical_json::hash(Some(&hash_payload));
 
-    let signal_id = Uuid::new_v4();
+    let reserved = reserved_signal_id.is_some();
+    let signal_id = reserved_signal_id.unwrap_or_else(Uuid::new_v4);
 
-    // 1. Idempotency cache. Only consulted when a producer-supplied key
-    //    is present. The check_or_insert is atomic against concurrent
-    //    retries on the same key.
-    if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
-        let bucket = idempotency::open_bucket(nats)
-            .await
-            .context("idempotency bucket")?;
-        let outcome = idempotency::check_or_insert(&bucket, key, signal_id, &input_hash)
-            .await
-            .context("idempotency check")?;
-        match outcome {
-            idempotency::CacheOutcome::Fresh => {}
-            idempotency::CacheOutcome::DeduplicatedSameHash { original_signal_id } => {
-                return Ok(WakeupOutcome::Deduplicated { original_signal_id });
-            }
-            idempotency::CacheOutcome::ConflictDifferentHash {
-                original_signal_id,
-                original_hash,
-            } => {
-                return Ok(WakeupOutcome::Conflict {
+    // Producer idempotency is already decided by the outer reservation on
+    // External Event ingress; HTTP/local callers retain the shared cache.
+    if !reserved {
+        if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
+            let bucket = idempotency::open_bucket(nats)
+                .await
+                .context("idempotency bucket")?;
+            let outcome = idempotency::check_or_insert(&bucket, key, signal_id, &input_hash)
+                .await
+                .context("idempotency check")?;
+            match outcome {
+                idempotency::CacheOutcome::Fresh => {}
+                idempotency::CacheOutcome::DeduplicatedSameHash { original_signal_id } => {
+                    return Ok(WakeupOutcome::Deduplicated { original_signal_id });
+                }
+                idempotency::CacheOutcome::ConflictDifferentHash {
                     original_signal_id,
                     original_hash,
-                    your_hash: hex::encode(input_hash),
-                });
+                } => {
+                    return Ok(WakeupOutcome::Conflict {
+                        original_signal_id,
+                        original_hash,
+                        your_hash: hex::encode(input_hash),
+                    });
+                }
             }
         }
     }
@@ -210,10 +267,11 @@ async fn process_wakeup_with_working_set(
         if !predicate_matches(&entry, &payload_value) {
             continue;
         }
-        if let Some(nats) = nats {
+        if nats.is_some() || scope_store.is_some() {
             if let Err(e) = persist_subscriber_captures(
                 repositories,
                 nats,
+                scope_store,
                 signal_id,
                 &req.name,
                 &entry,
@@ -221,10 +279,17 @@ async fn process_wakeup_with_working_set(
             )
             .await
             {
+                if reserved {
+                    return Err(e).context("persist reserved wakeup subscriber captures");
+                }
                 tracing::warn!(
                     "wakeup translator: persist captures failed for workflow {}: {} (continuing fan-out)",
                     entry.workflow_id,
                     e
+                );
+            } else if reserved {
+                crate::ingress_idempotency::observe_ingress_boundary(
+                    crate::ingress_idempotency::IngressBoundary::AfterCapturePersistence,
                 );
             }
         }
@@ -249,6 +314,9 @@ async fn process_wakeup_with_working_set(
             })),
         };
         if let Err(e) = sender.send(&signal).await {
+            if reserved {
+                return Err(e).context("persist reserved wakeup Signal intent");
+            }
             tracing::warn!(
                 "wakeup translator: relay send failed for workflow {}: {} (continuing fan-out)",
                 entry.workflow_id,
@@ -270,15 +338,29 @@ async fn process_wakeup_with_working_set(
         if !gate_predicate_matches(&gate, &payload_value) {
             continue;
         }
-        if let Some(nats) = nats {
-            if let Err(e) =
-                write_gate_captures(nats, signal_id, &req.name, &gate, &payload_value).await
+        if nats.is_some() || scope_store.is_some() {
+            if let Err(e) = write_gate_captures(
+                nats,
+                scope_store,
+                signal_id,
+                &req.name,
+                &gate,
+                &payload_value,
+            )
+            .await
             {
+                if reserved {
+                    return Err(e).context("persist reserved wakeup gate captures");
+                }
                 tracing::warn!(
                     "wakeup translator: persist gate captures failed for ({}, {}): {} (continuing fan-out)",
                     gate.workflow_instance_id,
                     gate.edge_id,
                     e
+                );
+            } else if reserved {
+                crate::ingress_idempotency::observe_ingress_boundary(
+                    crate::ingress_idempotency::IngressBoundary::AfterCapturePersistence,
                 );
             }
         }
@@ -288,6 +370,9 @@ async fn process_wakeup_with_working_set(
             signal_id: signal_id.to_string(),
         };
         if let Err(e) = sender.send_gate_outcome(&outcome).await {
+            if reserved {
+                return Err(e).context("persist reserved wakeup GateOutcome intent");
+            }
             tracing::warn!(
                 "wakeup translator: gate-outcome relay send failed for ({}, {}): {} (continuing fan-out)",
                 gate.workflow_instance_id,
@@ -310,6 +395,9 @@ async fn process_wakeup_with_working_set(
         matched_workflows: matched_workflows as i32,
     };
     if let Err(e) = crate::signal_wakeups::insert(repositories, &audit_row).await {
+        if reserved {
+            return Err(e).context("persist reserved wakeup audit");
+        }
         tracing::warn!(
             "wakeup translator: signal_wakeups audit write failed (signal_id={}): {}",
             signal_id,
@@ -338,7 +426,8 @@ fn gate_predicate_matches(entry: &GateEntry, payload: &Value) -> bool {
 /// gate's recovery path is a re-issued `DispatchPrecondition` from
 /// the server, so SQL rehydration isn't load-bearing for gates.
 async fn write_gate_captures(
-    nats: &NatsClient,
+    nats: Option<&NatsClient>,
+    scope_store: Option<&dyn ScopeStore>,
     signal_id: Uuid,
     name: &str,
     gate: &GateEntry,
@@ -369,7 +458,7 @@ async fn write_gate_captures(
     if extracted.is_empty() {
         return Ok(());
     }
-    write_captures_to_nats(nats, signal_id, &extracted).await
+    write_captures(nats, scope_store, signal_id, gate.edge_id, &extracted).await
 }
 
 fn predicate_matches(entry: &Entry, payload: &Value) -> bool {
@@ -381,7 +470,8 @@ fn predicate_matches(entry: &Entry, payload: &Value) -> bool {
 
 async fn persist_subscriber_captures(
     repositories: &WriterRepositoryBundle,
-    nats: &NatsClient,
+    nats: Option<&NatsClient>,
+    scope_store: Option<&dyn ScopeStore>,
     signal_id: Uuid,
     name: &str,
     entry: &Entry,
@@ -432,9 +522,34 @@ async fn persist_subscriber_captures(
             &row_envelopes,
         )
         .await?;
-        write_captures_to_nats(nats, signal_id, &extracted).await?;
+        write_captures(nats, scope_store, signal_id, entry.workflow_id, &extracted).await?;
     }
     Ok(())
+}
+
+async fn write_captures(
+    nats: Option<&NatsClient>,
+    scope_store: Option<&dyn ScopeStore>,
+    signal_id: Uuid,
+    operation_owner: Uuid,
+    captures: &[ExtractedEnvelope],
+) -> Result<()> {
+    if let Some(nats) = nats {
+        write_captures_to_nats(nats, signal_id, captures).await
+    } else if let Some(scope_store) = scope_store {
+        let run_id = signal_id.to_string();
+        write_event_captures(
+            scope_store,
+            DEFAULT_CTX_NAMESPACE,
+            signal_id,
+            &run_id,
+            operation_owner,
+            captures,
+        )
+        .await
+    } else {
+        Ok(())
+    }
 }
 
 async fn write_captures_to_nats(
@@ -446,7 +561,7 @@ async fn write_captures_to_nats(
         return Ok(());
     }
     let js = jetstream::new(nats.clone());
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv = match js.get_key_value(&bucket_name).await {
         Ok(kv) => kv,
         Err(_) => js

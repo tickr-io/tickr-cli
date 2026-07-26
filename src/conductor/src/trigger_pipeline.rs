@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tickr_ctx::envelope::SignalSource;
 use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::scope_repository::ScopeStore;
 use tickr_proto::signal as sp;
 use tickr_proto::workflow as wf;
 use uuid::Uuid;
@@ -32,6 +33,7 @@ use crate::captures_extractor::{
     extract_captures, ExtractionError, NamedEnvelope as ExtractedEnvelope,
 };
 use crate::idempotency;
+use crate::scope_working_set::write_event_captures;
 use crate::signal_captures;
 
 /// Per-tenant tickr-ctx bucket namespace. Mirrors the executor's resolver
@@ -78,7 +80,11 @@ pub enum TriggerOutcome {
     /// First arrival for this `(idempotency_key, hash_payload)` pair (or
     /// no idempotency key at all). The pipeline has written captures and
     /// constructed the wire `Signal`; the caller forwards it.
-    Fresh { signal_id: Uuid, signal: sp::Signal },
+    Fresh {
+        signal_id: Uuid,
+        signal: sp::Signal,
+        event_results: Vec<u8>,
+    },
     /// Same idempotency key, byte-identical canonical-JSON payload — an
     /// idempotent retry. No work happened; the cached `signal_id` is what
     /// the original arrival produced. Caller surfaces this to its
@@ -122,6 +128,21 @@ pub enum TriggerError {
     RepositoryWrite(#[source] anyhow::Error),
     #[error("captures cache: {0}")]
     NatsWrite(#[source] anyhow::Error),
+    #[error("selected ScopeStore write: {0}")]
+    ScopeWrite(#[source] anyhow::Error),
+    #[error("encode deterministic Event-variable results: {0}")]
+    EffectsEncoding(#[source] serde_json::Error),
+}
+
+impl TriggerError {
+    pub fn is_permanent_ingress_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkflowNotFound { .. }
+                | Self::InputsProvidedButNoCaptures
+                | Self::CapturesExtractionFailed { .. }
+        )
+    }
 }
 
 /// Run the shared trigger pipeline. On `TriggerOutcome::Fresh`, captures
@@ -133,7 +154,7 @@ pub async fn process_trigger(
     nats: &NatsClient,
     req: TriggerRequest,
 ) -> Result<TriggerOutcome, TriggerError> {
-    process_trigger_with_working_set(repositories, Some(nats), req).await
+    process_trigger_with_working_set(repositories, Some(nats), None, req, None).await
 }
 
 /// Tickr Lite Trigger ingress keeps the SQL capture archive and published
@@ -142,13 +163,80 @@ pub async fn process_trigger_local(
     repositories: &WriterRepositoryBundle,
     req: TriggerRequest,
 ) -> Result<TriggerOutcome, TriggerError> {
-    process_trigger_with_working_set(repositories, None, req).await
+    process_trigger_with_working_set(repositories, None, None, req, None).await
+}
+
+pub struct ReservedTriggerEffects {
+    pub signal: sp::Signal,
+    pub event_results: Vec<u8>,
+}
+
+/// Run External Event ingress effects under a producer reservation. The
+/// reservation owns the stable Signal identity and idempotency decision, so
+/// this path performs only deterministic capture persistence and construction.
+pub async fn process_reserved_trigger(
+    repositories: &WriterRepositoryBundle,
+    nats: &NatsClient,
+    req: TriggerRequest,
+    signal_id: Uuid,
+) -> Result<ReservedTriggerEffects, TriggerError> {
+    match process_trigger_with_working_set(repositories, Some(nats), None, req, Some(signal_id))
+        .await?
+    {
+        TriggerOutcome::Fresh {
+            signal,
+            event_results,
+            ..
+        } => Ok(ReservedTriggerEffects {
+            signal,
+            event_results,
+        }),
+        TriggerOutcome::Deduplicated { .. } | TriggerOutcome::Conflict { .. } => {
+            Err(TriggerError::Idempotency(anyhow!(
+                "reserved trigger unexpectedly consulted producer idempotency"
+            )))
+        }
+    }
+}
+/// Run reserved External Event effects through the selected ScopeStore role.
+/// The caller owns producer idempotency and receives no substrate client.
+pub async fn process_reserved_trigger_with_scope_store(
+    repositories: &WriterRepositoryBundle,
+    scope_store: &dyn ScopeStore,
+    req: TriggerRequest,
+    signal_id: Uuid,
+) -> Result<ReservedTriggerEffects, TriggerError> {
+    match process_trigger_with_working_set(
+        repositories,
+        None,
+        Some(scope_store),
+        req,
+        Some(signal_id),
+    )
+    .await?
+    {
+        TriggerOutcome::Fresh {
+            signal,
+            event_results,
+            ..
+        } => Ok(ReservedTriggerEffects {
+            signal,
+            event_results,
+        }),
+        TriggerOutcome::Deduplicated { .. } | TriggerOutcome::Conflict { .. } => {
+            Err(TriggerError::Idempotency(anyhow!(
+                "reserved trigger unexpectedly consulted producer idempotency"
+            )))
+        }
+    }
 }
 
 async fn process_trigger_with_working_set(
     repositories: &WriterRepositoryBundle,
     nats: Option<&NatsClient>,
+    scope_store: Option<&dyn ScopeStore>,
     req: TriggerRequest,
+    reserved_signal_id: Option<Uuid>,
 ) -> Result<TriggerOutcome, TriggerError> {
     let inputs_provided = req.inputs.is_some();
     let payload = req.inputs.unwrap_or(Value::Object(Default::default()));
@@ -178,34 +266,36 @@ async fn process_trigger_with_working_set(
         return Err(TriggerError::InputsProvidedButNoCaptures);
     }
 
-    // 3. Mint signal_id up front so it threads through every persistence
-    //    site (SQL archive, NATS keys, envelope lineage, wire signal).
-    let signal_id = Uuid::new_v4();
+    // 3. A reserved Event-ingress operation supplies its stable Signal id;
+    // ordinary HTTP/local callers mint one here.
+    let reserved = reserved_signal_id.is_some();
+    let signal_id = reserved_signal_id.unwrap_or_else(Uuid::new_v4);
 
-    // 4. Idempotency cache. Only consulted when a producer-supplied key
-    //    is present. The check_or_insert is atomic against concurrent
-    //    retries on the same key.
-    if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
-        let bucket = idempotency::open_bucket(nats)
-            .await
-            .map_err(TriggerError::Idempotency)?;
-        let outcome = idempotency::check_or_insert(&bucket, key, signal_id, &input_hash)
-            .await
-            .map_err(TriggerError::Idempotency)?;
-        match outcome {
-            idempotency::CacheOutcome::Fresh => {}
-            idempotency::CacheOutcome::DeduplicatedSameHash { original_signal_id } => {
-                return Ok(TriggerOutcome::Deduplicated { original_signal_id });
-            }
-            idempotency::CacheOutcome::ConflictDifferentHash {
-                original_signal_id,
-                original_hash,
-            } => {
-                return Ok(TriggerOutcome::Conflict {
+    // 4. Producer idempotency is owned by the outer Event-ingress reservation
+    // on the reserved path; ordinary callers retain the shared cache behavior.
+    if !reserved {
+        if let (Some(key), Some(nats)) = (req.idempotency_key.as_deref(), nats) {
+            let bucket = idempotency::open_bucket(nats)
+                .await
+                .map_err(TriggerError::Idempotency)?;
+            let outcome = idempotency::check_or_insert(&bucket, key, signal_id, &input_hash)
+                .await
+                .map_err(TriggerError::Idempotency)?;
+            match outcome {
+                idempotency::CacheOutcome::Fresh => {}
+                idempotency::CacheOutcome::DeduplicatedSameHash { original_signal_id } => {
+                    return Ok(TriggerOutcome::Deduplicated { original_signal_id });
+                }
+                idempotency::CacheOutcome::ConflictDifferentHash {
                     original_signal_id,
                     original_hash,
-                    your_hash: hex::encode(input_hash),
-                });
+                } => {
+                    return Ok(TriggerOutcome::Conflict {
+                        original_signal_id,
+                        original_hash,
+                        your_hash: hex::encode(input_hash),
+                    });
+                }
             }
         }
     }
@@ -246,6 +336,11 @@ async fn process_trigger_with_working_set(
     )
     .await
     .map_err(TriggerError::RepositoryWrite)?;
+    let event_results = if reserved {
+        serde_json::to_vec(&row_envelopes).map_err(TriggerError::EffectsEncoding)?
+    } else {
+        Vec::new()
+    };
 
     // 6b. Back-fill the (signal_id → run_id) linkage for a future-dated
     //     trigger so the signals read-path can surface the scheduled
@@ -278,6 +373,23 @@ async fn process_trigger_with_working_set(
         write_captures_to_nats(nats, signal_id, &extracted)
             .await
             .map_err(TriggerError::NatsWrite)?;
+    } else if let Some(scope_store) = scope_store {
+        let run_id = signal_id.to_string();
+        write_event_captures(
+            scope_store,
+            DEFAULT_CTX_NAMESPACE,
+            signal_id,
+            &run_id,
+            signal_id,
+            &extracted,
+        )
+        .await
+        .map_err(TriggerError::ScopeWrite)?;
+    }
+    if reserved && (nats.is_some() || scope_store.is_some()) {
+        crate::ingress_idempotency::observe_ingress_boundary(
+            crate::ingress_idempotency::IngressBoundary::AfterCapturePersistence,
+        );
     }
 
     // 8. Construct the wire Signal. Producer-supplied key carries onto the
@@ -310,7 +422,11 @@ async fn process_trigger_with_working_set(
         })),
     };
 
-    Ok(TriggerOutcome::Fresh { signal_id, signal })
+    Ok(TriggerOutcome::Fresh {
+        signal_id,
+        signal,
+        event_results,
+    })
 }
 
 /// Load the **live** workflow definition — the one canonical "the version we
@@ -358,7 +474,7 @@ async fn write_captures_to_nats(
     }
 
     let js = jetstream::new(nats.clone());
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv = match js.get_key_value(&bucket_name).await {
         Ok(kv) => kv,
         Err(_) => js

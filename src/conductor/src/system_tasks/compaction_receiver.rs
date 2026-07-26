@@ -12,33 +12,196 @@
 //! archive repository write.
 
 use crate::proto::{ConductorRelayMessage, EntityType};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_nats::{jetstream, Client as NatsClient};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use tickr_ctx::nats_scope::{
+    snapshot_from_entries, NatsScopeEntry, NatsScopeError, NatsScopeSnapshot, NatsScopeStore,
+};
 use tickr_migrations::archive_repository::ArchiveTerminalWorkflowInput;
 use tickr_migrations::backend::WriterRepositoryBundle;
+use tickr_migrations::scope_repository::{
+    decode_tickr_ctx_scope_snapshot, ScopeSnapshotOutcome, ScopeStore, TickrCtxScopeSnapshot,
+};
 use tickr_proto::archive as ap;
 use uuid::Uuid;
-
-/// Default namespace for the tickr-ctx KV bucket. Mirrors `tickr_ctx::Scope`'s
-/// fallback when `TICKR_NS` is unset.
-const DEFAULT_CTX_NAMESPACE: &str = "default";
 
 /// MinIO bucket that `log_uploader` writes per-task gzip blobs to. Mirrors
 /// `log_uploader::STORAGE_BUCKET` so URI derivation here matches the writer.
 const LOG_STORAGE_BUCKET: &str = "tickr-logs";
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompactionScopeEntry {
+    pub key: String,
+    pub envelope: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompactionScopeSnapshot {
+    pub scope_id: Option<Uuid>,
+    pub owner: String,
+    pub entries: Vec<CompactionScopeEntry>,
+    pub bytes: Vec<u8>,
+    pub digest: String,
+    pub value_bytes: usize,
+}
+
+#[async_trait]
+pub trait CompactionScopeSnapshotReader: Send + Sync {
+    async fn snapshot(
+        &self,
+        repository: &WriterRepositoryBundle,
+        projection: &ap::ArchiveProjection,
+    ) -> Result<CompactionScopeSnapshot>;
+}
+
+pub(crate) struct NatsCompactionScopeSnapshotReader {
+    store: NatsScopeStore,
+}
+
+pub struct RoleCompactionScopeSnapshotReader {
+    store: std::sync::Arc<dyn ScopeStore>,
+}
+
+impl RoleCompactionScopeSnapshotReader {
+    pub fn new(store: std::sync::Arc<dyn ScopeStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl CompactionScopeSnapshotReader for NatsCompactionScopeSnapshotReader {
+    async fn snapshot(
+        &self,
+        repository: &WriterRepositoryBundle,
+        projection: &ap::ArchiveProjection,
+    ) -> Result<CompactionScopeSnapshot> {
+        let workflow_instance_id = workflow_instance_id(projection)?;
+        let owner = tickr_ctx::scope::sanitize_segment(&projection.id);
+        match self.store.snapshot(&owner).await {
+            Ok(snapshot) => Ok(nats_snapshot(snapshot)),
+            Err(NatsScopeError::Cleaned { digest, .. }) => {
+                let run_info = repository
+                    .archive_run_info(workflow_instance_id)
+                    .await
+                    .context("read committed scope archive for Compaction redelivery")?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cleaned tickr-ctx scope `{owner}` has no committed archive enrichment"
+                        )
+                    })?;
+                snapshot_from_archive(&owner, &digest, &run_info.ctx_envelope)
+            }
+            Err(error) => Err(error).context("snapshot fresh all-NATS ScopeStore"),
+        }
+    }
+}
+
+#[async_trait]
+impl CompactionScopeSnapshotReader for RoleCompactionScopeSnapshotReader {
+    async fn snapshot(
+        &self,
+        _repository: &WriterRepositoryBundle,
+        projection: &ap::ArchiveProjection,
+    ) -> Result<CompactionScopeSnapshot> {
+        let outcome = self
+            .store
+            .snapshot_tickr_ctx_scope_for_run(&ctx_namespace(), &projection.id, Utc::now())
+            .await
+            .map_err(|error| anyhow!("snapshot selected ScopeStore: {error}"))?;
+        let snapshot = match outcome {
+            ScopeSnapshotOutcome::Committed(snapshot)
+            | ScopeSnapshotOutcome::Idempotent(snapshot) => snapshot,
+            ScopeSnapshotOutcome::Missing => {
+                return Err(anyhow!("tickr-ctx scope `{}` is missing", projection.id));
+            }
+            ScopeSnapshotOutcome::Bound(bound) => {
+                return Err(anyhow!("tickr-ctx scope exceeded a bound: {bound:?}"));
+            }
+            ScopeSnapshotOutcome::Quarantined { diagnostic, .. } => {
+                return Err(anyhow!("tickr-ctx scope is quarantined: {diagnostic}"));
+            }
+        };
+        common_snapshot(snapshot, &projection.id)
+    }
+}
+
 /// Persist the compaction payload through the terminal-archive repository.
 ///
 /// The selected repository owns the archive transaction and terminal audit
-/// persistence. NATS-KV read failures and missing tickr-ctx scope remain
-/// non-fatal.
+/// persistence. A distributed Compaction must first seal a readable tickr-ctx
+/// scope; absence, corruption, or an unreadable role store fails the drain.
 pub async fn persist_compaction_projection(
     repository: &WriterRepositoryBundle,
     projection: &ap::ArchiveProjection,
     shipped_at: Option<DateTime<Utc>>,
     nats: Option<&NatsClient>,
+) -> Result<()> {
+    let scope_snapshot = match nats {
+        Some(client) => {
+            let reader = open_nats_scope_reader(client)
+                .await
+                .context("seal tickr-ctx scope before Compaction archive")?;
+            Some(
+                seal_ctx_scope(repository, &reader, projection)
+                    .await
+                    .context("seal tickr-ctx scope before Compaction archive")?,
+            )
+        }
+        None => None,
+    };
+    persist_compaction_projection_inner(
+        repository,
+        projection,
+        shipped_at,
+        nats,
+        scope_snapshot.as_ref(),
+    )
+    .await
+}
+
+pub(crate) async fn persist_compaction_projection_with_scope(
+    repository: &WriterRepositoryBundle,
+    projection: &ap::ArchiveProjection,
+    shipped_at: Option<DateTime<Utc>>,
+    nats: &NatsClient,
+    scope_snapshot: &CompactionScopeSnapshot,
+) -> Result<()> {
+    persist_compaction_projection_inner(
+        repository,
+        projection,
+        shipped_at,
+        Some(nats),
+        Some(scope_snapshot),
+    )
+    .await
+}
+/// Persist an archive enriched by an already sealed selected-role snapshot.
+/// Redis archive evidence and cleanup remain owned by the role adapter.
+pub async fn persist_compaction_projection_with_selected_scope(
+    repository: &WriterRepositoryBundle,
+    projection: &ap::ArchiveProjection,
+    shipped_at: Option<DateTime<Utc>>,
+    scope_snapshot: &CompactionScopeSnapshot,
+) -> Result<()> {
+    persist_compaction_projection_inner(
+        repository,
+        projection,
+        shipped_at,
+        None,
+        Some(scope_snapshot),
+    )
+    .await
+}
+
+async fn persist_compaction_projection_inner(
+    repository: &WriterRepositoryBundle,
+    projection: &ap::ArchiveProjection,
+    shipped_at: Option<DateTime<Utc>>,
+    nats: Option<&NatsClient>,
+    scope_snapshot: Option<&CompactionScopeSnapshot>,
 ) -> Result<()> {
     let wi_id = Uuid::parse_str(&projection.id).with_context(|| {
         format!(
@@ -52,41 +215,31 @@ pub async fn persist_compaction_projection(
             projection.workflow_id
         )
     })?;
-
-    // tickr-ctx scope dump (or empty on read error / missing bucket).
-    let ctx_envelope_json = match nats {
-        Some(client) => read_ctx_scope(client, &projection.id)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "compaction_receiver: tickr-ctx scope read failed for run {}: {} (empty envelope)",
-                    wi_id, e
-                );
-                serde_json::Value::Array(Vec::new())
-            }),
-        None => serde_json::Value::Array(Vec::new()),
-    };
-
+    let ctx_envelope_json = scope_snapshot
+        .map(scope_archive_entries)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
     let log_uris_json = derive_log_uris(projection, workflow_id, wi_id);
     let runtime_params_json = derive_runtime_params(projection, shipped_at);
 
-    let archived_at = shipped_at.unwrap_or_else(Utc::now);
     repository
         .archive_terminal_workflow(ArchiveTerminalWorkflowInput {
             projection,
             ctx_envelope: ctx_envelope_json,
             runtime_params: runtime_params_json,
             log_uris: log_uris_json,
-            archived_at,
+            archived_at: shipped_at.unwrap_or_else(Utc::now),
         })
         .await
         .context("persist the linked terminal archive")?;
+    if let (Some(client), Some(snapshot)) = (nats, scope_snapshot) {
+        open_nats_scope_store(client)
+            .await?
+            .mark_archive_committed(&snapshot.owner, &snapshot.digest)
+            .await
+            .context("record committed tickr-ctx scope archive")?;
+    }
 
-    // Terminal-state cleanup for `signal_captures`. Flips `terminal_at` on
-    // every row linked to this run and deletes the matching NATS KV
-    // `<signal_id>/<name>` keys so the working-set cache reclaims storage
-    // immediately. The SQL audit row lingers for the grace window before
-    // the periodic repository cleanup removes it.
     if let Some(nats_client) = nats {
         match crate::signal_captures_cleanup::on_workflow_terminal(&repository, nats_client, wi_id)
             .await
@@ -98,84 +251,153 @@ pub async fn persist_compaction_projection(
                     wi_id
                 );
             }
-            Ok(_) => {} // no linked rows; cron-fired or no-captures run
-            Err(e) => {
-                // Non-fatal: the row's `terminal_at` may have been flipped
-                // partially before the failure, in which case the sweep
-                // picks it up later. A full failure leaves the row active
-                // until the next terminal event for the same run (idempotent
-                // re-run) or operator intervention.
+            Ok(_) => {}
+            Err(error) => {
                 eprintln!(
                     "signal_captures cleanup: failed for run {}: {} (sweep will retry)",
-                    wi_id, e
+                    wi_id, error
                 );
             }
         }
     }
-
-    // No gate-index sweep here: with stage-then-drain, any conductor may
-    // archive this run, so an in-process sweep would only clean the
-    // draining instance anyway. Gate-index freshness relies on the
-    // server-authoritative relay-reconnect rebuild; entries for an
-    // archived instance emit envelopes the server tolerates as no-ops
-    // until the next rebuild drops them.
-
     Ok(())
 }
 
-/// Read all `<run_id>/<key>` entries out of the `ctx-<ns>` JetStream KV bucket
-/// for this run. Returns a JSON array of `{key, envelope}` objects (envelope
-/// kept as opaque JSON — the conductor doesn't interpret it, just stores).
-async fn read_ctx_scope(nats: &NatsClient, run_id: &str) -> Result<serde_json::Value> {
-    let js = jetstream::new(nats.clone());
-    let bucket = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
-    let kv = match js.get_key_value(&bucket).await {
-        Ok(kv) => kv,
-        Err(_) => {
-            // No bucket → no scope. Not an error for archival purposes.
-            return Ok(serde_json::Value::Array(Vec::new()));
-        }
-    };
+/// Seal one immutable snapshot through the selected ScopeStore role.
+pub async fn seal_ctx_scope(
+    repository: &WriterRepositoryBundle,
+    reader: &dyn CompactionScopeSnapshotReader,
+    projection: &ap::ArchiveProjection,
+) -> Result<CompactionScopeSnapshot> {
+    reader.snapshot(repository, projection).await
+}
 
-    let prefix = format!("{}/", sanitize_segment(run_id));
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-
-    // NATS KV's `keys()` returns a stream of every key in the bucket; we
-    // client-side filter to this run's prefix. The bucket is per-namespace,
-    // not per-run, so the cost scales with bucket size — revisit if it
-    // becomes a hotspot in production.
-    let mut keys = kv.keys().await?;
-    while let Some(item) = keys.next().await {
-        let key = match item {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("compaction_receiver: KV keys() yielded error: {}", e);
-                continue;
-            }
-        };
-        if !key.starts_with(&prefix) {
-            continue;
-        }
-        match kv.get(&key).await {
-            Ok(Some(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(env_value) => entries.push(serde_json::json!({
-                    "key": key,
-                    "envelope": env_value,
-                })),
-                Err(e) => eprintln!(
-                    "compaction_receiver: failed to parse Envelope JSON for key {}: {}",
-                    key, e
-                ),
-            },
-            Ok(None) => {} // tombstoned mid-scan; skip
-            Err(e) => eprintln!(
-                "compaction_receiver: failed to fetch value for key {}: {}",
-                key, e
-            ),
-        }
+fn snapshot_from_archive(
+    owner: &str,
+    expected_digest: &str,
+    envelope: &serde_json::Value,
+) -> Result<CompactionScopeSnapshot> {
+    let entries = envelope
+        .as_array()
+        .ok_or_else(|| anyhow!("committed tickr-ctx scope archive is not an entry array"))?
+        .iter()
+        .map(|entry| {
+            let key = entry
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("committed tickr-ctx scope archive entry has no key"))?
+                .to_owned();
+            let encoded = entry
+                .get("envelope_bytes")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("committed tickr-ctx scope archive entry has no opaque bytes")
+                })?;
+            Ok(NatsScopeEntry {
+                key,
+                envelope: hex::decode(encoded)
+                    .context("decode committed tickr-ctx scope envelope bytes")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let snapshot = nats_snapshot(snapshot_from_entries(owner, entries)?);
+    if snapshot.digest != expected_digest {
+        return Err(anyhow!(
+            "committed tickr-ctx scope archive digest does not match its cleaned snapshot"
+        ));
     }
+    Ok(snapshot)
+}
 
-    Ok(serde_json::Value::Array(entries))
+pub async fn cleanup_ctx_scope(nats: &NatsClient, run_id: &str) -> Result<()> {
+    open_nats_scope_store(nats)
+        .await?
+        .cleanup_archived(&tickr_ctx::scope::sanitize_segment(run_id))
+        .await
+        .context("clean archived fresh all-NATS ScopeStore")
+}
+
+async fn open_nats_scope_store(nats: &NatsClient) -> Result<NatsScopeStore> {
+    let namespace = ctx_namespace();
+    let bucket = tickr_ctx::scope::bucket_for_namespace(&namespace);
+    let kv = jetstream::new(nats.clone())
+        .get_key_value(&bucket)
+        .await
+        .with_context(|| format!("open admitted ScopeStore bucket {bucket}"))?;
+    NatsScopeStore::new(kv, &namespace).context("open fresh all-NATS ScopeStore")
+}
+
+pub(crate) async fn open_nats_scope_reader(
+    nats: &NatsClient,
+) -> Result<NatsCompactionScopeSnapshotReader> {
+    Ok(NatsCompactionScopeSnapshotReader {
+        store: open_nats_scope_store(nats).await?,
+    })
+}
+
+fn scope_archive_entries(snapshot: &CompactionScopeSnapshot) -> Result<serde_json::Value> {
+    snapshot
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(serde_json::json!({
+                "key": entry.key,
+                "envelope": serde_json::from_slice::<serde_json::Value>(&entry.envelope)
+                    .context("decode validated tickr-ctx envelope for archive response")?,
+                "envelope_bytes": hex::encode(&entry.envelope),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(serde_json::Value::Array)
+}
+
+fn workflow_instance_id(projection: &ap::ArchiveProjection) -> Result<Uuid> {
+    Uuid::parse_str(&projection.id).with_context(|| {
+        format!(
+            "archive projection carried an unparseable id `{}`",
+            projection.id
+        )
+    })
+}
+
+fn nats_snapshot(snapshot: NatsScopeSnapshot) -> CompactionScopeSnapshot {
+    CompactionScopeSnapshot {
+        scope_id: None,
+        owner: snapshot.owner,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|entry| CompactionScopeEntry {
+                key: entry.key,
+                envelope: entry.envelope,
+            })
+            .collect(),
+        bytes: snapshot.bytes,
+        digest: snapshot.digest,
+        value_bytes: snapshot.value_bytes,
+    }
+}
+
+fn common_snapshot(
+    snapshot: TickrCtxScopeSnapshot,
+    owner: &str,
+) -> Result<CompactionScopeSnapshot> {
+    let entries = decode_tickr_ctx_scope_snapshot(&snapshot)?
+        .into_iter()
+        .map(|(key, envelope)| CompactionScopeEntry { key, envelope })
+        .collect();
+    Ok(CompactionScopeSnapshot {
+        scope_id: Some(snapshot.scope_id),
+        owner: tickr_ctx::scope::sanitize_segment(owner),
+        entries,
+        bytes: snapshot.bytes,
+        digest: snapshot.digest,
+        value_bytes: snapshot.value_bytes,
+    })
+}
+
+fn ctx_namespace() -> String {
+    std::env::var("TICKR_NS").unwrap_or_else(|_| "default".to_owned())
 }
 
 /// Derive the S3-uri map `{task_instance_id -> s3://<bucket>/task_logs/...}`
@@ -216,20 +438,6 @@ fn derive_runtime_params(
     })
 }
 
-/// Sanitize an identifier for use in a NATS KV key segment. Mirrors
-/// `tickr_ctx::scope::sanitize_segment` exactly — kept inline rather than
-/// pulled from the `tickr_ctx` crate because that crate is currently a
-/// binary, not a library. If `tickr_ctx` is ever published as a lib, swap
-/// this for a direct import.
-fn sanitize_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '=' | '.' | '-' => c,
-            _ => '_',
-        })
-        .collect()
-}
-
 /// Build the `COMPACTION_ACK` reply for a durably staged payload. Echoes the
 /// envelope's opaque correlation verbatim; the correlation is never persisted. The conductor sends
 /// this back over the relay once the payload is in the NATS work queue; the
@@ -245,23 +453,5 @@ pub fn build_ack(workflow_instance_id: &str, correlation: &str) -> ConductorRela
         // Coordinator stamps the tenant from connection state (handshake), so an
         // individual outbound envelope carries no tenant of its own.
         tenant_id: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_segment_matches_tickr_ctx_rules() {
-        // UUID-shaped input must round-trip.
-        let uuid = "11111111-2222-3333-4444-555555555555";
-        assert_eq!(sanitize_segment(uuid), uuid);
-        // Spaces become underscores.
-        assert_eq!(sanitize_segment("hello world"), "hello_world");
-        // The forward slash is a separator, not a legal key char.
-        assert_eq!(sanitize_segment("a/b"), "a_b");
-        // Empty stays empty.
-        assert_eq!(sanitize_segment(""), "");
     }
 }

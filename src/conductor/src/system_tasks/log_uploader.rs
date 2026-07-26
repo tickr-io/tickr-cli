@@ -12,7 +12,7 @@
 //! purged skips the upload (the blob from the first run stands) instead of
 //! overwriting it with an empty one.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{self, consumer};
 use async_nats::Client as NatsClient;
@@ -21,8 +21,16 @@ use flate2::Compression;
 use futures::StreamExt;
 use opendal::layers::LoggingLayer;
 use opendal::Operator;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::Duration;
+use tickr_proto::coord::all_nats;
+use tickr_proto::coord::log_stream::{
+    accepted_record_digest, rebuild_log_streams, AcceptedLogRecord, LogSeal, LogStreamIdentity,
+    LogStreamState, LogTerminal, PreAcceptanceGap,
+};
 use uuid::Uuid;
 
 /// Object-storage bucket the gzip blobs land in.
@@ -30,22 +38,19 @@ use uuid::Uuid;
 /// JetStream stream staging task-log batches. Mirrors the executor's
 /// publisher and the API's logs resolver — the three must agree on stream
 /// name and subject shape.
-const LOG_STREAM_NAME: &str = "tickr_task_logs";
+const LOG_STREAM_NAME: &str = tickr_proto::coord::all_nats::LOG_STREAM;
 
 /// Subject a task instance's log batches live on. Mirrors the executor's
 /// `log_subject`.
 fn log_subject(workflow_id: &Uuid, workflow_instance_id: &Uuid, task_instance_id: &Uuid) -> String {
     format!(
-        "logs.{}.{}.{}",
-        workflow_id, workflow_instance_id, task_instance_id
+        "{}.{}.{}.{}",
+        tickr_proto::coord::all_nats::LOG_SUBJECT_PREFIX,
+        workflow_id,
+        workflow_instance_id,
+        task_instance_id
     )
 }
-
-/// End-of-stream marker headers. Mirrors the executor's publisher and the
-/// API's logs resolver.
-const MARKER_HEADER: &str = "Tickr-Log-Marker";
-const MARKER_EXIT_STATUS_HEADER: &str = "Tickr-Exit-Status";
-const MARKER_EXIT_REASON_HEADER: &str = "Tickr-Exit-Reason";
 
 /// The End-of-stream marker as read off a task's log subject.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,21 +60,27 @@ pub struct EndOfStreamMarker {
     pub reason: Option<String>,
 }
 
-/// Extract the marker from a message's headers, if the message is one.
-fn marker_from_headers(headers: Option<&async_nats::HeaderMap>) -> Option<EndOfStreamMarker> {
-    let headers = headers?;
-    headers.get(MARKER_HEADER)?;
-    let exit_status = headers
-        .get(MARKER_EXIT_STATUS_HEADER)
-        .and_then(|v| v.as_str().parse::<i64>().ok())
-        .unwrap_or(-1);
-    let reason = headers
-        .get(MARKER_EXIT_REASON_HEADER)
-        .map(|v| v.as_str().to_string());
-    Some(EndOfStreamMarker {
-        exit_status,
-        reason,
-    })
+fn marker_from_terminal(terminal: &LogTerminal) -> EndOfStreamMarker {
+    match terminal {
+        LogTerminal::EndOfStream { exit } => match exit {
+            tickr_proto::coord::log_stream::LogExit::Status(status) => EndOfStreamMarker {
+                exit_status: i64::from(*status),
+                reason: None,
+            },
+            tickr_proto::coord::log_stream::LogExit::NoStatus => EndOfStreamMarker {
+                exit_status: -1,
+                reason: Some("terminated without exit status".to_owned()),
+            },
+            tickr_proto::coord::log_stream::LogExit::Error(reason) => EndOfStreamMarker {
+                exit_status: -1,
+                reason: Some(reason.clone()),
+            },
+        },
+        LogTerminal::AbnormalClosure { .. } => EndOfStreamMarker {
+            exit_status: -1,
+            reason: Some("Executor closed without controlled End-of-stream".to_owned()),
+        },
+    }
 }
 
 /// Sidecar object key carrying the archived marker. The marker is structured
@@ -119,77 +130,349 @@ pub fn production_log_storage() -> Result<Operator> {
         .finish())
 }
 
-/// Replay everything currently on a task's log subject. Returns the raw
-/// batch payloads in stream order plus the End-of-stream marker if one was
-/// published; an absent stream or empty subject yields empty results (not
-/// an error) — a task may legitimately have produced no logs, or a
-/// re-delivered job may find the subject already purged.
-async fn read_log_subject(
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SealedLogStream {
+    identity: LogStreamIdentity,
+    committed_frontier: Option<u64>,
+    accepted_records: Vec<AcceptedLogRecord>,
+    declared_gaps: Vec<PreAcceptanceGap>,
+    terminal: LogTerminal,
+}
+
+/// Immutable accepted-record, gap, frontier, and terminal snapshot for one
+/// Task instance. The digest is the stable Log seal identity used by Compaction.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskLogSeal {
+    task_instance_id: Uuid,
+    streams: Vec<SealedLogStream>,
+    digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct LogTerminalFence {
+    pub stream: LogStreamIdentity,
+    pub terminal: LogTerminal,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TaskLogSealIdentity {
+    pub task_instance_id: Uuid,
+    pub digest: String,
+    pub terminal_fences: Vec<LogTerminalFence>,
+}
+
+impl TaskLogSeal {
+    pub(crate) fn identity(&self) -> TaskLogSealIdentity {
+        TaskLogSealIdentity {
+            task_instance_id: self.task_instance_id,
+            digest: self.digest.clone(),
+            terminal_fences: self
+                .streams
+                .iter()
+                .map(|stream| LogTerminalFence {
+                    stream: stream.identity.clone(),
+                    terminal: stream.terminal.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn accepted_batches(&self) -> Vec<Vec<u8>> {
+        self.streams
+            .iter()
+            .flat_map(|stream| {
+                stream
+                    .accepted_records
+                    .iter()
+                    .map(|record| record.bytes.clone())
+            })
+            .collect()
+    }
+
+    fn terminal_marker(&self) -> Result<EndOfStreamMarker> {
+        self.streams
+            .last()
+            .map(|stream| marker_from_terminal(&stream.terminal))
+            .ok_or_else(|| anyhow!("cannot install an empty Log seal"))
+    }
+}
+
+pub(crate) fn task_log_seal_from_role(
+    task_instance_id: Uuid,
+    mut seals: Vec<LogSeal>,
+) -> Result<Option<TaskLogSeal>> {
+    if seals.is_empty() {
+        return Ok(None);
+    }
+    seals.sort_by(|left, right| left.stream().cmp(right.stream()));
+    let streams = seals
+        .iter()
+        .map(|seal| {
+            if seal.stream().task_instance_id != task_instance_id
+                || accepted_record_digest(seal.accepted_records()) != seal.record_digest()
+            {
+                bail!("selected Log seal does not match its Task or accepted-record digest");
+            }
+            let committed_frontier = match seal.terminal() {
+                LogTerminal::AbnormalClosure { committed_frontier } => *committed_frontier,
+                LogTerminal::EndOfStream { .. } => seal
+                    .accepted_records()
+                    .last()
+                    .map(|record| record.identity.sequence),
+            };
+            Ok(SealedLogStream {
+                identity: seal.stream().clone(),
+                committed_frontier,
+                accepted_records: seal.accepted_records().to_vec(),
+                declared_gaps: Vec::new(),
+                terminal: seal.terminal().clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let digest =
+        digest_bytes(&serde_json::to_vec(&seals).context("encode selected immutable Log seals")?);
+    Ok(Some(TaskLogSeal {
+        task_instance_id,
+        streams,
+        digest,
+    }))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct FinalLogObjectIdentity {
+    pub path: String,
+    pub digest: String,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct FinalLogInstallation {
+    pub task_instance_id: Uuid,
+    pub seal_digest: String,
+    pub log_object: Option<FinalLogObjectIdentity>,
+    pub terminal_object: FinalLogObjectIdentity,
+}
+
+fn seal_streams(
+    task_instance_id: Uuid,
+    streams: BTreeMap<LogStreamIdentity, LogStreamState>,
+) -> Result<Option<TaskLogSeal>> {
+    if streams.is_empty() {
+        return Ok(None);
+    }
+    let streams = streams
+        .into_values()
+        .map(|state| {
+            let terminal = state
+                .terminal()
+                .cloned()
+                .ok_or_else(|| anyhow!("cannot seal an open Log staging stream"))?;
+            Ok(SealedLogStream {
+                identity: state.identity().clone(),
+                committed_frontier: state.committed_frontier(),
+                accepted_records: state.accepted_records(),
+                declared_gaps: state.declared_gaps(),
+                terminal,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let digest =
+        digest_bytes(&serde_json::to_vec(&streams).context("encode immutable Log seal snapshot")?);
+    Ok(Some(TaskLogSeal {
+        task_instance_id,
+        streams,
+        digest,
+    }))
+}
+
+/// Replay the common LogStream state and durably close any stream whose Task
+/// is already terminal. Repeating this operation returns the same seal.
+pub(crate) async fn seal_task_logs(
     nats: &NatsClient,
     workflow_id: &Uuid,
     workflow_instance_id: &Uuid,
     task_instance_id: &Uuid,
-) -> Result<(Vec<Vec<u8>>, Option<EndOfStreamMarker>)> {
+) -> Result<Option<TaskLogSeal>> {
     let js = jetstream::new(nats.clone());
     let stream = match js.get_stream(LOG_STREAM_NAME).await {
-        Ok(s) => s,
-        Err(_) => {
-            // No stream → no executor has published a single batch yet.
-            return Ok((Vec::new(), None));
-        }
+        Ok(stream) => stream,
+        Err(_) => return Ok(None),
     };
-
     let subject = log_subject(workflow_id, workflow_instance_id, task_instance_id);
-    let consumer = stream
-        .create_consumer(pull::Config {
-            filter_subject: subject.clone(),
-            deliver_policy: consumer::DeliverPolicy::All,
-            ack_policy: consumer::AckPolicy::None,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "failed to create log replay consumer for {}: {}",
-                subject,
-                e
-            )
-        })?;
+    let mut recovered_terminal = false;
 
-    let mut batches: Vec<Vec<u8>> = Vec::new();
-    let mut marker: Option<EndOfStreamMarker> = None;
     loop {
-        let mut fetched = consumer
-            .fetch()
-            .max_messages(500)
-            .expires(Duration::from_millis(500))
-            .messages()
+        let consumer = stream
+            .create_consumer(pull::Config {
+                filter_subject: subject.clone(),
+                deliver_policy: consumer::DeliverPolicy::All,
+                ack_policy: consumer::AckPolicy::None,
+                ..Default::default()
+            })
             .await
-            .map_err(|e| anyhow!("log replay fetch on {}: {}", subject, e))?;
-
-        let mut got = 0usize;
-        while let Some(msg) = fetched.next().await {
-            let msg = msg.map_err(|e| anyhow!("log replay message on {}: {}", subject, e))?;
-            // The marker is structured metadata, never log text — record it
-            // and keep its (empty) payload out of the batch list.
-            if let Some(m) = marker_from_headers(msg.headers.as_ref()) {
-                marker = Some(m);
-            } else {
-                batches.push(msg.payload.to_vec());
+            .with_context(|| format!("create Log replay consumer for {subject}"))?;
+        let mut durable_records = Vec::new();
+        loop {
+            let mut fetched = consumer
+                .fetch()
+                .max_messages(500)
+                .expires(Duration::from_millis(500))
+                .messages()
+                .await
+                .with_context(|| format!("fetch Log replay records on {subject}"))?;
+            let mut count = 0_usize;
+            while let Some(message) = fetched.next().await {
+                let message =
+                    message.map_err(|error| anyhow!("Log replay on {subject}: {error}"))?;
+                durable_records.push(
+                    all_nats::decode_log_record(
+                        |name| {
+                            message
+                                .headers
+                                .as_ref()
+                                .and_then(|headers| headers.get(name))
+                                .map(|value| value.as_str().to_owned())
+                        },
+                        &message.payload,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                );
+                count += 1;
             }
-            got += 1;
+            if count < 500 {
+                break;
+            }
         }
-        if got < 500 {
-            break;
+
+        let streams = rebuild_log_streams(durable_records)?;
+        let open = streams
+            .values()
+            .filter(|state| state.terminal().is_none())
+            .map(|state| (state.identity().clone(), state.committed_frontier()))
+            .collect::<Vec<_>>();
+        if open.is_empty() {
+            return seal_streams(*task_instance_id, streams);
         }
+        if recovered_terminal {
+            bail!("abnormal Log terminal did not become replayable");
+        }
+        for (identity, frontier) in open {
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(all_nats::LOG_PROTOCOL_HEADER, all_nats::LOG_PROTOCOL);
+            headers.insert(all_nats::LOG_KIND_HEADER, all_nats::LOG_KIND_ABNORMAL);
+            headers.insert(
+                all_nats::LOG_TASK_INSTANCE_HEADER,
+                identity.task_instance_id.to_string().as_str(),
+            );
+            headers.insert(
+                all_nats::LOG_PICKUP_GENERATION_HEADER,
+                identity.pickup_generation.to_string().as_str(),
+            );
+            if let Some(frontier) = frontier {
+                headers.insert(
+                    all_nats::LOG_COMMITTED_FRONTIER_HEADER,
+                    frontier.to_string().as_str(),
+                );
+            }
+            let message_id = format!(
+                "log:{}:{}:terminal",
+                identity.task_instance_id, identity.pickup_generation
+            );
+            headers.insert("Nats-Msg-Id", message_id.as_str());
+            js.publish_with_headers(subject.clone(), headers, Vec::new().into())
+                .await
+                .context("publish abnormal Log terminal")?
+                .await
+                .context("await abnormal Log terminal acceptance")?;
+        }
+        recovered_terminal = true;
     }
-    Ok((batches, marker))
 }
 
-/// Upload one task's staged logs (and End-of-stream marker sidecar) to
-/// object storage. Returns `true` when anything was written, `false` when
-/// the subject was empty (nothing to upload — never overwrite an existing
-/// blob or sidecar with emptiness).
+fn digest_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+async fn write_final_log_object(
+    storage: &Operator,
+    path: String,
+    bytes: Vec<u8>,
+) -> Result<FinalLogObjectIdentity> {
+    let identity = FinalLogObjectIdentity {
+        path,
+        digest: digest_bytes(&bytes),
+        length: bytes.len() as u64,
+    };
+    storage
+        .write(&identity.path, bytes)
+        .await
+        .with_context(|| format!("write final Log object `{}`", identity.path))?;
+    Ok(identity)
+}
+
+async fn verify_final_log_object(
+    storage: &Operator,
+    identity: &FinalLogObjectIdentity,
+) -> Result<()> {
+    let bytes = storage
+        .read(&identity.path)
+        .await
+        .with_context(|| format!("read installed final Log object `{}`", identity.path))?;
+    if bytes.len() as u64 != identity.length {
+        bail!(
+            "final Log object `{}` length mismatch: expected {}, found {}",
+            identity.path,
+            identity.length,
+            bytes.len()
+        );
+    }
+    if digest_bytes(&bytes.to_vec()) != identity.digest {
+        bail!("final Log object `{}` digest mismatch", identity.path);
+    }
+    Ok(())
+}
+
+pub(crate) async fn install_task_logs(
+    storage: &Operator,
+    workflow_id: &Uuid,
+    workflow_instance_id: &Uuid,
+    seal: &TaskLogSeal,
+) -> Result<FinalLogInstallation> {
+    let batches = seal.accepted_batches();
+    let log_object = if batches.is_empty() {
+        None
+    } else {
+        let path = format!(
+            "task_logs/{}/{}/{}.gz",
+            workflow_id, workflow_instance_id, seal.task_instance_id
+        );
+        Some(write_final_log_object(storage, path, compress_log_batches(&batches)?).await?)
+    };
+    let terminal_path =
+        exit_sidecar_path(workflow_id, workflow_instance_id, &seal.task_instance_id);
+    let terminal_bytes =
+        serde_json::to_vec(&seal.terminal_marker()?).context("encode final Log terminal")?;
+    let terminal_object = write_final_log_object(storage, terminal_path, terminal_bytes).await?;
+    Ok(FinalLogInstallation {
+        task_instance_id: seal.task_instance_id,
+        seal_digest: seal.digest.clone(),
+        log_object,
+        terminal_object,
+    })
+}
+
+pub(crate) async fn verify_task_log_installation(
+    storage: &Operator,
+    installation: &FinalLogInstallation,
+) -> Result<()> {
+    if let Some(log_object) = &installation.log_object {
+        verify_final_log_object(storage, log_object).await?;
+    }
+    verify_final_log_object(storage, &installation.terminal_object).await
+}
+
+/// Compatibility entry point for callers that archive one task directly.
+/// Compaction uses the explicit seal, install, and verify phases above.
 pub async fn upload_task_logs(
     nats: &NatsClient,
     storage: &Operator,
@@ -197,59 +480,13 @@ pub async fn upload_task_logs(
     workflow_instance_id: &Uuid,
     task_instance_id: &Uuid,
 ) -> Result<bool> {
-    let (batches, marker) =
-        read_log_subject(nats, workflow_id, workflow_instance_id, task_instance_id).await?;
-    if batches.is_empty() && marker.is_none() {
+    let Some(seal) =
+        seal_task_logs(nats, workflow_id, workflow_instance_id, task_instance_id).await?
+    else {
         return Ok(false);
-    }
-
-    if !batches.is_empty() {
-        let compressed_data = compress_log_batches(&batches)?;
-        println!(
-            "Compressed {} log batches ({} bytes) for task {}",
-            batches.len(),
-            compressed_data.len(),
-            task_instance_id
-        );
-
-        // Same key shape as the staging subject, mirrored into object storage.
-        let storage_path = format!(
-            "task_logs/{}/{}/{}.gz",
-            workflow_id, workflow_instance_id, task_instance_id
-        );
-
-        // Same-key overwrite keeps the upload idempotent under job redelivery.
-        // Preserve OpenDAL error detail so the underlying S3 status
-        // (AccessDenied, NoSuchBucket, etc.) reaches the log.
-        storage
-            .write(&storage_path, compressed_data)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to write compressed logs to {}: {:#}",
-                    storage_path,
-                    e
-                )
-            })?;
-
-        println!("Stored compressed logs at: {}", storage_path);
-    }
-
-    // The marker (when present) survives archival as a sidecar object. Its
-    // absence after archival is itself the signal: terminal task + no
-    // sidecar ⇒ the stream ended without a marker (abnormal end).
-    if let Some(marker) = marker {
-        let sidecar_path = exit_sidecar_path(workflow_id, workflow_instance_id, task_instance_id);
-        let body = serde_json::to_vec(&marker)?;
-        storage.write(&sidecar_path, body).await.map_err(|e| {
-            anyhow!(
-                "Failed to write End-of-stream sidecar to {}: {:#}",
-                sidecar_path,
-                e
-            )
-        })?;
-    }
-
+    };
+    let installation = install_task_logs(storage, workflow_id, workflow_instance_id, &seal).await?;
+    verify_task_log_installation(storage, &installation).await?;
     Ok(true)
 }
 
@@ -272,6 +509,90 @@ pub async fn purge_task_log_subject(
         .filter(&subject)
         .await
         .map_err(|e| anyhow!("failed to purge log subject {}: {}", subject, e))?;
+    Ok(())
+}
+
+/// Purge Accepted Log records while retaining one terminal fence per sealed
+/// pickup generation, so a late writer still observes immutable state.
+pub(crate) async fn purge_sealed_task_logs(
+    nats: &NatsClient,
+    workflow_id: &Uuid,
+    workflow_instance_id: &Uuid,
+    seal: &TaskLogSealIdentity,
+) -> Result<()> {
+    let js = jetstream::new(nats.clone());
+    let stream = js
+        .get_stream(LOG_STREAM_NAME)
+        .await
+        .context("open Log staging stream for sealed purge")?;
+    let subject = log_subject(workflow_id, workflow_instance_id, &seal.task_instance_id);
+    let consumer = stream
+        .create_consumer(pull::Config {
+            filter_subject: subject.clone(),
+            deliver_policy: consumer::DeliverPolicy::All,
+            ack_policy: consumer::AckPolicy::None,
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("create sealed Log purge consumer for {subject}"))?;
+    let expected_terminals = seal
+        .terminal_fences
+        .iter()
+        .map(|fence| (fence.stream.clone(), fence.terminal.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut retained_terminals = BTreeMap::new();
+    loop {
+        let mut fetched = consumer
+            .fetch()
+            .max_messages(500)
+            .expires(Duration::from_millis(500))
+            .messages()
+            .await
+            .with_context(|| format!("fetch sealed Log purge records on {subject}"))?;
+        let mut count = 0_usize;
+        while let Some(message) = fetched.next().await {
+            let message =
+                message.map_err(|error| anyhow!("sealed Log purge on {subject}: {error}"))?;
+            let sequence = message
+                .info()
+                .map_err(|error| anyhow!("read sealed Log sequence on {subject}: {error}"))?
+                .stream_sequence;
+            let record = all_nats::decode_log_record(
+                |name| {
+                    message
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get(name))
+                        .map(|value| value.as_str().to_owned())
+                },
+                &message.payload,
+            )
+            .map_err(anyhow::Error::msg)?;
+            match record {
+                tickr_proto::coord::log_stream::ReplayedLogRecord::Terminal {
+                    stream,
+                    terminal,
+                } => {
+                    if retained_terminals.insert(stream, terminal).is_some() {
+                        bail!("sealed Log staging contains duplicate terminal records");
+                    }
+                }
+                tickr_proto::coord::log_stream::ReplayedLogRecord::Accepted { .. }
+                | tickr_proto::coord::log_stream::ReplayedLogRecord::PreAcceptanceGap(_) => {
+                    stream.delete_message(sequence).await.with_context(|| {
+                        format!("purge Accepted Log or gap at stream sequence {sequence}")
+                    })?;
+                }
+            }
+            count += 1;
+        }
+        if count < 500 {
+            break;
+        }
+    }
+    if retained_terminals != expected_terminals {
+        bail!("retained Log terminal fences do not match immutable seal");
+    }
     Ok(())
 }
 
@@ -318,6 +639,74 @@ mod tests {
         assert!(decoded.is_empty(), "decoded payload must be empty");
     }
 
+    fn sealed_log(bytes: &[u8], gap_last: u64, exit_status: i32) -> TaskLogSeal {
+        use tickr_proto::coord::log_stream::{
+            LogExit, LogRecordIdentity, LogRecordSubmission, PreAcceptanceGap,
+        };
+
+        let identity = LogStreamIdentity {
+            task_instance_id: Uuid::nil(),
+            pickup_generation: 1,
+        };
+        let mut state = LogStreamState::new(identity.clone());
+        state
+            .apply_accepted(LogRecordSubmission::new(
+                LogRecordIdentity {
+                    stream: identity.clone(),
+                    sequence: 0,
+                },
+                bytes.to_vec(),
+            ))
+            .unwrap();
+        state
+            .apply_gap(PreAcceptanceGap {
+                stream: identity.clone(),
+                first_sequence: 1,
+                last_sequence: gap_last,
+                dropped_records: gap_last,
+            })
+            .unwrap();
+        state
+            .apply_terminal(LogTerminal::EndOfStream {
+                exit: LogExit::Status(exit_status),
+            })
+            .unwrap();
+        seal_streams(Uuid::nil(), BTreeMap::from([(identity, state)]))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn immutable_log_seal_covers_records_gaps_frontier_and_terminal() {
+        let unchanged = sealed_log(b"accepted", 1, 0);
+        assert_eq!(unchanged.digest, sealed_log(b"accepted", 1, 0).digest);
+        assert_ne!(unchanged.digest, sealed_log(b"changed", 1, 0).digest);
+        assert_ne!(unchanged.digest, sealed_log(b"accepted", 2, 0).digest);
+        assert_ne!(unchanged.digest, sealed_log(b"accepted", 1, 7).digest);
+
+        let mut terminal_state = LogStreamState::new(LogStreamIdentity {
+            task_instance_id: Uuid::nil(),
+            pickup_generation: 2,
+        });
+        terminal_state
+            .apply_terminal(LogTerminal::AbnormalClosure {
+                committed_frontier: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            terminal_state.apply_accepted(
+                tickr_proto::coord::log_stream::LogRecordSubmission::new(
+                    tickr_proto::coord::log_stream::LogRecordIdentity {
+                        stream: terminal_state.identity().clone(),
+                        sequence: 0,
+                    },
+                    b"late".to_vec(),
+                )
+            ),
+            Err(tickr_proto::coord::log_stream::LogStreamViolation::AppendAfterTerminal)
+        ));
+    }
+
     #[test]
     fn log_subject_matches_staging_layout() {
         let wf = Uuid::nil();
@@ -325,7 +714,7 @@ mod tests {
         let ti = Uuid::nil();
         assert_eq!(
             log_subject(&wf, &wi, &ti),
-            "logs.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"
+            "tickr.all_nats.v2.log_staging.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"
         );
     }
 }

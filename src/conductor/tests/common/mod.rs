@@ -34,6 +34,18 @@ pub struct DbGuard {
     db_name: String,
 }
 
+impl DbGuard {
+    pub fn database_url(&self) -> String {
+        format!(
+            "{}/{}",
+            self.admin_url
+                .strip_suffix("/postgres")
+                .expect("test admin URL ends in /postgres"),
+            self.db_name
+        )
+    }
+}
+
 impl Drop for DbGuard {
     fn drop(&mut self) {
         let admin_url = self.admin_url.clone();

@@ -27,7 +27,10 @@ function response(
       implementation,
     },
     nats_kv: row('nats_kv', over.nats_kv ?? 'healthy'),
-    executors: row('executors', over.executors ?? 'healthy'),
+    executors: {
+      ...row('executors', over.executors ?? 'healthy'),
+      capacity_interpretation: 'observation_only',
+    },
     conductor: row('conductor', over.conductor ?? 'healthy'),
     control_plane: row('control_plane', over.control_plane ?? 'healthy'),
   };
@@ -108,7 +111,12 @@ describe('reduceHealth — 2-consecutive-read debounce', () => {
       ok: true,
       response: {
         ...response(),
-        executors: { status: 'healthy', detail: '4 alive · 2/8 slots', detection_window: 'liveness window 2m' },
+        executors: {
+          status: 'healthy',
+          detail: '4 alive · 2/8 slots',
+          detection_window: 'liveness window 2m',
+          capacity_interpretation: 'observation_only',
+        },
       },
     };
     const s = reduceHealth(first, bumped);

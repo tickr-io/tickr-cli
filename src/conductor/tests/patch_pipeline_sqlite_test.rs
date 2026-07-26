@@ -9,7 +9,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tickr_conductor::build_pipeline::{BuildExecutor, BuildOutcome, TaskBuildJob};
 use tickr_conductor::patch_pipeline::local::{
-    patch_work_notifications, start_local_patch_worker, LocalPatchWorkerConfig,
+    patch_work_notifications, start_local_patch_worker, PatchReconcilerConfig,
 };
 use tickr_conductor::patch_pipeline::{
     correlate_outcome, patch_key, process_patch, redrive_unsettled, OutcomeCorrelation,
@@ -328,7 +328,7 @@ async fn startup_recovers_committed_builds_through_one_finalizer() {
         sender.clone(),
         "startup-worker".to_owned(),
         notifications,
-        LocalPatchWorkerConfig {
+        PatchReconcilerConfig {
             scan_interval: Duration::from_secs(3600),
             build_lease_duration: Duration::from_secs(30),
             lifecycle_lease_duration: Duration::from_secs(30),
@@ -491,7 +491,7 @@ async fn full_and_closed_notifications_cannot_strand_patch_lifecycle() {
         sender.clone(),
         "steady-worker".to_owned(),
         notifications,
-        LocalPatchWorkerConfig {
+        PatchReconcilerConfig {
             scan_interval: Duration::from_millis(25),
             build_lease_duration: Duration::from_secs(1),
             lifecycle_lease_duration: Duration::from_secs(1),

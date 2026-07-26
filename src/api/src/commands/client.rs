@@ -5,10 +5,14 @@
 //! the per-command handler, which forwards the Conductor's `status_code`
 //! verbatim.
 
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::local::{bounded, LocalCommandBus, LocalCommandBusConfig, LocalCommandWriter};
-use async_nats::Client;
+use async_nats::{Client, HeaderMap};
+use async_trait::async_trait;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -16,34 +20,78 @@ use axum::{
 };
 use prost::Message as _;
 
+use tickr_proto::coord::command_bus::{
+    CommandRequestMetadata, CORRELATION_HEADER, DEADLINE_HEADER, DEFAULT_MAX_IN_FLIGHT,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+};
 use tickr_proto::tickr_api::{
     api_command_request, ApiCommandRequest, ApiCommandResponse, CommandErrorCode, PingRequest,
 };
+use uuid::Uuid;
 
 /// The single subject every command kind travels on. Names the
 /// API<->conductor relationship rather than the verb.
-pub const COMMAND_SUBJECT: &str = "tickr.api.commands";
+pub const COMMAND_SUBJECT: &str = tickr_proto::coord::all_nats::COMMAND_SUBJECT;
 
 /// API-side Command bus selected by the resolved formation.
 ///
-/// Both transports carry the same production protobuf envelopes and expose
-/// the same deadline, availability, malformed-reply, and payload-limit
-/// outcomes. Transport internals are not visible to HTTP handlers.
+/// All transports carry the same production protobuf envelopes and expose the
+/// same deadline, availability, malformed-reply, duplicate-correlation, and
+/// payload-limit outcomes. Transport internals are not visible to HTTP
+/// handlers.
 #[derive(Clone)]
-pub enum CommandBus {
+pub struct CommandBus {
+    transport: CommandTransport,
+    correlations: CorrelationTracker,
+}
+
+#[derive(Clone)]
+enum CommandTransport {
     Nats(Client),
     Local(LocalCommandBus),
+    Redis(Arc<dyn RedisCommandRequestClient>),
 }
 
 impl CommandBus {
     pub fn nats(client: Client) -> Self {
-        Self::Nats(client)
+        Self::nats_with_in_flight_limit(
+            client,
+            NonZeroUsize::new(DEFAULT_MAX_IN_FLIGHT).expect("non-zero constant"),
+        )
+    }
+
+    pub async fn connect_nats(url: &str) -> Result<Self, async_nats::ConnectError> {
+        async_nats::connect(url).await.map(Self::nats)
+    }
+
+    /// Construct all-NATS with the admitted in-flight correlation bound.
+    pub fn nats_with_in_flight_limit(client: Client, limit: NonZeroUsize) -> Self {
+        Self {
+            transport: CommandTransport::Nats(client),
+            correlations: CorrelationTracker::new(limit.get()),
+        }
     }
 
     /// Construct the Tickr Lite Command bus and its sole Conductor writer.
     pub fn local(config: LocalCommandBusConfig) -> (Self, LocalCommandWriter) {
+        let correlation_limit = config.capacity.get();
         let (client, writer) = bounded(config);
-        (Self::Local(client), writer)
+        (
+            Self {
+                transport: CommandTransport::Local(client),
+                correlations: CorrelationTracker::new(correlation_limit),
+            },
+            writer,
+        )
+    }
+
+    /// Construct all-Redis with its role-scoped request client and admitted
+    /// live-correlation bound.
+    pub fn redis(client: Arc<dyn RedisCommandRequestClient>, limit: NonZeroUsize) -> Self {
+        Self {
+            transport: CommandTransport::Redis(client),
+            correlations: CorrelationTracker::new(limit.get()),
+        }
     }
 
     pub async fn send(
@@ -51,9 +99,79 @@ impl CommandBus {
         request: ApiCommandRequest,
         deadline: Duration,
     ) -> Result<ApiCommandResponse, BusError> {
-        match self {
-            Self::Nats(client) => send_command(client, request, deadline).await,
-            Self::Local(client) => client.request(request, deadline).await,
+        self.send_with_correlation(request, deadline, Uuid::new_v4())
+            .await
+    }
+
+    /// Send with a caller-supplied correlation for backend-law verification
+    /// and stable retries. A correlation can have only one live request.
+    pub async fn send_with_correlation(
+        &self,
+        request: ApiCommandRequest,
+        deadline: Duration,
+        correlation_id: Uuid,
+    ) -> Result<ApiCommandResponse, BusError> {
+        let _correlation = self.correlations.acquire(correlation_id)?;
+        let metadata = CommandRequestMetadata::new(correlation_id, deadline);
+        match &self.transport {
+            CommandTransport::Nats(client) => send_nats_command(client, request, metadata).await,
+            CommandTransport::Local(client) => client.request(request, metadata).await,
+            CommandTransport::Redis(client) => {
+                let bytes = request.encode_to_vec();
+                let reply = client
+                    .request(bytes, metadata)
+                    .await
+                    .map_err(BusError::from)?;
+                ApiCommandResponse::decode(reply.as_slice()).map_err(|_| BusError::Malformed)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CorrelationTracker {
+    active: Arc<Mutex<HashSet<Uuid>>>,
+    capacity: usize,
+}
+
+impl CorrelationTracker {
+    fn new(capacity: usize) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(HashSet::with_capacity(capacity))),
+            capacity,
+        }
+    }
+
+    fn acquire(&self, correlation_id: Uuid) -> Result<CorrelationGuard, BusError> {
+        let mut active = self.active.lock().map_err(|_| BusError::Unavailable)?;
+        if active.contains(&correlation_id) {
+            return Err(BusError::DuplicateCorrelation);
+        }
+        if active.len() >= self.capacity {
+            return Err(BusError::Unavailable);
+        }
+        active.insert(correlation_id);
+        Ok(CorrelationGuard {
+            active: Arc::clone(&self.active),
+            correlation_id,
+        })
+    }
+}
+
+struct CorrelationGuard {
+    active: Arc<Mutex<HashSet<Uuid>>>,
+    correlation_id: Uuid,
+}
+
+impl Drop for CorrelationGuard {
+    fn drop(&mut self) {
+        match self.active.lock() {
+            Ok(mut active) => {
+                active.remove(&self.correlation_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&self.correlation_id);
+            }
         }
     }
 }
@@ -99,12 +217,44 @@ impl Default for CommandDeadlines {
     }
 }
 
+/// Redis Command-bus request surface. Redis clients, keys, scripts, streams,
+/// consumer groups, durability proof, and quota state remain in the
+/// role-specific adapter.
+#[async_trait]
+pub trait RedisCommandRequestClient: Send + Sync {
+    async fn request(
+        &self,
+        encoded_request: Vec<u8>,
+        metadata: CommandRequestMetadata,
+    ) -> Result<Vec<u8>, RedisCommandRequestError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedisCommandRequestError {
+    Unavailable,
+    Timeout,
+    TooLarge,
+    DuplicateCorrelation,
+}
+
+impl From<RedisCommandRequestError> for BusError {
+    fn from(error: RedisCommandRequestError) -> Self {
+        match error {
+            RedisCommandRequestError::Unavailable => Self::Unavailable,
+            RedisCommandRequestError::Timeout => Self::Timeout,
+            RedisCommandRequestError::TooLarge => Self::TooLarge,
+            RedisCommandRequestError::DuplicateCorrelation => Self::DuplicateCorrelation,
+        }
+    }
+}
+
 /// Transport-level failure of a command round-trip — distinct from a
 /// conductor-returned error, which rides inside a decoded `ApiCommandResponse`
 /// as an `ErrorPayload`.
 #[derive(Debug)]
 pub enum BusError {
-    /// The selected transport or its Conductor responder is unavailable. -> 503.
+    /// The selected transport, its live consumer, or its bounded admission
+    /// capacity is unavailable. -> 503.
     Unavailable,
     /// The conductor didn't reply within the deadline. -> 504.
     Timeout,
@@ -113,20 +263,39 @@ pub enum BusError {
     /// The encoded command exceeded the selected transport's payload limit.
     /// Reachable on register and Patch, which carry raw Nickel source. -> 413.
     TooLarge,
+    /// The correlation already names another live request. -> 409.
+    DuplicateCorrelation,
 }
 
 /// Encode and send one command, awaiting the conductor's reply within
-/// `deadline`. The deadline doubles as the NATS request timeout, so a slow
-/// conductor surfaces as `BusError::Timeout` rather than hanging.
+/// `deadline`. The absolute deadline and correlation travel in NATS headers;
+/// the encoded production request remains unchanged.
 pub async fn send_command(
     nats: &Client,
     request: ApiCommandRequest,
     deadline: Duration,
 ) -> Result<ApiCommandResponse, BusError> {
+    let metadata = CommandRequestMetadata::new(Uuid::new_v4(), deadline);
+    send_nats_command(nats, request, metadata).await
+}
+
+async fn send_nats_command(
+    nats: &Client,
+    request: ApiCommandRequest,
+    metadata: CommandRequestMetadata,
+) -> Result<ApiCommandResponse, BusError> {
     let bytes = request.encode_to_vec();
+    if bytes.len() > DEFAULT_MAX_PAYLOAD_BYTES {
+        return Err(BusError::TooLarge);
+    }
+    let timeout = metadata.remaining().ok_or(BusError::Timeout)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CORRELATION_HEADER, metadata.correlation_id.to_string());
+    headers.insert(DEADLINE_HEADER, metadata.deadline_unix_ms.to_string());
     let req = async_nats::Request::new()
+        .headers(headers)
         .payload(bytes.into())
-        .timeout(Some(deadline));
+        .timeout(Some(timeout));
     match nats.send_request(COMMAND_SUBJECT, req).await {
         Ok(msg) => {
             ApiCommandResponse::decode(msg.payload.as_ref()).map_err(|_| BusError::Malformed)
@@ -134,12 +303,7 @@ pub async fn send_command(
         Err(e) => match e.kind() {
             async_nats::client::RequestErrorKind::NoResponders => Err(BusError::Unavailable),
             async_nats::client::RequestErrorKind::TimedOut => Err(BusError::Timeout),
-            // The command outgrew the broker's max payload (rejected
-            // client-side before it left). -> 413.
             async_nats::client::RequestErrorKind::MaxPayloadExceeded => Err(BusError::TooLarge),
-            // A client/IO-level failure — including an unroutable subject —
-            // means the bus didn't carry the command; surface it as
-            // unavailable rather than a 500.
             async_nats::client::RequestErrorKind::InvalidSubject
             | async_nats::client::RequestErrorKind::Other => Err(BusError::Unavailable),
         },
@@ -192,6 +356,11 @@ pub fn bus_error_response(e: BusError) -> Response {
         BusError::TooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({"error": "command payload too large"})),
+        )
+            .into_response(),
+        BusError::DuplicateCorrelation => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "duplicate command correlation"})),
         )
             .into_response(),
     }

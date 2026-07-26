@@ -53,7 +53,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tickr_migrations::backend::WriterRepositoryBundle;
@@ -66,10 +65,9 @@ use tickr_migrations::patch_repository::{
 pub use tickr_migrations::patch_repository::{PatchProvenance, PatchSourceFormat};
 use tickr_proto::patch as pp;
 use tickr_proto::workflow as wf;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::build_pipeline::{BuildExecutor, BuildOutcome, TaskBuildJob};
+use crate::build_pipeline::BuildOutcome;
 use crate::parser::builder::project_gate_proto;
 use crate::parser::types::{ParsedGate, ParsedInputBinding, ParsedTask};
 
@@ -1248,10 +1246,9 @@ fn row_from_repository(row: tickr_migrations::patch_repository::PatchLifecycleRo
     }
 }
 
-/// One build-job-per-new-task message for build-at-patch, mirroring
-/// registration's `TaskBuildJob` keyed by `patch_key` instead of
-/// `(workflow_id, version)`. Published after the ingress transaction commits;
-/// patch build workers consume the queue with NATS queue-group semantics.
+/// Advisory per-Task Patch-build pointer. Publishers retain the existing
+/// payload, but workers reconstruct executable work from committed Patch rows;
+/// delivery loss, duplication, delay, or reordering changes scan latency only.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatchTaskBuildJob {
     pub patch_key: Uuid,
@@ -1260,21 +1257,18 @@ pub struct PatchTaskBuildJob {
     pub nix_expression_path: String,
 }
 
-/// NATS subject / queue group for patch-keyed per-task build jobs. A
-/// dedicated subject (not registration's `conductor_build_queue`) because the
-/// finalizer discipline differs: the last-one-out flip lands on the patch
-/// lifecycle row and ships the apply/abandon envelope, not the workflow row
-/// and the submission queue.
-pub const PATCH_BUILD_QUEUE_SUBJECT: &str = "conductor_patch_build_queue";
-pub const PATCH_BUILD_QUEUE_GROUP: &str = "conductor-patch-build-workers";
+/// NATS subject / queue group for advisory Patch-build notifications. The
+/// dedicated subject remains separate from registration because Patch and
+/// definition rows have different parent finalizers.
+pub const PATCH_BUILD_QUEUE_SUBJECT: &str = tickr_proto::coord::all_nats::PATCH_BUILD_QUEUE_SUBJECT;
+pub const PATCH_BUILD_QUEUE_GROUP: &str = tickr_proto::coord::all_nats::PATCH_BUILD_QUEUE_GROUP;
 
 /// Ingress verdict for one Patch request.
 #[derive(Debug)]
 pub enum PatchIngress {
-    /// Row open, relay under way (or queued for re-drive). Poll the row.
-    /// `build_jobs` is non-empty when the Patch introduces new tasks: the row
-    /// sits at `Building` and the caller must publish the jobs onto the patch
-    /// build queue after this returns (publish-after-commit ordering).
+    /// Row open, relay under way (or eligible for durable reconciliation).
+    /// `build_jobs` is non-empty when the Patch introduces new tasks; publishing
+    /// those pointers after commit requests an earlier authoritative scan.
     Accepted {
         patch_id: Uuid,
         patch_key: Uuid,
@@ -1396,10 +1390,9 @@ pub async fn process_patch(
     })
 }
 
-/// Publish patch build jobs onto the patch build queue. Called after the
-/// ingress transaction committed (publish-after-commit ordering). A publish
-/// failure leaves the row at `Building` — loud, pollable, and terminal only
-/// via operator resubmission; the stall-TTL backstop resumes the instance.
+/// Publish advisory Patch-build notifications after the ingress transaction
+/// commits. A publish failure affects latency only because workers continuously
+/// scan the authoritative Patch rows.
 pub async fn publish_patch_build_jobs(
     nats: &async_nats::Client,
     jobs: &[PatchTaskBuildJob],
@@ -1454,76 +1447,6 @@ pub async fn finalize_patch_after_build(
     }
 
     Ok(settlement)
-}
-
-/// One patch-build job: build via the injected executor (the same
-/// `BuildExecutor` seam registration uses — a `TaskBuildJob` shell carries
-/// the patch identity in `workflow_id` purely for the executor's logs),
-/// settle the per-task result, and run the aggregate finalizer.
-async fn process_patch_build_job(
-    repositories: &WriterRepositoryBundle,
-    executor: &dyn BuildExecutor,
-    sender: &dyn PatchRelaySender,
-    msg: async_nats::Message,
-) {
-    let job: PatchTaskBuildJob = match bincode::deserialize(&msg.payload) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("patch build worker: malformed PatchTaskBuildJob: {e}");
-            return;
-        }
-    };
-    let build_input = TaskBuildJob {
-        workflow_id: job.patch_key,
-        workflow_version: 0,
-        task_id: job.task_id,
-        nix_expression_path: job.nix_expression_path,
-    };
-    let outcome = executor.build(&build_input).await;
-    if let Err(error) =
-        finalize_patch_after_build(repositories, sender, job.patch_key, job.task_id, &outcome).await
-    {
-        eprintln!(
-            "patch build worker: settlement failed for {}/{}: {error}",
-            job.patch_key, job.task_id
-        );
-    }
-}
-
-/// Patch build worker: queue-group consumer over the patch build queue, the
-/// patch-keyed sibling of registration's `start_build_worker`. Runs until
-/// the cancellation token fires.
-pub async fn start_patch_build_worker(
-    nats: async_nats::Client,
-    repositories: Arc<WriterRepositoryBundle>,
-    executor: Arc<dyn BuildExecutor>,
-    sender: Arc<dyn PatchRelaySender>,
-    cancel: CancellationToken,
-) -> Result<()> {
-    use futures::StreamExt;
-    println!(
-        "Starting conductor patch build worker on {}",
-        PATCH_BUILD_QUEUE_SUBJECT
-    );
-    let mut sub = nats
-        .queue_subscribe(PATCH_BUILD_QUEUE_SUBJECT, PATCH_BUILD_QUEUE_GROUP.into())
-        .await?;
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                println!("Patch build worker received shutdown signal.");
-                break;
-            }
-            Some(msg) = sub.next() => {
-                process_patch_build_job(&repositories, executor.as_ref(), sender.as_ref(), msg).await;
-            }
-            else => {
-                println!("Patch build queue subscription ended.");
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Rebuild the single validate+apply relay envelope for a decoded repository
@@ -1638,30 +1561,6 @@ pub async fn redrive_unsettled(
         }
     }
     Ok(sent)
-}
-
-/// The steady-state re-drive loop: every `REDRIVE_INTERVAL`, re-send
-/// unsettled rows older than `REDRIVE_MIN_AGE` until shutdown.
-pub async fn run_patch_redrive(
-    repositories: Arc<WriterRepositoryBundle>,
-    sender: Arc<dyn PatchRelaySender>,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                println!("patch re-drive: shutdown signal received");
-                return;
-            }
-            _ = tokio::time::sleep(REDRIVE_INTERVAL) => {
-                match redrive_unsettled(&repositories, sender.as_ref(), REDRIVE_MIN_AGE).await {
-                    Ok(0) => {}
-                    Ok(n) => println!("patch re-drive: re-sent {n} unsettled patch(es)"),
-                    Err(e) => eprintln!("patch re-drive pass failed: {e}"),
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

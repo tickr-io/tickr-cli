@@ -7,8 +7,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tickr::data_directory::{DataDirectory, RootRelativePath};
 use tickr::local_log_staging::{
-    AcceptOutcome, LocalLogStagingStream, LogExit, LogRecordIdentity, LogStreamIdentity,
-    ReplayedLogRecord,
+    content_digest, AcceptOutcome, LocalLogStagingStream, LogExit, LogRecordIdentity,
+    LogRecordSubmission, LogStreamIdentity, LogTerminal, PreAcceptanceGap, ReplayedLogRecord,
+    TerminalOutcome,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -35,6 +36,36 @@ fn record(stream: &LogStreamIdentity, sequence: u64) -> LogRecordIdentity {
     }
 }
 
+fn submission(
+    stream: &LogStreamIdentity,
+    sequence: u64,
+    bytes: impl Into<Vec<u8>>,
+) -> LogRecordSubmission {
+    LogRecordSubmission::new(record(stream, sequence), bytes.into())
+}
+
+fn accepted(
+    stream: &LogStreamIdentity,
+    sequence: u64,
+    bytes: impl Into<Vec<u8>>,
+) -> ReplayedLogRecord {
+    let bytes = bytes.into();
+    ReplayedLogRecord::Accepted {
+        identity: record(stream, sequence),
+        content_digest: content_digest(&bytes),
+        bytes,
+    }
+}
+
+fn gap(stream: &LogStreamIdentity, first: u64, last: u64) -> PreAcceptanceGap {
+    PreAcceptanceGap {
+        stream: stream.clone(),
+        first_sequence: first,
+        last_sequence: last,
+        dropped_records: last - first + 1,
+    }
+}
+
 #[test]
 fn synced_acceptance_survives_ambiguous_retry_and_restart() -> Result<()> {
     let (_temporary, data_directory) = admitted_data_directory()?;
@@ -42,25 +73,22 @@ fn synced_acceptance_survives_ambiguous_retry_and_restart() -> Result<()> {
     let mut stream = LocalLogStagingStream::open(&data_directory, identity.clone())?;
 
     assert_eq!(
-        stream.accept(record(&identity, 0), b"durable payload".to_vec())?,
+        stream.accept(submission(&identity, 0, b"durable payload".to_vec()))?,
         AcceptOutcome::Accepted
     );
     drop(stream);
 
     let mut recovered = LocalLogStagingStream::open(&data_directory, identity.clone())?;
     assert_eq!(
-        recovered.accept(record(&identity, 0), b"durable payload".to_vec())?,
+        recovered.accept(submission(&identity, 0, b"durable payload".to_vec()))?,
         AcceptOutcome::AlreadyAccepted
     );
     assert_eq!(
         recovered.replay(),
-        vec![ReplayedLogRecord::Accepted {
-            identity: record(&identity, 0),
-            bytes: b"durable payload".to_vec(),
-        }]
+        vec![accepted(&identity, 0, b"durable payload".to_vec())]
     );
     assert!(recovered
-        .accept(record(&identity, 0), b"different bytes".to_vec())
+        .accept(submission(&identity, 0, b"different bytes".to_vec()))
         .is_err());
     Ok(())
 }
@@ -71,28 +99,25 @@ fn committed_frontier_replays_only_contiguous_accepted_and_gap_records() -> Resu
     let identity = stream_identity();
     let mut stream = LocalLogStagingStream::open(&data_directory, identity.clone())?;
 
-    stream.accept(record(&identity, 2), b"third".to_vec())?;
+    stream.accept(LogRecordSubmission::new(
+        record(&identity, 2),
+        b"third".to_vec(),
+    ))?;
     assert_eq!(stream.committed_frontier(), None);
     assert!(stream.replay().is_empty());
 
-    stream.declare_pre_acceptance_gap(0, 1, 2)?;
+    stream.declare_pre_acceptance_gap(gap(&identity, 0, 1))?;
     assert_eq!(stream.committed_frontier(), Some(2));
     assert_eq!(
         stream.replay(),
         vec![
-            ReplayedLogRecord::PreAcceptanceGap {
-                stream: identity.clone(),
-                first_sequence: 0,
-                last_sequence: 1,
-                dropped_records: 2,
-            },
-            ReplayedLogRecord::Accepted {
-                identity: record(&identity, 2),
-                bytes: b"third".to_vec(),
-            },
+            ReplayedLogRecord::PreAcceptanceGap(gap(&identity, 0, 1)),
+            accepted(&identity, 2, b"third".to_vec()),
         ]
     );
-    assert!(stream.declare_pre_acceptance_gap(2, 2, 1).is_err());
+    assert!(stream
+        .declare_pre_acceptance_gap(gap(&identity, 2, 2))
+        .is_err());
     Ok(())
 }
 
@@ -101,31 +126,52 @@ fn recovery_preserves_clean_end_or_records_abnormal_closure() -> Result<()> {
     let (_temporary, data_directory) = admitted_data_directory()?;
     let abnormal_identity = stream_identity();
     let mut abnormal = LocalLogStagingStream::open(&data_directory, abnormal_identity.clone())?;
-    abnormal.accept(record(&abnormal_identity, 0), b"before crash".to_vec())?;
+    abnormal.accept(LogRecordSubmission::new(
+        record(&abnormal_identity, 0),
+        b"before crash".to_vec(),
+    ))?;
     drop(abnormal);
 
     let mut recovered = LocalLogStagingStream::open(&data_directory, abnormal_identity.clone())?;
-    assert!(recovered.recover_abnormal_closure()?);
-    assert!(!recovered.recover_abnormal_closure()?);
+    assert_eq!(
+        recovered.recover_abnormal_closure()?,
+        TerminalOutcome::Recorded
+    );
+    assert_eq!(
+        recovered.recover_abnormal_closure()?,
+        TerminalOutcome::AlreadyRecorded
+    );
     assert!(matches!(
         recovered.replay().last(),
-        Some(ReplayedLogRecord::AbnormalClosure {
-            committed_frontier: Some(0)
+        Some(ReplayedLogRecord::Terminal {
+            terminal: LogTerminal::AbnormalClosure {
+                committed_frontier: Some(0)
+            },
+            ..
         })
     ));
 
     let clean_identity = stream_identity();
     let mut clean = LocalLogStagingStream::open(&data_directory, clean_identity.clone())?;
-    clean.accept(record(&clean_identity, 0), b"complete".to_vec())?;
+    clean.accept(LogRecordSubmission::new(
+        record(&clean_identity, 0),
+        b"complete".to_vec(),
+    ))?;
     clean.finish_cleanly(LogExit::Status(0))?;
     drop(clean);
 
     let mut clean_recovered = LocalLogStagingStream::open(&data_directory, clean_identity)?;
-    assert!(!clean_recovered.recover_abnormal_closure()?);
+    assert_eq!(
+        clean_recovered.recover_abnormal_closure()?,
+        TerminalOutcome::AlreadyRecorded
+    );
     assert!(matches!(
         clean_recovered.replay().last(),
-        Some(ReplayedLogRecord::EndOfStream {
-            exit: LogExit::Status(0)
+        Some(ReplayedLogRecord::Terminal {
+            terminal: LogTerminal::EndOfStream {
+                exit: LogExit::Status(0)
+            },
+            ..
         })
     ));
     Ok(())
@@ -136,7 +182,10 @@ fn restart_discards_only_an_incomplete_unaccepted_append_tail() -> Result<()> {
     let (temporary, data_directory) = admitted_data_directory()?;
     let identity = stream_identity();
     let mut stream = LocalLogStagingStream::open(&data_directory, identity.clone())?;
-    stream.accept(record(&identity, 0), b"safe".to_vec())?;
+    stream.accept(LogRecordSubmission::new(
+        record(&identity, 0),
+        b"safe".to_vec(),
+    ))?;
     drop(stream);
 
     let journal = temporary.path().join(format!(
@@ -151,10 +200,7 @@ fn restart_discards_only_an_incomplete_unaccepted_append_tail() -> Result<()> {
     let recovered = LocalLogStagingStream::open(&data_directory, identity.clone())?;
     assert_eq!(
         recovered.replay(),
-        vec![ReplayedLogRecord::Accepted {
-            identity: record(&identity, 0),
-            bytes: b"safe".to_vec(),
-        }]
+        vec![accepted(&identity, 0, b"safe".to_vec())]
     );
     Ok(())
 }
@@ -182,7 +228,10 @@ async fn real_child_stdout_drains_concurrently_and_completion_precedes_publicati
             drain_stream
                 .lock()
                 .expect("log stream lock is not poisoned")
-                .accept(record(&drain_identity, sequence), line.into_bytes())?;
+                .accept(LogRecordSubmission::new(
+                    record(&drain_identity, sequence),
+                    line.into_bytes(),
+                ))?;
             sequence += 1;
             // Publication remains asynchronous to process completion. This
             // deliberately keeps the drain alive after the tiny child exits.
@@ -214,9 +263,15 @@ fn sealing_and_final_installation_survive_retries_and_detect_corruption() -> Res
     let (temporary, data_directory) = admitted_data_directory()?;
     let identity = stream_identity();
     let mut stream = LocalLogStagingStream::open(&data_directory, identity.clone())?;
-    stream.accept(record(&identity, 0), b"first".to_vec())?;
-    stream.accept(record(&identity, 2), b"third".to_vec())?;
-    stream.declare_pre_acceptance_gap(1, 1, 1)?;
+    stream.accept(LogRecordSubmission::new(
+        record(&identity, 0),
+        b"first".to_vec(),
+    ))?;
+    stream.accept(LogRecordSubmission::new(
+        record(&identity, 2),
+        b"third".to_vec(),
+    ))?;
+    stream.declare_pre_acceptance_gap(gap(&identity, 1, 1))?;
     stream.finish_cleanly(LogExit::Status(0))?;
     let seal = stream.seal()?;
     assert_eq!(

@@ -35,8 +35,9 @@ use tickr_api::commands::client::CommandBus;
 use tickr_api::commands::local::LocalCommandBusConfig;
 use tickr_api::http::coordinator_client::CoordinatorClient;
 use tickr_api::http::health::{
-    api_self, build_health_report, check_conductor, check_control_plane, check_data_plane_sql,
-    check_executors, check_nats_kv, ComponentStatus, DataPlaneSqlImplementation,
+    api_self, build_health_report, build_health_report_with_fleet_status, check_conductor,
+    check_control_plane, check_data_plane_sql, check_executor_fleet_observations, check_executors,
+    check_nats_kv, ComponentStatus, DataPlaneSqlImplementation, ExecutorCapacityInterpretation,
     HealthCoordinationRole, HealthFinalLogStore, HealthFormationProfile, HealthFormationTopology,
     HealthProtocolIdentity, HealthResolvedRole, HealthRoleImplementation, HealthSubstrateSelection,
     HealthWriterTopology, ResolvedFormationHealth,
@@ -44,7 +45,9 @@ use tickr_api::http::health::{
 use tickr_api::http::logs_resolver::{
     LocalTaskLogStore, LogBatchPage, LogsError, LogsResolver, TaskLogs,
 };
-use tickr_executor::local_pickup::LocalExecutorFleetStatus;
+use tickr_executor::local_pickup::{
+    ExecutorCapacityObservation, ExecutorFleetSnapshot, LocalExecutorCapacity,
+};
 use tickr_migrations::backend::{ReadOnlyRepositoryBundle, RepositoryFactory};
 use tickr_migrations::{apply_sqlite, apply_target, sqlite_writer_options, MigrationTarget};
 use tickr_proto::config::DataPlaneSql;
@@ -63,6 +66,48 @@ use uuid::Uuid;
 async fn api_self_row_is_always_healthy() {
     // Reaching the handler is the whole claim: the row is a constant healthy.
     assert_eq!(api_self().status, ComponentStatus::Healthy);
+}
+
+#[test]
+fn expiring_executor_observations_report_freshness_without_capacity_guarantees() {
+    let snapshot = ExecutorFleetSnapshot {
+        server_time_millis: 1_000,
+        observation_ttl_millis: 100,
+        observations: vec![
+            ExecutorCapacityObservation {
+                executor_id: Uuid::new_v4(),
+                reporter_id: Uuid::new_v4(),
+                sequence: 2,
+                configured_process_slots: 4,
+                in_flight_count: 5,
+                observed_at_server_millis: 990,
+                expires_at_server_millis: 1_090,
+            },
+            ExecutorCapacityObservation {
+                executor_id: Uuid::new_v4(),
+                reporter_id: Uuid::new_v4(),
+                sequence: 1,
+                configured_process_slots: 8,
+                in_flight_count: 3,
+                observed_at_server_millis: 900,
+                expires_at_server_millis: 999,
+            },
+        ],
+    };
+
+    let health = check_executor_fleet_observations(&snapshot);
+    assert_eq!(health.status, ComponentStatus::Healthy);
+    assert_eq!(
+        health.capacity_interpretation,
+        ExecutorCapacityInterpretation::ObservationOnly
+    );
+    assert_eq!(health.observed_executors, Some(1));
+    assert_eq!(health.configured_process_slots, Some(4));
+    assert_eq!(health.in_flight_count, Some(5));
+    assert_eq!(health.freshest_observation_age_ms, Some(10));
+    assert_eq!(health.oldest_observation_age_ms, Some(10));
+    assert_eq!(health.observation_ttl_ms, Some(100));
+    assert!(health.detail.contains("not guaranteed available capacity"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,7 +162,7 @@ async fn nats_kv_unreachable_row_is_unhealthy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executors_unreachable_row_is_unhealthy_zero_fleet() {
     // No reachable NATS ⇒ no executor key can be observed ⇒ the pool row reads
-    // zero-fleet unhealthy, with the "0 alive · 0/0 slots" detail. The read never
+    // zero-fleet unhealthy with explicit observational wording. The read never
     // scans the task-liveness bucket or a cached table — it can only see this one.
     let client = async_nats::ConnectOptions::new()
         .request_timeout(Some(Duration::from_secs(1)))
@@ -132,7 +177,10 @@ async fn executors_unreachable_row_is_unhealthy_zero_fleet() {
         "no observable executor ⇒ unhealthy, got detail: {}",
         row.detail
     );
-    assert_eq!(row.detail, "0 alive · 0/0 slots");
+    assert_eq!(
+        row.detail,
+        "0 observed executors · observed load 0/0 configured slots"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -281,6 +329,59 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_redis_capability_projection_is_exposed_verbatim_and_secret_free() {
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(50))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+        .expect("lazy pool builds");
+    let repositories =
+        tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
+    let (command_bus, _writer) = CommandBus::local(LocalCommandBusConfig::default());
+    let coordinator = CoordinatorClient::new("http://127.0.0.1:1".to_owned());
+    let fleet =
+        LocalExecutorCapacity::new(Uuid::new_v4(), NonZeroUsize::new(1).unwrap()).observation();
+    let projection = serde_json::json!({
+        "capability_fingerprint": "sha256:admitted",
+        "profile": "all-redis",
+        "redis_implementation": "redis_oss",
+        "redis_version": "7.4.2",
+        "topology_class": "single_writable_primary",
+        "role_protocols": [{"role": "command_bus", "protocol": {"name": "tickr.redis.command-bus", "version": 1}}],
+        "operation_manifests": [{"role": "command_bus", "identity": "sha256:manifest"}],
+        "durability_class": "one local-primary AOF fsync, zero required replica acknowledgements",
+        "normalized_limits": [{"role": "command_bus", "limits": {"max-memory-bytes": 1024}}],
+        "capacity": {"configured_memory_bytes": 4096, "used_memory_bytes": 512},
+        "quota_state": [{"role": "command_bus", "state": {"used": 1, "soft_threshold": 8, "hard_limit": 10, "accepted_identities": 1, "pressure": "normal"}}],
+        "fence": {"state": "open", "generation": 1, "ready": true},
+        "last_capability_failure": null
+    });
+
+    let report = build_health_report_with_fleet_status(
+        &repositories,
+        None,
+        &command_bus,
+        &coordinator,
+        &fleet,
+        Duration::from_millis(10),
+        Some(projection.clone()),
+    )
+    .await;
+    let serialized = serde_json::to_value(report).expect("Health serializes");
+    assert_eq!(serialized["redis_capability"], projection);
+    let text = serialized["redis_capability"].to_string();
+    for forbidden in [
+        "endpoint",
+        "username",
+        "password",
+        "query",
+        "trust_root",
+        "certificate",
+    ] {
+        assert!(!text.contains(forbidden), "projection leaked {forbidden}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Docker-gated: reachable components report healthy, and the wired route serves
 // the typed report fresh per request.
@@ -425,7 +526,10 @@ async fn spawn_api(nats: async_nats::Client, pool: Arc<sqlx::PgPool>) -> String 
     let minio = opendal::Operator::new(s3).expect("s3 stub").finish();
     let logs = Arc::new(tickr_api::http::logs_resolver::LogsResolver::new(
         minio,
-        nats.clone(),
+        Arc::new(tickr_executor::log_stream::AllNatsLogStreamProvider::new(
+            Arc::new(nats.clone()),
+            Duration::from_secs(5),
+        )),
     ));
     let state = tickr_api::http::routes::build_app_state(
         Arc::new(nats),
@@ -473,10 +577,13 @@ async fn endpoint_serves_typed_report_fresh_per_request() {
     assert_eq!(first["data_plane_sql"]["implementation"], "postgres");
     assert_eq!(first["data_plane_sql"]["status"], "healthy");
     assert!(first.get("postgres").is_none());
-    // No executor keys are seeded here, so the pool row is zero-fleet unhealthy —
-    // present in the typed report with its detail, proving the wired field exists.
+    // No executor observations are present, so the role-backed projection is
+    // zero-fleet unhealthy and makes no available-capacity claim.
     assert_eq!(first["executors"]["status"], "unhealthy");
-    assert_eq!(first["executors"]["detail"], "0 alive · 0/0 slots");
+    assert_eq!(
+        first["executors"]["detail"],
+        "0 observed executors · no guaranteed available capacity"
+    );
     // The coordinator stub points at a dead address, so the single control-plane
     // hop fails ⇒ that row is unhealthy — present in the typed report, proving
     // the wired field exists and that coordinator-unreachable ⇒ unhealthy end-to-end.
@@ -645,9 +752,42 @@ async fn executor_pool_counts_alive_and_sums_slots() {
         row.detail
     );
     // N=3 alive; used = 1+3+0 = 4; total = 4+8+2 = 14.
-    assert_eq!(row.detail, "3 alive · 4/14 slots");
+    assert_eq!(
+        row.detail,
+        "3 observed executors · observed load 4/14 configured slots"
+    );
     // The detection window is derived from the liveness knob (40s here).
     assert_eq!(row.detection_window, "liveness window 40s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_pool_keeps_contradictory_capacity_observational() {
+    let Some((_nats, nats)) = start_nats_ttl().await else {
+        return;
+    };
+    let store = ensure_component_bucket(&nats).await;
+    let ttl = Duration::from_secs(40);
+    seed_executor_key(&nats, usize::MAX, usize::MAX, ttl).await;
+    seed_executor_key(&nats, 0, usize::MAX, ttl).await;
+    for _ in 0..50 {
+        if executor_key_count(&store).await == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let row = check_executors(&nats, ttl).await;
+    assert_eq!(row.status, ComponentStatus::Healthy);
+    assert_eq!(row.observed_executors, Some(2));
+    assert_eq!(row.configured_process_slots, Some(usize::MAX));
+    assert_eq!(row.in_flight_count, Some(usize::MAX));
+    assert_eq!(
+        row.detail,
+        format!(
+            "2 observed executors · observed load {0}/{0} configured slots",
+            usize::MAX
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -704,7 +844,10 @@ async fn executor_pool_zero_fleet_is_unhealthy() {
     // Empty bucket ⇒ zero fleet ⇒ unhealthy.
     let empty = check_executors(&nats, Duration::from_secs(8)).await;
     assert_eq!(empty.status, ComponentStatus::Unhealthy);
-    assert_eq!(empty.detail, "0 alive · 0/0 slots");
+    assert_eq!(
+        empty.detail,
+        "0 observed executors · observed load 0/0 configured slots"
+    );
 
     // Seed a short-TTL key, then let it expire (self-reaping): the row returns to
     // unhealthy with no reaper, proving an expired key is simply not counted.
@@ -724,7 +867,10 @@ async fn executor_pool_zero_fleet_is_unhealthy() {
         "all executor keys expired ⇒ unhealthy, got detail: {}",
         expired.detail
     );
-    assert_eq!(expired.detail, "0 alive · 0/0 slots");
+    assert_eq!(
+        expired.detail,
+        "0 observed executors · observed load 0/0 configured slots"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +898,13 @@ async fn spawn_command_consumer(nats: &async_nats::Client) -> CancellationToken 
     let state = tickr_conductor::api_commands_consumer::ApiCommandsState {
         definition_repository,
         nats: nats.clone(),
+        signal_applied_notifications:
+            tickr_conductor::signal_applied_notifier::all_nats_signal_applied_notifications(
+                nats.clone(),
+            )
+            .await
+            .unwrap()
+            .reconciliation(),
         relay_sender: Arc::new(tickr_conductor::wakeup_translator::DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),
         gate_index: tickr_conductor::gate_index_lifecycle::gate_index(),
@@ -1009,10 +1162,11 @@ async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_s
         },
     ));
     let ready = Arc::new(AtomicBool::new(false));
-    let fleet = LocalExecutorFleetStatus::new(
+    let fleet = LocalExecutorCapacity::new(
         Uuid::new_v4(),
         NonZeroUsize::new(4).expect("non-zero test capacity"),
-    );
+    )
+    .observation();
     let state = tickr_api::http::routes::build_lite_app_state(
         command_bus,
         Arc::new(repositories),

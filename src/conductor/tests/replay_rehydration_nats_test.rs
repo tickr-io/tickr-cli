@@ -81,9 +81,11 @@ fn task_envelope(task_id: Uuid, value: &str) -> serde_json::Value {
 }
 
 fn dump_entry(run: Uuid, name: &str, envelope: serde_json::Value) -> ArchivedCtxEntry {
+    let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
     ArchivedCtxEntry {
         key: format!("{}/{}", sanitize_segment(&run.to_string()), name),
         envelope,
+        envelope_bytes,
     }
 }
 
@@ -145,7 +147,7 @@ async fn carried_keys_land_verbatim_and_sentinel_is_the_final_act() {
 
     let js = jetstream::new(nats.clone());
     let kv = js
-        .get_key_value("ctx-default")
+        .get_key_value(tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET)
         .await
         .expect("ctx bucket exists after apply");
     let prefix = sanitize_segment(&replay_run.to_string());

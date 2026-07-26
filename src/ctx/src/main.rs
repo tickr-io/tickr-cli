@@ -8,12 +8,9 @@
 //!
 //! See `research/inter-task-comms/synthesis.md` and `notes/secrets-handling-idea.md`.
 
-mod ambient;
 mod cli;
-mod envelope;
-mod local;
-mod scope;
-mod store;
+
+pub use tickr_ctx::{ambient, envelope, local, nats_scope, scope, store};
 
 use clap::Parser;
 

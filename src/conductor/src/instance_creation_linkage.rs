@@ -72,7 +72,7 @@ pub async fn link_and_rehydrate(
     //    so a startup-ordering quirk (handler ran first or not at all)
     //    doesn't leave the rehydration loop unable to find the bucket.
     let js = jetstream::new(nats.clone());
-    let bucket_name = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket_name = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv = match js.get_key_value(&bucket_name).await {
         Ok(kv) => kv,
         Err(_) => js

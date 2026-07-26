@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_nats::Client as NatsClient;
 use chrono::{DateTime, Utc};
@@ -207,7 +208,10 @@ async fn spawn_api(nats: NatsClient, harness: &BackendHarness, coordinator_url: 
     let minio = opendal::Operator::new(s3).unwrap().finish();
     let logs = Arc::new(tickr_api::http::logs_resolver::LogsResolver::new(
         minio,
-        nats.clone(),
+        Arc::new(tickr_executor::log_stream::AllNatsLogStreamProvider::new(
+            Arc::new(nats.clone()),
+            Duration::from_secs(5),
+        )),
     ));
     let state = tickr_api::http::routes::build_app_state(
         Arc::new(nats),

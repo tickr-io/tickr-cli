@@ -1,8 +1,8 @@
 //! End-to-end test for the cancel routes over the command bus: the canonical
 //! `POST /api/signals/cancel` plus the two path-encoded sugar routes. Stands up
-//! a real conductor subscriber, emulates the server's `SignalApplied`
-//! relay-back for ByTag fan-out, and asserts status + body match the
-//! conductor's HTTP handler across every outcome.
+//! a real conductor subscriber, emulates durable server materialization, and
+//! asserts status + body match the conductor's HTTP handler across every
+//! outcome.
 //!
 //! Requires Docker (testcontainers Postgres + NATS). Skipped automatically
 //! when unavailable.
@@ -20,7 +20,7 @@ use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
-use tickr_proto::codec::signal::{cancel_instance_target, decode_signal, encode_signal_applied};
+use tickr_proto::codec::signal::{cancel_instance_target, decode_signal};
 use tickr_proto::signal as sp;
 use tickr_proto::{ConductorRelayMessage, EntityType};
 use tokio::sync::mpsc;
@@ -108,6 +108,13 @@ async fn spawn_subscriber(
     let state = ApiCommandsState {
         definition_repository,
         nats: nats.clone(),
+        signal_applied_notifications:
+            tickr_conductor::signal_applied_notifier::all_nats_signal_applied_notifications(
+                nats.clone(),
+            )
+            .await
+            .unwrap()
+            .reconciliation(),
         relay_sender: Arc::new(DefaultRelaySender),
         patch_relay_sender: Arc::new(tickr_conductor::patch_pipeline::DefaultPatchRelaySender),
         gate_index: gate_index(),
@@ -133,7 +140,10 @@ async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
     let minio = opendal::Operator::new(s3).expect("s3 stub").finish();
     let logs = Arc::new(tickr_api::http::logs_resolver::LogsResolver::new(
         minio,
-        nats.clone(),
+        Arc::new(tickr_executor::log_stream::AllNatsLogStreamProvider::new(
+            Arc::new(nats.clone()),
+            Duration::from_secs(5),
+        )),
     ));
     let state = tickr_api::http::routes::build_app_state(
         Arc::new(nats),
@@ -221,7 +231,7 @@ async fn instance_cancel_returns_applied_true() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bytag_cancel_resolves_to_matched_count() {
+async fn bytag_cancel_reconciles_durable_state_without_notification() {
     let Some((_pg, pool)) = start_postgres().await else {
         return;
     };
@@ -231,28 +241,25 @@ async fn bytag_cancel_resolves_to_matched_count() {
     let pool = Arc::new(pool);
     let (_cancel, mut rx) = spawn_subscriber(nats.clone(), Arc::clone(&pool), true).await;
     let mut rx = rx.take().expect("relay rx");
-    // Keep a NATS handle for the emulator; spawn_api takes ownership of `nats`.
-    let publisher = nats.clone();
+    let materialization_repository =
+        tickr_migrations::backend::WriterRepositoryBundle::from_postgres_pool(
+            pool.as_ref().clone(),
+        );
     let base = spawn_api(nats, pool).await;
     let client = reqwest::Client::new();
 
-    // Emulate the conductor that receives the server's SignalApplied relay-back:
-    // read the forwarded ByTag cancel, then publish SignalApplied(3) onto the
-    // `signal_applied.<signal_id>` tenant subject the waiter subscribed to.
+    // Persist server-authored materialization but suppress the transient NATS
+    // notification entirely. The API must converge through bounded SQL reads.
     let emulate = tokio::spawn(async move {
         let signal = next_signal(&mut rx).await;
-        let subject = tickr_conductor::cancel_pipeline::signal_applied_subject(
-            Uuid::parse_str(&signal.signal_id).expect("published signal id is UUID"),
-        );
-        let payload = encode_signal_applied(&sp::SignalApplied {
-            signal_id: signal.signal_id,
-            matched_count: 3,
-        });
-        publisher
-            .publish(subject, payload.into())
-            .await
-            .expect("publish relay-back");
-        publisher.flush().await.expect("flush relay-back");
+        let signal_id = Uuid::parse_str(&signal.signal_id).expect("published signal id is UUID");
+        assert!(tickr_conductor::signal_cancels::materialize(
+            &materialization_repository,
+            signal_id,
+            3,
+        )
+        .await
+        .expect("persist Signal materialization"));
     });
     let resp = client
         .post(format!("{}/api/signals/cancel", base))
@@ -281,10 +288,9 @@ async fn bytag_cancel_timeout_returns_503_with_signal_id() {
     let base = spawn_api(nats, pool).await;
     let client = reqwest::Client::new();
 
-    // No conductor publishes the SignalApplied relay-back onto the tenant
-    // subject — as if the conductor that would relay the apply in had died.
-    // Read the forwarded signal (so the request proceeds to the wait) and then
-    // let the deadline elapse, surfacing the 503 the caller retries against.
+    // No durable Signal materialization is recorded. Draining the forwarded
+    // Signal without publishing a notification proves the deadline is owned
+    // by bounded durable-state reconciliation rather than the transient path.
     let killer = tokio::spawn(async move {
         let signal = next_signal(&mut rx).await;
         signal.signal_id

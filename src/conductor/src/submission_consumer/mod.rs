@@ -1,32 +1,30 @@
 //! Conductor-to-server definition submission.
 //!
-//! Distributed formations retain the NATS pointer queue and queue-group
-//! consumer. Tickr Lite instead leases committed `Ready` lifecycle rows
-//! directly from SQLite. Its notifications are latency hints: startup and
-//! bounded steady-state scans recover missed hints and process restarts.
+//! Committed `Ready` lifecycle rows are authoritative in every formation.
+//! Startup and bounded periodic scans acquire expiring leases, forward the
+//! unchanged definition through the Conductor relay, and conditionally settle
+//! `Ready -> Submitted`. NATS pointers and local channel notifications only
+//! request earlier scans.
 //!
-//! Both paths preserve the relay-before-settlement boundary. Relay forwarding
-//! projects the unchanged workflow definition family onto the Conductor relay;
-//! only a successful forward permits the conditional `Ready -> Submitted`
-//! settlement. The boundary does not claim Control-plane application.
+//! Relay forwarding precedes settlement and does not claim Control-plane
+//! application. A process death leaves the row reclaimable after lease expiry.
 
 pub mod consumer;
 pub mod local;
 pub mod message;
-pub mod reconciliation;
 
-pub use consumer::{publish_submission, start_submission_consumer};
+pub use consumer::publish_submission;
 pub use local::{
     definition_submission_notifications, start_local_definition_submission_worker,
+    start_local_definition_submission_worker_with_claim_admission,
     DefinitionSubmissionNotificationStream, DefinitionSubmissionNotifier,
     LocalDefinitionSubmissionWorkerConfig,
 };
 pub use message::SubmissionMessage;
-pub use reconciliation::reconcile_orphan_ready_rows;
 
 /// NATS JetStream durable subject the submission consumer rides on.
-pub const SUBMISSION_QUEUE_SUBJECT: &str = "conductor_submission_queue";
+pub const SUBMISSION_QUEUE_SUBJECT: &str = tickr_proto::coord::all_nats::SUBMISSION_QUEUE_SUBJECT;
 
 /// Queue-group name shared across replicas. NATS guarantees one
 /// delivery per message across the group.
-pub const SUBMISSION_QUEUE_GROUP: &str = "conductor-submission-consumers";
+pub const SUBMISSION_QUEUE_GROUP: &str = tickr_proto::coord::all_nats::SUBMISSION_QUEUE_GROUP;

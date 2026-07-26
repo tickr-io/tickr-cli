@@ -27,7 +27,7 @@ use tickr_conductor::build_pipeline::{
     LocalDefinitionBuildWorkerConfig, NixBuildExecutor,
 };
 use tickr_conductor::patch_pipeline::{
-    local::{patch_work_notifications, start_local_patch_worker, LocalPatchWorkerConfig},
+    local::{patch_work_notifications, start_local_patch_worker, PatchReconcilerConfig},
     DefaultPatchRelaySender,
 };
 use tickr_conductor::relay::{run_streaming_lite, LiteRelayRoles};
@@ -37,7 +37,8 @@ use tickr_conductor::replay_pipeline::{
 };
 use tickr_conductor::replay_rehydration::{local_rehydration_values, RehydrationPlan};
 use tickr_conductor::signal_applied_notifier::{
-    signal_applied_notifications, LocalSignalAppliedNotifier, SignalAppliedNotifier,
+    signal_applied_notifications, LocalSignalAppliedNotifier, SignalAppliedNotificationRoles,
+    SignalAppliedNotifier,
 };
 use tickr_conductor::submission_consumer::local::{
     definition_submission_notifications, start_local_definition_submission_worker,
@@ -45,14 +46,15 @@ use tickr_conductor::submission_consumer::local::{
 };
 use tickr_conductor::wakeup_translator::DefaultRelaySender;
 use tickr_executor::local_pickup::{
-    LocalExecutorFleetStatus, LocalPickupClaim, NixTaskProcessLauncher, PickupOutcome,
-    SafeCancellationCoordinator, SafePickupExecutor, TaskProcessLauncher,
+    LocalExecutorCapacity, LocalPickupClaim, LocalTaskHandler, NixTaskProcessLauncher,
+    PickupOutcome, SafeCancellationCoordinator, SafePickupExecutor, TaskProcessLauncher,
 };
 use tickr_executor::task_handler::build_task_environment;
+use tickr_executor::task_log_shipper::{ShipperConfig, TaskLogShipper};
 use tickr_executor::wire::DispatchedTask;
 use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_migrations::scope_repository::{
-    CreateTickrCtxScopeInput, ScopeCreationOutcome, ScopeValueInput,
+    CreateTickrCtxScopeInput, ScopeCreationOutcome, ScopeStore, ScopeValueInput,
 };
 use tickr_proto::config::DataPlaneSql;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -72,8 +74,8 @@ use crate::formation_manifest::{install_or_verify_formation_manifest, ManifestAd
 use crate::local_command_writer::LocalCommandWriter;
 use crate::local_compaction::{LocalCompactionDrain, LocalCompactionStager};
 use crate::local_log_staging::{
-    read_final_log, FinalLogTerminal, LocalLogStagingStream, LogExit, LogRecordIdentity,
-    LogStreamIdentity, ReplayedLogRecord,
+    read_final_log, FinalLogTerminal, LocalLogStagingStream, LogExit, LogStreamIdentity,
+    ReplayedLogRecord,
 };
 use crate::local_task_pickup_writer::{LocalTaskPickupWriter, LocalTaskPickupWriterClient};
 use crate::tickr_ctx_endpoint::{TickrCtxEndpoint, TickrCtxEndpointHandle, TickrCtxScopeWriter};
@@ -94,7 +96,7 @@ pub struct LiteSupervisor {
 fn lite_health_descriptor(
     descriptor: &ResolvedFormationDescriptor,
 ) -> Result<ResolvedFormationHealth> {
-    if descriptor.profile != FormationProfile::TickrLite
+    if descriptor.profile != FormationProfile::LiteLocal
         || descriptor.topology != Topology::SingleNode
         || descriptor.sql != SqlImplementation::Sqlite
         || descriptor.final_logs != FinalLogStore::LocalFiles
@@ -195,7 +197,7 @@ impl LiteSupervisor {
         let DataPlaneSql::Sqlite { url } = &selection else {
             bail!("Tickr Lite requires SQLite");
         };
-        let descriptor = resolve_formation(&FormationSelection::tickr_lite())
+        let descriptor = resolve_formation(&FormationSelection::lite_local())
             .context("resolving Tickr Lite formation")?;
         let health_descriptor = lite_health_descriptor(&descriptor)?;
         let sqlite_path = sqlite_path_from_url(url)
@@ -242,8 +244,9 @@ impl LiteSupervisor {
         {}
 
         let (pickup_client, pickup_writer) = LocalTaskPickupWriter::new(writer.as_ref().clone());
+        let scope_store: Arc<dyn ScopeStore> = writer.clone();
 
-        let (scope_writer_client, scope_writer) = TickrCtxScopeWriter::new(writer.clone());
+        let (scope_writer_client, scope_writer) = TickrCtxScopeWriter::new(scope_store.clone());
         let (ctx_handle, ctx_endpoint) = TickrCtxEndpoint::bind_after_recovery(
             data_directory.clone(),
             RootRelativePath::new("run/tickr-ctx.sock")?,
@@ -252,7 +255,8 @@ impl LiteSupervisor {
         .context("binding Tickr Lite tickr-ctx endpoint")?;
 
         let slots = NonZeroUsize::new(EXECUTOR_PROCESS_SLOTS).expect("slots are non-zero");
-        let fleet = LocalExecutorFleetStatus::new(Uuid::new_v4(), slots);
+        let executor_capacity = LocalExecutorCapacity::new(Uuid::new_v4(), slots);
+        let fleet = executor_capacity.observation();
         let executor = Arc::new(SafePickupExecutor::new(
             pickup_client.clone(),
             LiteTaskProcessLauncher {
@@ -260,10 +264,12 @@ impl LiteSupervisor {
                 ctx: ctx_handle.clone(),
                 namespace: std::env::var("TICKR_NS").unwrap_or_else(|_| "default".to_owned()),
                 data_directory: data_directory.clone(),
-                writer: writer.clone(),
                 logs: Arc::new(Mutex::new(HashMap::new())),
+                scope_store: scope_store.clone(),
+                log_config: ShipperConfig::from_env(),
+                shutdown: self.cancel.clone(),
             },
-            fleet.clone(),
+            executor_capacity,
             format!("tickr-lite-{}", Uuid::new_v4()),
             LIVENESS_TIMEOUT,
         ));
@@ -273,10 +279,8 @@ impl LiteSupervisor {
             .context("reconciling overdue local pickup")?
             .is_some()
         {}
-        let cancellation = Arc::new(SafeCancellationCoordinator::new(
-            pickup_client.clone(),
-            executor.task_handler(),
-        ));
+        let cancellation_task_handler = executor.task_handler();
+        let cancellation = Arc::new(SafeCancellationCoordinator::new(pickup_client.clone()));
 
         let notification_capacity = NonZeroUsize::new(ROLE_NOTIFICATION_CAPACITY)
             .expect("notification capacity is non-zero");
@@ -293,14 +297,18 @@ impl LiteSupervisor {
 
         let patch_sender = Arc::new(DefaultPatchRelaySender);
         let replay_sender = Arc::new(LiteReplayRelaySender {
-            writer: writer.clone(),
+            scope_store: scope_store.clone(),
         });
         let command_state = LiteApiCommandsState {
             definition_repository: writer.clone(),
             relay_sender: Arc::new(DefaultRelaySender),
             patch_relay_sender: patch_sender.clone(),
             replay_relay_sender: replay_sender.clone(),
-            signal_applied_notifications: Arc::new(tokio::sync::Mutex::new(signal_notifications)),
+            signal_applied_notifications: SignalAppliedNotificationRoles::new(
+                signal_notifier.clone(),
+                signal_notifications,
+            )
+            .reconciliation(),
             gate_index: tickr_conductor::gate_index_lifecycle::gate_index().clone(),
         };
         let (command_bus, command_writer) =
@@ -310,6 +318,7 @@ impl LiteSupervisor {
             pickup: pickup_client.clone(),
             writer: writer.clone(),
             cancellation,
+            cancellation_task_handler,
             signal_notifier,
         });
 
@@ -408,7 +417,7 @@ impl LiteSupervisor {
                     patch_sender,
                     format!("tickr-lite-patch-{}", Uuid::new_v4()),
                     patch_notifications,
-                    LocalPatchWorkerConfig::default(),
+                    PatchReconcilerConfig::default(),
                     self.cancel.child_token(),
                 ),
             ),
@@ -545,8 +554,7 @@ impl LiteSupervisor {
 }
 
 struct CapturedLogStream {
-    stream: Arc<Mutex<LocalLogStagingStream>>,
-    readers: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    shipper: TaskLogShipper,
     _parent_liveness: tokio::process::ChildStdin,
 }
 
@@ -557,7 +565,9 @@ struct LiteTaskProcessLauncher {
     namespace: String,
     data_directory: Arc<DataDirectory>,
     logs: Arc<Mutex<HashMap<String, CapturedLogStream>>>,
-    writer: Arc<WriterRepositoryBundle>,
+    scope_store: Arc<dyn ScopeStore>,
+    log_config: ShipperConfig,
+    shutdown: CancellationToken,
 }
 
 impl LiteTaskProcessLauncher {
@@ -565,22 +575,8 @@ impl LiteTaskProcessLauncher {
         let Some(capture) = self.logs.lock().await.remove(task_id) else {
             return Ok(());
         };
-        let mut capture_error = None;
-        for reader in capture.readers {
-            match reader.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => capture_error = Some(error),
-                Err(error) => capture_error = Some(format!("log capture task failed: {error}")),
-            }
-        }
-        let terminal = capture_error.map(LogExit::Error).unwrap_or(exit);
-        let result = capture
-            .stream
-            .lock()
-            .await
-            .finish_cleanly(terminal)
-            .map_err(|error| format!("finish local task log: {error}"));
-        result
+        capture.shipper.finish(exit, &self.shutdown).await;
+        Ok(())
     }
 }
 
@@ -598,7 +594,7 @@ impl TaskProcessLauncher for LiteTaskProcessLauncher {
         let run_id = requested_scope_id.to_string();
         let scope_claim_id = Uuid::new_v5(&requested_scope_id, b"tickr-lite-ctx-scope");
         let scope_id = match self
-            .writer
+            .scope_store
             .create_tickr_ctx_scope(CreateTickrCtxScopeInput {
                 scope_id: requested_scope_id,
                 namespace: &self.namespace,
@@ -643,14 +639,15 @@ impl TaskProcessLauncher for LiteTaskProcessLauncher {
             task_instance_id: task.task_instance_id,
             pickup_generation: generation,
         };
-        let stream =
+        let mut stream =
             match LocalLogStagingStream::open(self.data_directory.as_ref(), stream_identity) {
-                Ok(stream) => Arc::new(Mutex::new(stream)),
+                Ok(stream) => stream,
                 Err(error) => {
                     self.ctx.revoke_task(&task_id).await;
                     return Err(format!("open local task log: {error}"));
                 }
             };
+
         let guardian_executable = std::env::current_exe()
             .map_err(|error| format!("resolve Task process guardian executable: {error}"))?;
         let mut guardian_command = Command::new(guardian_executable);
@@ -672,35 +669,47 @@ impl TaskProcessLauncher for LiteTaskProcessLauncher {
             Ok(child) => child,
             Err(error) => {
                 self.ctx.revoke_task(&task_id).await;
+                let _ = stream.finish_cleanly(LogExit::Error(format!(
+                    "spawn Task process guardian: {error}"
+                )));
                 return Err(format!("spawn Task process guardian: {error}"));
             }
         };
         let Some(parent_liveness) = child.stdin.take() else {
             self.ctx.revoke_task(&task_id).await;
             stop_guardian_after_setup_failure(&mut child).await;
+            let _ = stream.finish_cleanly(LogExit::Error(
+                "Task guardian parent-liveness pipe was not configured".to_owned(),
+            ));
             return Err("Task guardian parent-liveness pipe was not configured".to_owned());
         };
         let Some(stdout) = child.stdout.take() else {
             drop(parent_liveness);
             self.ctx.revoke_task(&task_id).await;
             stop_guardian_after_setup_failure(&mut child).await;
+            let _ = stream.finish_cleanly(LogExit::Error(
+                "Task stdout capture was not configured".to_owned(),
+            ));
             return Err("Task stdout capture was not configured".to_owned());
         };
         let Some(stderr) = child.stderr.take() else {
             drop(parent_liveness);
             self.ctx.revoke_task(&task_id).await;
             stop_guardian_after_setup_failure(&mut child).await;
+            let _ = stream.finish_cleanly(LogExit::Error(
+                "Task stderr capture was not configured".to_owned(),
+            ));
             return Err("Task stderr capture was not configured".to_owned());
         };
-        let readers = vec![
-            tokio::spawn(capture_task_output(stdout, stream.clone())),
-            tokio::spawn(capture_task_output(stderr, stream.clone())),
-        ];
+        let shipper = TaskLogShipper::start_readers(
+            Box::new(stream),
+            &self.log_config,
+            vec![Box::new(stdout), Box::new(stderr)],
+        );
         self.logs.lock().await.insert(
             task_id,
             CapturedLogStream {
-                stream,
-                readers,
+                shipper,
                 _parent_liveness: parent_liveness,
             },
         );
@@ -733,36 +742,6 @@ impl TaskProcessLauncher for LiteTaskProcessLauncher {
         let task_id = task.task_instance_id.to_string();
         self.ctx.revoke_task(&task_id).await;
         self.finish_logs(&task_id, LogExit::NoStatus).await
-    }
-}
-
-async fn capture_task_output<R>(
-    mut output: R,
-    stream: Arc<Mutex<LocalLogStagingStream>>,
-) -> Result<(), String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = vec![0_u8; 8 * 1024];
-    loop {
-        let read = output
-            .read(&mut bytes)
-            .await
-            .map_err(|error| format!("read Task process output: {error}"))?;
-        if read == 0 {
-            return Ok(());
-        }
-        let mut stream = stream.lock().await;
-        let sequence = stream
-            .committed_frontier()
-            .map_or(0, |frontier| frontier.saturating_add(1));
-        let identity = LogRecordIdentity {
-            stream: stream.identity().clone(),
-            sequence,
-        };
-        stream
-            .accept(identity, bytes[..read].to_vec())
-            .map_err(|error| format!("stage Task process output: {error}"))?;
     }
 }
 
@@ -1002,7 +981,7 @@ async fn run_compaction_drain(
     }
 }
 struct LiteReplayRelaySender {
-    writer: Arc<WriterRepositoryBundle>,
+    scope_store: Arc<dyn ScopeStore>,
 }
 
 #[async_trait]
@@ -1022,7 +1001,7 @@ impl ReplayRelaySender for LiteReplayRelaySender {
             .collect::<Vec<_>>();
         let run_id = replay_run_id.to_string();
         let claim_id = Uuid::new_v5(&replay_run_id, b"tickr-lite-rehydration");
-        self.writer
+        self.scope_store
             .create_tickr_ctx_scope(CreateTickrCtxScopeInput {
                 scope_id: replay_run_id,
                 namespace: "replay",
@@ -1032,7 +1011,7 @@ impl ReplayRelaySender for LiteReplayRelaySender {
                 now: Utc::now(),
             })
             .await
-            .context("committing local replay rehydration")?;
+            .map_err(|error| anyhow!("committing local replay rehydration: {error}"))?;
         Ok(())
     }
 }
@@ -1040,8 +1019,8 @@ impl ReplayRelaySender for LiteReplayRelaySender {
 struct LiteRelayRoleSet {
     pickup: LocalTaskPickupWriterClient,
     writer: Arc<WriterRepositoryBundle>,
-    cancellation:
-        Arc<SafeCancellationCoordinator<LocalTaskPickupWriterClient, LiteTaskProcessLauncher>>,
+    cancellation: Arc<SafeCancellationCoordinator<LocalTaskPickupWriterClient>>,
+    cancellation_task_handler: LocalTaskHandler<LiteTaskProcessLauncher>,
     signal_notifier: LocalSignalAppliedNotifier,
 }
 
@@ -1088,7 +1067,7 @@ impl LiteRelayRoles for LiteRelayRoleSet {
 
     async fn stage_task_cancellation(&self, payload: &[u8]) -> Result<()> {
         self.cancellation
-            .cancel(payload)
+            .cancel(&self.cancellation_task_handler, payload)
             .await
             .map(|_| ())
             .map_err(|error| anyhow!(error))
@@ -1151,15 +1130,21 @@ impl LiteLogStore {
         let mut end = None;
         for record in staging.replay() {
             match record {
-                ReplayedLogRecord::Accepted { identity, bytes } => batches.push(LogBatch {
+                ReplayedLogRecord::Accepted {
+                    identity, bytes, ..
+                } => batches.push(LogBatch {
                     seq: identity.sequence,
                     bytes,
                 }),
-                ReplayedLogRecord::EndOfStream { exit } => {
-                    end = marker(FinalLogTerminal::EndOfStream { exit })
-                }
-                ReplayedLogRecord::PreAcceptanceGap { .. }
-                | ReplayedLogRecord::AbnormalClosure { .. } => {}
+                ReplayedLogRecord::Terminal {
+                    terminal: FinalLogTerminal::EndOfStream { exit },
+                    ..
+                } => end = marker(FinalLogTerminal::EndOfStream { exit }),
+                ReplayedLogRecord::PreAcceptanceGap(_)
+                | ReplayedLogRecord::Terminal {
+                    terminal: FinalLogTerminal::AbnormalClosure { .. },
+                    ..
+                } => {}
             }
         }
         Ok((batches, end))
@@ -1293,7 +1278,7 @@ mod tests {
 
     #[test]
     fn health_projection_comes_from_the_resolved_lite_descriptor() {
-        let descriptor = resolve_formation(&FormationSelection::tickr_lite()).unwrap();
+        let descriptor = resolve_formation(&FormationSelection::lite_local()).unwrap();
         let health = lite_health_descriptor(&descriptor).unwrap();
 
         assert_eq!(health.profile, HealthFormationProfile::TickrLite);

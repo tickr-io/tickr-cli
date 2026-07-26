@@ -130,7 +130,10 @@ async fn read_ctx_graph(
     run_id: Uuid,
 ) -> Option<(Envelope, CtxGraphProjection)> {
     let js = jetstream::new(nats.clone());
-    let kv = js.get_key_value("ctx-default").await.ok()?;
+    let kv = js
+        .get_key_value(tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET)
+        .await
+        .ok()?;
     let key = format!("{}/{}", run_id, CTX_GRAPH_KEY);
     let bytes = kv.get(&key).await.ok()??;
     let envelope: Envelope = serde_json::from_slice(&bytes).expect("value is a tickr-ctx envelope");

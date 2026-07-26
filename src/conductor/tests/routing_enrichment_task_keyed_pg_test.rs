@@ -309,7 +309,7 @@ async fn seed_ctx_output_typed(
     let js = jetstream::new(nats.clone());
     let kv = js
         .create_key_value(jetstream::kv::Config {
-            bucket: "ctx-default".to_string(),
+            bucket: tickr_proto::coord::all_nats::DEFAULT_SCOPE_BUCKET.to_string(),
             ..Default::default()
         })
         .await

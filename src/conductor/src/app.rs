@@ -1,6 +1,11 @@
-use crate::build_pipeline::{start_build_worker, BuildExecutor, NixBuildExecutor};
+use crate::build_pipeline::{BuildExecutor, NixBuildExecutor};
+use crate::ingress_idempotency::IngressCoordinator;
+use crate::lifecycle_work::{all_nats_lifecycle_work, LifecycleWork};
 use crate::nats_ingress;
 use crate::relay;
+use crate::signal_applied_notifier::{
+    all_nats_signal_applied_notifications, SignalAppliedNotificationRoles,
+};
 use crate::signal_captures_cleanup;
 use crate::submission_consumer;
 use crate::system_tasks;
@@ -8,69 +13,281 @@ use crate::waits_on_signal_lifecycle;
 use anyhow::{Context, Result};
 use async_nats;
 use std::sync::Arc;
+use tickr_migrations::scope_repository::ScopeStore;
+use tickr_proto::coord::{
+    CompactionStaging, TaskCancellationAckConsumer, TaskCancellationPublisher,
+    TaskDispatchPublisher, TaskEventConsumer, TaskEventWriter,
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
-    println!("Starting conductor client...");
-
-    // Resolve the Core DSL import search path used when evaluating submitted
-    // Nickel source. Empty/unset is non-fatal: registration still accepts
-    // requests, but `nickel export` cannot resolve `import "task.ncl"`.
-    match crate::parser::nickel::dsl_import_path() {
-        Some(paths) => println!("Core DSL search path ({}): {}", crate::parser::nickel::DSL_PATHS_ENV, paths),
-        None => eprintln!(
-            "WARNING: {} is unset or empty — workflow registration will fail to resolve the Core DSL until it is set",
-            crate::parser::nickel::DSL_PATHS_ENV
-        ),
-    }
-
-    // Resolve and verify the complete selected writer role before opening NATS
-    // consumers, reconciliation loops, or the Compaction drain.
+pub async fn open_conductor_repositories(
+) -> Result<Arc<tickr_migrations::backend::WriterRepositoryBundle>> {
     let selection =
         tickr_proto::config::data_plane_sql().context("resolving data-plane SQL configuration")?;
     println!(
         "Opening {} data-plane SQL writer...",
         selection.implementation()
     );
-    let definition_repository = Arc::new(
+    let repositories = Arc::new(
         crate::repository::configure_writer(selection)
             .await
             .context("opening selected data-plane SQL writer")?,
     );
     println!("Data-plane SQL writer schema verified.");
+    Ok(repositories)
+}
 
-    // Connect to NATS only after SQL selection and verification succeed.
+pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
+    let repositories = open_conductor_repositories().await?;
+    let command_bus = Arc::new(
+        crate::api_commands_consumer::NatsCommandBusConsumer::connect(
+            &tickr_proto::config::nats_url(),
+        )
+        .await?,
+    );
+    run_conductor_with_repositories(shutdown_token, repositories, command_bus).await
+}
+
+pub async fn run_conductor_with_repositories(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    command_bus: Arc<dyn crate::api_commands_consumer::CommandBusConsumer>,
+) -> Result<()> {
+    run_conductor_composed(
+        shutdown_token,
+        definition_repository,
+        command_bus,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn run_conductor_with_task_events(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    command_bus: Arc<dyn crate::api_commands_consumer::CommandBusConsumer>,
+    task_event_consumer: Arc<dyn TaskEventConsumer>,
+    task_event_writer: Arc<dyn TaskEventWriter>,
+) -> Result<()> {
+    run_conductor_composed(
+        shutdown_token,
+        definition_repository,
+        command_bus,
+        Some((task_event_consumer, task_event_writer)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn run_conductor_with_roles(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    command_bus: Arc<dyn crate::api_commands_consumer::CommandBusConsumer>,
+    task_event_consumer: Arc<dyn TaskEventConsumer>,
+    task_event_writer: Arc<dyn TaskEventWriter>,
+    task_dispatch: Arc<dyn TaskDispatchPublisher>,
+    task_cancellation: Arc<dyn TaskCancellationPublisher>,
+    cancellation_acknowledgements: Arc<dyn TaskCancellationAckConsumer>,
+    compaction_staging: Arc<dyn CompactionStaging>,
+    log_streams: Arc<dyn system_tasks::CompactionLogStaging>,
+    scope_store: Arc<dyn ScopeStore>,
+    event_ingress: Arc<dyn nats_ingress::EventIngress>,
+    ingress_coordinator: IngressCoordinator,
+    signal_applied: SignalAppliedNotificationRoles,
+    lifecycle_work: LifecycleWork,
+) -> Result<()> {
+    run_conductor_composed(
+        shutdown_token,
+        definition_repository,
+        command_bus,
+        Some((task_event_consumer, task_event_writer)),
+        Some(task_dispatch),
+        Some((task_cancellation, cancellation_acknowledgements)),
+        Some((compaction_staging, log_streams, scope_store)),
+        Some((event_ingress, ingress_coordinator)),
+        Some(signal_applied),
+        Some(lifecycle_work),
+    )
+    .await
+}
+
+async fn run_conductor_composed(
+    shutdown_token: CancellationToken,
+    definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
+    command_bus: Arc<dyn crate::api_commands_consumer::CommandBusConsumer>,
+    task_events: Option<(Arc<dyn TaskEventConsumer>, Arc<dyn TaskEventWriter>)>,
+    task_dispatch: Option<Arc<dyn TaskDispatchPublisher>>,
+    task_cancellation: Option<(
+        Arc<dyn TaskCancellationPublisher>,
+        Arc<dyn TaskCancellationAckConsumer>,
+    )>,
+    compaction: Option<(
+        Arc<dyn CompactionStaging>,
+        Arc<dyn system_tasks::CompactionLogStaging>,
+        Arc<dyn ScopeStore>,
+    )>,
+    event_ingress: Option<(Arc<dyn nats_ingress::EventIngress>, IngressCoordinator)>,
+    signal_applied: Option<SignalAppliedNotificationRoles>,
+    lifecycle_work: Option<LifecycleWork>,
+) -> Result<()> {
+    println!("Starting conductor client...");
+
+    // Resolve the Core DSL import search path used when evaluating submitted
+    // Nickel source. Empty/unset is non-fatal: registration still accepts
+    // requests, but `nickel export` cannot resolve `import "task.ncl"`.
+    match crate::parser::nickel::dsl_import_path() {
+        Some(paths) => println!(
+            "Core DSL search path ({}): {}",
+            crate::parser::nickel::DSL_PATHS_ENV,
+            paths
+        ),
+        None => eprintln!(
+            "WARNING: {} is unset or empty — workflow registration will fail to resolve the Core DSL until it is set",
+            crate::parser::nickel::DSL_PATHS_ENV
+        ),
+    }
+
+    // Formation resources are admitted by the process composer only after
+    // this writer role has proved its schema.
     let nats = async_nats::connect(tickr_proto::config::nats_url()).await?;
+    let signal_applied = match signal_applied {
+        Some(signal_applied) => signal_applied,
+        None => all_nats_signal_applied_notifications(nats.clone())
+            .await
+            .context("constructing all-NATS SignalAppliedNotifier adapter")?,
+    };
+    let signal_applied_notifier = signal_applied.notifier();
+    let signal_applied_notifications = signal_applied.reconciliation();
+
+    let lifecycle_work = match lifecycle_work {
+        Some(lifecycle_work) => lifecycle_work,
+        None => all_nats_lifecycle_work(&nats)
+            .await
+            .context("constructing all-NATS LifecycleWork adapter")?,
+    };
+    let (mut lifecycle_source, lifecycle_wakeups, lifecycle_inputs) = lifecycle_work.into_parts();
+    let (
+        definition_build_notifications,
+        patch_notifications,
+        submission_notifications,
+        lifecycle_claim_admission,
+    ) = lifecycle_inputs.into_parts();
+    let lifecycle_wakeup_shutdown = shutdown_token.clone();
+    let lifecycle_wakeup_handle = tokio::spawn(async move {
+        if let Err(error) = lifecycle_source
+            .run(lifecycle_wakeups, lifecycle_wakeup_shutdown)
+            .await
+        {
+            eprintln!("LifecycleWork wakeup source error: {error}");
+        }
+    });
 
     let stream_shutdown = shutdown_token.clone();
     let stream_definitions = Arc::clone(&definition_repository);
+
+    let stream_task_events = task_events;
+    let stream_task_dispatch = task_dispatch;
+    let stream_task_cancellation = task_cancellation;
+    let stream_compaction_staging = compaction.as_ref().map(|(staging, _, _)| staging.clone());
+    let stream_signal_applied_notifier = Arc::clone(&signal_applied_notifier);
     let streaming_handle = tokio::spawn(async move {
-        if let Err(e) = relay::run_streaming(stream_shutdown, stream_definitions).await {
+        let result = match (
+            stream_task_events,
+            stream_task_dispatch,
+            stream_task_cancellation,
+            stream_compaction_staging,
+        ) {
+            (
+                Some((consumer, writer)),
+                Some(dispatch),
+                Some((cancellation, acknowledgements)),
+                Some(compaction_staging),
+            ) => {
+                relay::run_streaming_with_roles(
+                    stream_shutdown,
+                    stream_definitions,
+                    consumer,
+                    writer,
+                    dispatch,
+                    cancellation,
+                    acknowledgements,
+                    compaction_staging,
+                    stream_signal_applied_notifier,
+                )
+                .await
+            }
+            (Some((consumer, writer)), None, None, None) => {
+                relay::run_streaming_with_task_events(
+                    stream_shutdown,
+                    stream_definitions,
+                    consumer,
+                    writer,
+                    stream_signal_applied_notifier,
+                )
+                .await
+            }
+            (None, None, None, None) => {
+                relay::run_streaming(
+                    stream_shutdown,
+                    stream_definitions,
+                    stream_signal_applied_notifier,
+                )
+                .await
+            }
+            _ => unreachable!("selected Task and Compaction roles require the complete role set"),
+        };
+        if let Err(e) = result {
             eprintln!("Streaming error: {}", e);
         }
     });
 
-    // Compaction drain: consumes staged compaction jobs off the per-tenant
-    // NATS work queue and performs the archival (log upload from the Log
-    // staging stream, tickr-ctx scope read, three-table archive
-    // transaction, signal-captures cleanup, log-subject purge). The relay
-    // handler only stages + ACKs; any conductor instance can drain any
-    // staged job, so a worker runs on every instance.
+    let selected_ingress_scope_store = compaction
+        .as_ref()
+        .map(|(_, _, scope_store)| scope_store.clone());
+
+    // Every Conductor drains through the selected Compaction, Log, and Scope
+    // role interfaces; fresh all-NATS retains its existing adapter and path.
     let drain_shutdown = shutdown_token.clone();
-    let drain_nats = nats.clone();
     let drain_repositories = Arc::clone(&definition_repository);
     let drain_storage = system_tasks::production_log_storage()?;
+    let drain_nats = nats.clone();
     let compaction_drain_handle = tokio::spawn(async move {
-        if let Err(e) = system_tasks::run_compaction_drain(
-            drain_nats,
-            drain_repositories,
-            drain_storage,
-            drain_shutdown,
-        )
-        .await
-        {
-            eprintln!("compaction drain error: {}", e);
+        let result = match compaction {
+            Some((staging, logs, scopes)) => {
+                system_tasks::run_selected_compaction_drain(
+                    staging,
+                    logs,
+                    scopes,
+                    drain_repositories,
+                    drain_storage,
+                    drain_shutdown,
+                )
+                .await
+            }
+            None => {
+                system_tasks::run_compaction_drain(
+                    drain_nats,
+                    drain_repositories,
+                    drain_storage,
+                    drain_shutdown,
+                )
+                .await
+            }
+        };
+        if let Err(error) = result {
+            eprintln!("compaction drain error: {error}");
         }
     });
 
@@ -82,25 +299,10 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         eprintln!("waits-on-signal index rebuild failed at startup: {}", e);
     }
 
-    // Boot-time reconciliation: republish a submission pointer per
-    // workflow row currently at `Ready` BEFORE the submission consumer
-    // subscribes. Bounds the commit-then-publish dual-write hazard
-    // where the build pipeline's finalizer committed `Building -> Ready`
-    // but the post-commit NATS publish dropped. Runs exactly once on
-    // startup — no periodic reconciliation in steady state.
-    if let Err(e) =
-        submission_consumer::reconcile_orphan_ready_rows(definition_repository.as_ref(), &nats)
-            .await
-    {
-        eprintln!("submission queue boot reconciliation failed: {}", e);
-    }
-
     // Boot-time replay reconcile: re-drive any replay pipeline row a prior
     // conductor left `Materializing` (Trigger relayed but the ctx re-hydration
     // / release never landed before it died). Runs exactly once on startup,
-    // following the orphan-ready-row precedent above — new machinery, not a
-    // reuse. The sender it drives through is reused by the steady-state re-drive
-    // loop below.
+    // independently from the steady-state re-drive loop whose sender it shares.
     let replay_sender: Arc<dyn crate::replay_pipeline::ReplayRelaySender> =
         Arc::new(crate::replay_pipeline::DefaultReplayRelaySender { nats: nats.clone() });
     match crate::replay_pipeline::reconcile_orphan_replay_rows(
@@ -129,44 +331,45 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         );
     }
 
-    // Per-task build worker: consumes `TaskBuildJob` messages off the
-    // build queue (one per task per workflow), invokes the production
-    // Nix-shelling executor, records per-task outcomes, runs the
-    // last-one-out finalizer, and (on the winning Ready flip) publishes
-    // a submission pointer onto the submission queue.
+    // Definition-build reconciliation receives only its role wakeup stream and
+    // the shared claim-admission fence. Startup and periodic bounded SQL scans
+    // remain authoritative when the selected notification source is silent.
     let build_worker_shutdown = shutdown_token.clone();
-    let build_worker_nats = nats.clone();
     let build_worker_repositories = Arc::clone(&definition_repository);
     let build_executor: Arc<dyn BuildExecutor> = Arc::new(NixBuildExecutor);
+    let build_claim_admission = Arc::clone(&lifecycle_claim_admission);
     let build_worker_handle = tokio::spawn(async move {
-        if let Err(e) = start_build_worker(
-            build_worker_nats,
-            build_worker_repositories,
-            build_executor,
-            build_worker_shutdown,
-        )
-        .await
+        if let Err(e) =
+            crate::build_pipeline::start_local_definition_build_worker_with_claim_admission(
+                build_worker_repositories,
+                build_executor,
+                format!("conductor-build-{}", uuid::Uuid::new_v4()),
+                definition_build_notifications,
+                build_claim_admission,
+                crate::build_pipeline::LocalDefinitionBuildWorkerConfig::default(),
+                build_worker_shutdown,
+            )
+            .await
         {
             eprintln!("build worker error: {}", e);
         }
     });
 
-    // Patch build worker: the patch-keyed sibling of the per-task build
-    // worker. Consumes `PatchTaskBuildJob` messages (one per never-built
-    // task a Patch's `AddNode` introduces), builds via the same Nix
-    // executor, records patch-keyed outcomes, and runs the patch finalizer
-    // (build success ships the single validate+apply envelope; failure settles
-    // the row BuildFailed conductor-internally, no envelope).
+    // Patch-build and Patch-lifecycle share one advisory wakeup but perform
+    // separate read-only discovery and fenced SQL lease operations.
     let patch_build_shutdown = shutdown_token.clone();
-    let patch_build_nats = nats.clone();
     let patch_build_repositories = Arc::clone(&definition_repository);
     let patch_build_executor: Arc<dyn BuildExecutor> = Arc::new(NixBuildExecutor);
+    let patch_claim_admission = Arc::clone(&lifecycle_claim_admission);
     let patch_build_handle = tokio::spawn(async move {
-        if let Err(e) = crate::patch_pipeline::start_patch_build_worker(
-            patch_build_nats,
+        if let Err(e) = crate::patch_pipeline::local::start_local_patch_worker_with_claim_admission(
             patch_build_repositories,
             patch_build_executor,
             Arc::new(crate::patch_pipeline::DefaultPatchRelaySender),
+            format!("conductor-patch-{}", uuid::Uuid::new_v4()),
+            patch_notifications,
+            patch_claim_admission,
+            crate::patch_pipeline::local::PatchReconcilerConfig::default(),
             patch_build_shutdown,
         )
         .await
@@ -175,59 +378,90 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         }
     });
 
-    // Submission consumer: subscribes to the submission queue with
-    // queue-group semantics across replicas. Ships the SubmitWorkflow
-    // envelope cross-plane via the relay and flips the workflow row
-    // `Ready -> Submitted`. The boot-time reconciliation scan above
-    // republishes any orphan Ready rows so the consumer picks them up
-    // on startup.
+    // Definition submission likewise treats the notification as an early-scan
+    // request and conditionally settles only its committed SQL lease.
     let submission_shutdown = shutdown_token.clone();
-    let submission_nats = nats.clone();
     let submission_repositories = Arc::clone(&definition_repository);
     let submission_consumer_handle = tokio::spawn(async move {
-        if let Err(e) = submission_consumer::start_submission_consumer(
-            submission_nats,
-            submission_repositories,
-            submission_shutdown,
-        )
-        .await
+        if let Err(e) =
+            submission_consumer::start_local_definition_submission_worker_with_claim_admission(
+                submission_repositories,
+                format!("conductor-submission-{}", uuid::Uuid::new_v4()),
+                submission_notifications,
+                lifecycle_claim_admission,
+                submission_consumer::LocalDefinitionSubmissionWorkerConfig::default(),
+                submission_shutdown,
+            )
+            .await
         {
             eprintln!("submission consumer error: {}", e);
         }
     });
 
-    // NATS-side ingress translator. Consumes v=1 envelopes from
-    // `tickr.external.signals`, decodes them, mints signal_id, applies the
-    // idempotency cache, and forwards Signals over the existing relay
-    // outbound channel. Single durable pull consumer per conductor;
-    // serial processing matches the v1 throughput posture.
+    // Transport selection is complete before the consumer starts. The
+    // steady-state path receives no Redis or NATS client.
+    let (event_ingress, ingress_coordinator, ingress_working_set): (
+        Arc<dyn nats_ingress::EventIngress>,
+        IngressCoordinator,
+        Arc<dyn nats_ingress::IngressWorkingSet>,
+    ) = match event_ingress {
+        Some((event_ingress, ingress_coordinator)) => (
+            event_ingress,
+            ingress_coordinator,
+            Arc::new(nats_ingress::ScopeStoreIngressWorkingSet::new(
+                selected_ingress_scope_store
+                    .context("selected EventIngress requires the selected ScopeStore")?,
+            )),
+        ),
+        None => {
+            let event_ingress = Arc::new(
+                nats_ingress::NatsEventIngress::connect(&nats)
+                    .await
+                    .context("constructing all-NATS EventIngress adapter")?,
+            );
+            let ingress_coordinator = event_ingress.ingress_coordinator();
+            (
+                event_ingress,
+                ingress_coordinator,
+                Arc::new(nats_ingress::NatsIngressWorkingSet::new(nats.clone())),
+            )
+        }
+    };
     let ingress_shutdown = shutdown_token.clone();
-    let ingress_nats = nats.clone();
     let ingress_repositories = Arc::clone(&definition_repository);
-    let nats_ingress_handle = tokio::spawn(async move {
-        if let Err(e) =
-            nats_ingress::run_translator(ingress_nats, ingress_repositories, ingress_shutdown).await
+    let event_ingress_handle = tokio::spawn(async move {
+        if let Err(error) = nats_ingress::run_event_consumer(
+            event_ingress,
+            ingress_coordinator,
+            ingress_repositories,
+            ingress_working_set,
+            Arc::new(nats_ingress::GlobalRelaySender),
+            ingress_shutdown,
+        )
+        .await
         {
-            eprintln!("NATS ingress translator error: {}", e);
+            eprintln!("EventIngress consumer error: {error}");
         }
     });
 
-    // API command-bus subscriber. Consumes `ApiCommandRequest`s from the
-    // API component over NATS core request/reply on `tickr.api.commands` and
-    // dispatches each to the matching write pipeline (register / trigger /
-    // cancel / wakeup), replying with an `ApiCommandResponse`. Serial
-    // processing matches the conductor's other NATS subscribers.
+    // Serve API Commands through the formation-selected request/reply consumer
+    // and dispatch each to the matching write pipeline. The shared dispatcher
+    // preserves the existing typed response and HTTP-equivalent status.
     let api_commands_shutdown = shutdown_token.clone();
     let api_commands_state = crate::api_commands_consumer::ApiCommandsState {
         definition_repository: Arc::clone(&definition_repository),
         nats: nats.clone(),
+        signal_applied_notifications,
         relay_sender: Arc::new(crate::wakeup_translator::DefaultRelaySender),
         patch_relay_sender: Arc::new(crate::patch_pipeline::DefaultPatchRelaySender),
         gate_index: crate::gate_index_lifecycle::gate_index(),
     };
+    let api_commands_handler: Arc<dyn crate::api_commands_consumer::CommandBusHandler> =
+        Arc::new(api_commands_state);
     let api_commands_handle = tokio::spawn(async move {
-        if let Err(e) =
-            crate::api_commands_consumer::start(api_commands_state, api_commands_shutdown).await
+        if let Err(e) = command_bus
+            .serve(api_commands_handler, api_commands_shutdown)
+            .await
         {
             eprintln!("API command-bus subscriber error: {}", e);
         }
@@ -244,18 +478,6 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         // Pull only this conductor's own tenant slice from the shared archive.
         tickr_proto::TenantId::from_env().as_uuid(),
         events_pull_shutdown,
-    ));
-
-    // Patch re-drive loop: re-sends unsettled patch lifecycle rows
-    // (persist-at-ingress + re-drive-to-settlement) until the server's
-    // outcome envelope closes them. Safe under redelivery — the patch_key
-    // dedup absorbs duplicates on both sides.
-    let patch_redrive_shutdown = shutdown_token.clone();
-    let patch_redrive_repositories = Arc::clone(&definition_repository);
-    let patch_redrive_handle = tokio::spawn(crate::patch_pipeline::run_patch_redrive(
-        patch_redrive_repositories,
-        Arc::new(crate::patch_pipeline::DefaultPatchRelaySender),
-        patch_redrive_shutdown,
     ));
 
     // Replay re-drive loop: the patch re-drive's sibling for replay pipeline
@@ -314,6 +536,10 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         eprintln!("Error waiting for submission consumer: {}", e);
     }
 
+    if let Err(e) = lifecycle_wakeup_handle.await {
+        eprintln!("Error waiting for LifecycleWork wakeup source: {}", e);
+    }
+
     if let Err(e) = sweep_handle.await {
         eprintln!("Error waiting for signal_captures sweep: {}", e);
     }
@@ -322,16 +548,12 @@ pub async fn run_conductor(shutdown_token: CancellationToken) -> Result<()> {
         eprintln!("Error waiting for events pull cycle: {}", e);
     }
 
-    if let Err(e) = nats_ingress_handle.await {
-        eprintln!("Error waiting for NATS ingress translator: {}", e);
+    if let Err(e) = event_ingress_handle.await {
+        eprintln!("Error waiting for EventIngress consumer: {}", e);
     }
 
     if let Err(e) = api_commands_handle.await {
         eprintln!("Error waiting for API command-bus subscriber: {}", e);
-    }
-
-    if let Err(e) = patch_redrive_handle.await {
-        eprintln!("Error waiting for patch re-drive loop: {}", e);
     }
 
     if let Err(e) = replay_redrive_handle.await {

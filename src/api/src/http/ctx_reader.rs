@@ -1,5 +1,5 @@
 //! The ctx KV reader: the API component's read path against the tenant's
-//! NATS KV `ctx-<ns>` bucket, powering the instance Context tab.
+//! hardened all-NATS scope bucket, powering the instance Context tab.
 //!
 //! **Read-only: KV writers are conductor/executor only.** This module never
 //! puts, deletes, or creates buckets — a missing bucket reads as an empty
@@ -187,7 +187,7 @@ pub async fn read_live_entries(
     prefixes: &[String],
 ) -> Result<Vec<(String, serde_json::Value)>, CtxReadError> {
     let js = jetstream::new(nats.clone());
-    let bucket = format!("ctx-{}", sanitize_segment(&ctx_namespace()));
+    let bucket = tickr_ctx::scope::bucket_for_namespace(&ctx_namespace());
     let kv = match js.get_key_value(&bucket).await {
         Ok(kv) => kv,
         // get_key_value can't distinguish "bucket absent" from transport

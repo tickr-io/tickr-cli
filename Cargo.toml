@@ -35,6 +35,8 @@ prost = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10.8"
+redis = { version = "0.32.7", default-features = false, features = ["tokio-rustls-comp", "streams"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10"
@@ -101,16 +103,20 @@ anyhow = "1.0"
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+redis = { workspace = true }
+rustls = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
+prost = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
-prost = { workspace = true }
+async-nats = { workspace = true }
 
 [features]
 madsim = ["tickr_conductor/madsim", "tickr_api/madsim"]

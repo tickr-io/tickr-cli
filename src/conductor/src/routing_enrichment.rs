@@ -219,7 +219,7 @@ pub async fn read_self_patch_output(
     task_instance_id: Uuid,
 ) -> Option<Value> {
     let js = jetstream::new(nats.clone());
-    let bucket = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv = js.get_key_value(&bucket).await.ok()?;
     let key = format!(
         "{}/{}",
@@ -258,7 +258,7 @@ async fn read_emitted_outputs(
     task_instance_id: Uuid,
 ) -> Result<BTreeMap<String, Value>> {
     let js = jetstream::new(nats.clone());
-    let bucket = format!("ctx-{}", sanitize_segment(DEFAULT_CTX_NAMESPACE));
+    let bucket = tickr_ctx::scope::bucket_for_namespace(DEFAULT_CTX_NAMESPACE);
     let kv = match js.get_key_value(&bucket).await {
         Ok(kv) => kv,
         // No bucket → the run published nothing. Not an error.

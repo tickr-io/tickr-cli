@@ -1,6 +1,6 @@
-//! Durable definition-submission processing for Tickr Lite.
+//! Durable definition-submission reconciliation.
 //!
-//! Committed `Ready` rows are authoritative. The bounded channel only shortens
+//! Committed `Ready` SQL rows are authoritative. Notifications only shorten
 //! scan latency; startup and periodic scans recover work after notification
 //! loss, process restart, or relay disconnection.
 
@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+use crate::lifecycle_work::{LifecycleClaimAdmission, LifecyclePipeline, OpenLifecycleClaims};
 use crate::relay::forward_workflow_registration_bytes;
 
 /// Bounded best-effort wakeup for newly committed definition-submission work.
@@ -51,8 +52,8 @@ pub fn definition_submission_notifications(
 impl DefinitionSubmissionNotifier {
     /// Request an immediate scan. A full or closed channel deliberately loses
     /// only this hint; the committed `Ready` row remains authoritative.
-    pub fn notify(&self) {
-        let _ = self.sender.try_send(());
+    pub fn notify(&self) -> bool {
+        self.sender.try_send(()).is_ok()
     }
 }
 
@@ -73,12 +74,31 @@ impl Default for LocalDefinitionSubmissionWorkerConfig {
     }
 }
 
-/// Run startup reconciliation followed by bounded notification- and timer-led
-/// scans until formation cancellation.
 pub async fn start_local_definition_submission_worker(
     repositories: Arc<WriterRepositoryBundle>,
     lease_owner: String,
+    notifications: DefinitionSubmissionNotificationStream,
+    config: LocalDefinitionSubmissionWorkerConfig,
+    cancel: CancellationToken,
+) -> Result<()> {
+    start_local_definition_submission_worker_with_claim_admission(
+        repositories,
+        lease_owner,
+        notifications,
+        Arc::new(OpenLifecycleClaims),
+        config,
+        cancel,
+    )
+    .await
+}
+
+/// Run startup reconciliation followed by bounded notification- and timer-led
+/// scans until formation cancellation.
+pub async fn start_local_definition_submission_worker_with_claim_admission(
+    repositories: Arc<WriterRepositoryBundle>,
+    lease_owner: String,
     mut notifications: DefinitionSubmissionNotificationStream,
+    claim_admission: Arc<dyn LifecycleClaimAdmission>,
     config: LocalDefinitionSubmissionWorkerConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -94,11 +114,12 @@ pub async fn start_local_definition_submission_worker(
     let mut ticker = tokio::time::interval(config.scan_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await;
-    scan_once(
+    scan_once_with_claim_admission(
         repositories.as_ref(),
         &lease_owner,
         lease_duration,
         config.batch_size,
+        claim_admission.as_ref(),
     )
     .await?;
 
@@ -107,20 +128,22 @@ pub async fn start_local_definition_submission_worker(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                scan_once(
+                scan_once_with_claim_admission(
                     repositories.as_ref(),
                     &lease_owner,
                     lease_duration,
                     config.batch_size,
+                    claim_admission.as_ref(),
                 ).await?;
             }
             notification = notifications.receiver.recv(), if notifications_open => {
                 notifications_open = notification.is_some();
-                scan_once(
+                scan_once_with_claim_admission(
                     repositories.as_ref(),
                     &lease_owner,
                     lease_duration,
                     config.batch_size,
+                    claim_admission.as_ref(),
                 ).await?;
             }
         }
@@ -128,13 +151,21 @@ pub async fn start_local_definition_submission_worker(
     Ok(())
 }
 
-async fn scan_once(
+async fn scan_once_with_claim_admission(
     repositories: &WriterRepositoryBundle,
     lease_owner: &str,
     lease_duration: chrono::Duration,
     batch_size: NonZeroUsize,
+    claim_admission: &dyn LifecycleClaimAdmission,
 ) -> Result<()> {
     let now = Utc::now();
+    if !repositories
+        .has_reclaimable_definition_submission(now)
+        .await?
+        || !claim_admission.claims_open(LifecyclePipeline::Submission)
+    {
+        return Ok(());
+    }
     let leases = repositories
         .lease_definition_submissions(DefinitionSubmissionLeaseRequest {
             owner: lease_owner,
@@ -145,7 +176,7 @@ async fn scan_once(
         .await?;
 
     // Relay sequentially so the stable repository selection order remains the
-    // observable forward order for one local formation.
+    // observable forward order for one reconciler.
     for lease in leases {
         process_leased_submission(repositories, lease).await?;
     }
@@ -159,7 +190,7 @@ async fn process_leased_submission(
     let payload = lease.intent.definition.encode_to_vec();
     if let Err(error) = forward_workflow_registration_bytes(payload).await {
         eprintln!(
-            "local submission worker: relay unavailable for ({}, {}): {error}",
+            "definition submission worker: relay unavailable for ({}, {}): {error}",
             lease.intent.workflow_id, lease.intent.workflow_version
         );
         return Ok(());
@@ -177,7 +208,7 @@ async fn process_leased_submission(
             DefinitionSubmissionSettlementOutcome::AlreadySettled(status),
         ) => {
             eprintln!(
-                "local submission worker: ({}, {}) already settled as {status:?}",
+                "definition submission worker: ({}, {}) already settled as {status:?}",
                 lease.intent.workflow_id, lease.intent.workflow_version
             );
         }
@@ -185,13 +216,13 @@ async fn process_leased_submission(
             DefinitionSubmissionSettlementOutcome::Absent,
         ) => {
             eprintln!(
-                "local submission worker: ({}, {}) disappeared after relay forward",
+                "definition submission worker: ({}, {}) disappeared after relay forward",
                 lease.intent.workflow_id, lease.intent.workflow_version
             );
         }
         LeasedDefinitionSubmissionSettlementOutcome::LeaseLost => {
             eprintln!(
-                "local submission worker: lease expired for ({}, {}) after relay forward; leaving Ready for re-drive",
+                "definition submission worker: lease expired for ({}, {}) after relay forward; leaving Ready for re-drive",
                 lease.intent.workflow_id, lease.intent.workflow_version
             );
         }

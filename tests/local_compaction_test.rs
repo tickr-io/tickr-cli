@@ -9,7 +9,8 @@ use tempfile::TempDir;
 use tickr::data_directory::DataDirectory;
 use tickr::local_compaction::{LocalCompactionDrain, LocalCompactionStager};
 use tickr::local_log_staging::{
-    FinalLogReference, LocalLogStagingStream, LogExit, LogRecordIdentity, LogStreamIdentity,
+    FinalLogReference, LocalLogStagingStream, LogExit, LogRecordIdentity, LogRecordSubmission,
+    LogStreamIdentity,
 };
 use tickr_migrations::backend::{RepositoryFactory, WriterRepositoryBundle};
 use tickr_migrations::scope_repository::{
@@ -144,13 +145,13 @@ async fn create_scope_and_claimed_log(
         pickup_generation: claim.pickup_generation.try_into()?,
     };
     let mut log = LocalLogStagingStream::open(data_directory, stream.clone())?;
-    log.accept(
+    log.accept(LogRecordSubmission::new(
         LogRecordIdentity {
             stream: stream.clone(),
             sequence: 0,
         },
         b"failure evidence".to_vec(),
-    )?;
+    ))?;
     log.finish_cleanly(LogExit::Status(1))?;
     Ok(stream)
 }

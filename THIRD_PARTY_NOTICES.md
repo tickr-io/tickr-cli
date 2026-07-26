@@ -634,6 +634,7 @@ It is platform-independent and includes development and optional dependencies.
 | normalize-path | 3.0.0 | MIT | https://registry.npmjs.org/normalize-path/-/normalize-path-3.0.0.tgz | [e70ff771504ba41f](#e70ff771504ba41f) |
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term | [cfdb7491dfa8800a](#cfdb7491dfa8800a) |
 | nuid | 0.5.0 | Apache-2.0 | https://github.com/casualjim/rs-nuid.git | [f4c1d7ba32ef5bcf](#f4c1d7ba32ef5bcf) |
+| num-bigint | 0.4.8 | MIT OR Apache-2.0 | https://github.com/rust-num/num-bigint | [a60eea8175145316](#a60eea8175145316), [6485b8ed310d3f03](#6485b8ed310d3f03) |
 | num-bigint-dig | 0.8.6 | MIT/Apache-2.0 | https://github.com/dignifiedquire/num-bigint | [a60eea8175145316](#a60eea8175145316), [6485b8ed310d3f03](#6485b8ed310d3f03) |
 | num-conv | 0.2.2 | MIT OR Apache-2.0 | https://github.com/jhpratt/num-conv | [0d542e0c8804e39a](#0d542e0c8804e39a), [e2e245f2b566d0bf](#e2e245f2b566d0bf) |
 | num-integer | 0.1.46 | MIT OR Apache-2.0 | https://github.com/rust-num/num-integer | [a60eea8175145316](#a60eea8175145316), [6485b8ed310d3f03](#6485b8ed310d3f03) |
@@ -749,6 +750,7 @@ It is platform-independent and includes development and optional dependencies.
 | readdirp | 3.6.0 | MIT | https://registry.npmjs.org/readdirp/-/readdirp-3.6.0.tgz | [dffec71d93f273d2](#dffec71d93f273d2) |
 | recharts | 3.8.1 | MIT | https://registry.npmjs.org/recharts/-/recharts-3.8.1.tgz | [e65e92a0a65f60ce](#e65e92a0a65f60ce) |
 | redent | 3.0.0 | MIT | https://registry.npmjs.org/redent/-/redent-3.0.0.tgz | [48da2f39e100d408](#48da2f39e100d408) |
+| redis | 0.32.7 | BSD-3-Clause | https://github.com/redis-rs/redis-rs | [500d6bc35e93b68e](#500d6bc35e93b68e) |
 | redox_syscall | 0.3.5 | MIT | https://gitlab.redox-os.org/redox-os/syscall | [efcfee7981ff7243](#efcfee7981ff7243) |
 | redox_syscall | 0.5.18 | MIT | https://gitlab.redox-os.org/redox-os/syscall | [efcfee7981ff7243](#efcfee7981ff7243) |
 | redox_syscall | 0.9.0 | MIT | https://gitlab.redox-os.org/redox-os/syscall | [efcfee7981ff7243](#efcfee7981ff7243) |
@@ -9596,6 +9598,45 @@ Declared license: MIT
 Upstream source: https://registry.npmjs.org/@radix-ui/react-direction/-/react-direction-1.1.1.tgz
 Declared author/owner metadata: not declared
 The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
+```
+
+<a id="500d6bc35e93b68e"></a>
+### 500d6bc35e93b68e
+
+```text
+Copyright (c) 2022 by redis-rs contributors
+
+Redis cluster code in parts copyright (c) 2018 by Atsushi Koge.
+
+Some rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
+
+    * The names of the contributors may not be used to endorse or
+      promote products derived from this software without specific
+      prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 <a id="503558bfefe66ca1"></a>

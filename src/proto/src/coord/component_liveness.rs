@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// consumer, so a key expiry there becomes an `Unhealthy` task verdict. This
 /// bucket has no such consumer — a component-key expiry just means the executor
 /// is gone, never a task-death marker.
-pub const COMPONENT_LIVENESS_BUCKET: &str = "tickr_component_liveness";
+pub const COMPONENT_LIVENESS_BUCKET: &str = super::all_nats::COMPONENT_LIVENESS_BUCKET;
 
 /// The component-liveness key for one executor process: `executor.<boot-uuid>`.
 /// The `executor.` prefix namespaces the key so a future second component kind

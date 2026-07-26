@@ -19,19 +19,16 @@
 //! row is instantaneous and carries the same per-row window field.
 
 use async_nats::jetstream;
-use async_nats::jetstream::kv::Operation;
 use async_nats::Client;
-use futures::StreamExt;
 use serde::Serialize;
 use std::time::Duration;
-use utoipa::ToSchema;
-// Consume the writer slice's key schema + bucket name off the published
-// contract — never redefined here, so writer and reader can't drift.
+use tickr_executor::component_liveness::NatsExecutorFleetStatus;
+use tickr_executor::local_pickup::ExecutorFleetStatus;
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use tickr_proto::coord::{
-    ComponentLivenessValue, COMPONENT_LIVENESS_BUCKET, DEFAULT_LIVENESS_TIMEOUT_SECS,
-    LIVENESS_TIMEOUT_ENV,
+    COMPONENT_LIVENESS_BUCKET, DEFAULT_LIVENESS_TIMEOUT_SECS, LIVENESS_TIMEOUT_ENV,
 };
+use utoipa::ToSchema;
 
 use crate::commands::client::{ping_command_bus, CommandBus};
 use crate::http::coordinator_client::CoordinatorClient;
@@ -40,10 +37,6 @@ use crate::http::coordinator_client::CoordinatorClient;
 /// slices populate it with executor component-liveness keys; here it is read-only
 /// (its `status()`), and its absence is not itself unhealthy — see `check_nats_kv`.
 const KV_PROBE_BUCKET: &str = COMPONENT_LIVENESS_BUCKET;
-
-/// Key prefix namespacing executor component-liveness keys (`executor.<uuid>`) in
-/// the shared bucket, so the pool read counts only executor processes.
-const EXECUTOR_KEY_PREFIX: &str = "executor.";
 
 /// Detection-window label for the instantaneous checks. A red row here flips back
 /// to green on the very next request, so the window is the request itself — no
@@ -275,6 +268,13 @@ pub struct CommandPathHealth {
     pub detection_window: String,
 }
 
+/// Capacity shown by Health is metadata, never a dispatch permit or reservation.
+#[derive(Serialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorCapacityInterpretation {
+    ObservationOnly,
+}
+
 /// Executor observation with machine-readable configured and in-flight counts.
 #[derive(Serialize, ToSchema, Debug, Clone)]
 pub struct ExecutorHealth {
@@ -284,6 +284,10 @@ pub struct ExecutorHealth {
     pub observed_executors: Option<usize>,
     pub configured_process_slots: Option<usize>,
     pub in_flight_count: Option<usize>,
+    pub capacity_interpretation: ExecutorCapacityInterpretation,
+    pub freshest_observation_age_ms: Option<u64>,
+    pub oldest_observation_age_ms: Option<u64>,
+    pub observation_ttl_ms: Option<u64>,
 }
 
 impl ExecutorHealth {
@@ -301,25 +305,68 @@ impl ExecutorHealth {
             observed_executors: Some(observed_executors),
             configured_process_slots: Some(configured_process_slots),
             in_flight_count: Some(in_flight_count),
+            capacity_interpretation: ExecutorCapacityInterpretation::ObservationOnly,
+            freshest_observation_age_ms: None,
+            oldest_observation_age_ms: None,
+            observation_ttl_ms: None,
         }
     }
+}
 
-    fn windowed(
-        status: ComponentStatus,
-        detail: impl Into<String>,
-        detection_window: impl Into<String>,
-        observed_executors: usize,
-        configured_process_slots: usize,
-        in_flight_count: usize,
-    ) -> Self {
-        Self {
-            status,
-            detail: detail.into(),
-            detection_window: detection_window.into(),
-            observed_executors: Some(observed_executors),
-            configured_process_slots: Some(configured_process_slots),
-            in_flight_count: Some(in_flight_count),
+/// Project expiring backend-neutral observations into the Executors Health row.
+///
+/// The projection deliberately reports configured slots and observed load. It
+/// never derives or serializes "available capacity", because dispatch remains
+/// governed by each Executor's local pull-to-capacity decision.
+pub fn check_executor_fleet_observations(
+    snapshot: &tickr_executor::local_pickup::ExecutorFleetSnapshot,
+) -> ExecutorHealth {
+    let mut observed_executors = 0usize;
+    let mut configured_process_slots = 0usize;
+    let mut in_flight_count = 0usize;
+    let mut freshest_age_ms: Option<u64> = None;
+    let mut oldest_age_ms: Option<u64> = None;
+
+    for observation in &snapshot.observations {
+        if snapshot.observation_ttl_millis == 0
+            || observation.expires_at_server_millis <= snapshot.server_time_millis
+        {
+            continue;
         }
+        let age = observation.age_millis(snapshot.server_time_millis);
+        observed_executors = observed_executors.saturating_add(1);
+        configured_process_slots =
+            configured_process_slots.saturating_add(observation.configured_process_slots);
+        in_flight_count = in_flight_count.saturating_add(observation.in_flight_count);
+        freshest_age_ms = Some(freshest_age_ms.map_or(age, |current| current.min(age)));
+        oldest_age_ms = Some(oldest_age_ms.map_or(age, |current| current.max(age)));
+    }
+
+    let status = match freshest_age_ms {
+        Some(age) if age < snapshot.observation_ttl_millis / 4 => ComponentStatus::Healthy,
+        Some(_) => ComponentStatus::Degraded,
+        None => ComponentStatus::Unhealthy,
+    };
+    let detail = match (freshest_age_ms, oldest_age_ms) {
+        (Some(freshest), Some(oldest)) => format!(
+            "{observed_executors} observed executors · observed load \
+             {in_flight_count}/{configured_process_slots} configured slots · \
+             observation age {freshest}..{oldest}ms · not guaranteed available capacity"
+        ),
+        _ => "0 observed executors · no guaranteed available capacity".to_string(),
+    };
+
+    ExecutorHealth {
+        status,
+        detail,
+        detection_window: format!("observation expiry {}ms", snapshot.observation_ttl_millis),
+        observed_executors: Some(observed_executors),
+        configured_process_slots: Some(configured_process_slots),
+        in_flight_count: Some(in_flight_count),
+        capacity_interpretation: ExecutorCapacityInterpretation::ObservationOnly,
+        freshest_observation_age_ms: freshest_age_ms,
+        oldest_observation_age_ms: oldest_age_ms,
+        observation_ttl_ms: Some(snapshot.observation_ttl_millis),
     }
 }
 
@@ -343,6 +390,8 @@ pub struct HealthResponse {
     pub local_coordination: Option<ComponentHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_path: Option<CommandPathHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis_capability: Option<serde_json::Value>,
 }
 
 /// The API-self row. Reaching this code means the request got through the
@@ -417,99 +466,58 @@ fn liveness_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Human label for the liveness detection window (e.g. `2m`, `90s`) shown as the
-/// row's `detection_window`.
-fn window_label(timeout: Duration) -> String {
-    let secs = timeout.as_secs();
-    if secs > 0 && secs.is_multiple_of(60) {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
-/// The Executors **pool** row — one aggregate row, no per-executor rows. Lists
-/// `executor.*` keys in `tickr_component_liveness`, counts the non-expired keys as
-/// **N alive**, and sums their `{cap, in_flight}` into **Y/X (used/total slots)**.
-/// The read is O(fleet size), stateless, and self-cleaning: an expired/missing key
-/// is simply not counted (NATS reaps it by TTL; we also skip any key whose own age
-/// has already reached the TTL). It touches only this bucket — no task-liveness
-/// scan, no cached table.
+/// Read the formation-selected observational role for the Executors Health row.
 ///
-/// Band is **derived, not tuned**: each key's own age (`now − entry.created`)
-/// against the single `TICKR_LIVENESS_TIMEOUT_SECS` knob — ≥1 fresh key (`< TTL/4`)
-/// ⇒ healthy; keys exist but all sit in the `TTL/4..TTL` slack window ⇒ degraded;
-/// no non-expired key (zero fleet) ⇒ unhealthy. Saturation `X/Y` is detail text,
-/// never a band driver.
-pub async fn check_executors(nats: &Client, timeout: Duration) -> ExecutorHealth {
-    let window = window_label(timeout);
-    let detection_window = format!("liveness window {window}");
-    let ages = collect_executor_ages(nats, timeout).await;
-
-    // Aggregate: N alive, plus summed used/total slots for the informational
-    // saturation detail. Zero fleet ⇒ unhealthy regardless of slots.
-    let n_alive = ages.len();
-    let used: usize = ages.iter().map(|a| a.value.in_flight).sum();
-    let total: usize = ages.iter().map(|a| a.value.cap).sum();
-    let detail = format!("{n_alive} alive · {used}/{total} slots");
-
-    let status = match ages.iter().map(|a| a.age).min() {
-        // Freshest key drives the band: at least one `< TTL/4` ⇒ healthy; all
-        // present keys in the `TTL/4..TTL` slack window ⇒ degraded.
-        Some(freshest) if freshest < timeout / 4 => ComponentStatus::Healthy,
-        Some(_) => ComponentStatus::Degraded,
-        // No non-expired executor key ⇒ zero fleet.
-        None => ComponentStatus::Unhealthy,
-    };
-
-    ExecutorHealth::windowed(status, detail, detection_window, n_alive, total, used)
-}
-
-/// One counted executor key: its `{cap, in_flight}` value and its age at read time.
-struct ExecutorAge {
-    value: ComponentLivenessValue,
-    age: Duration,
-}
-
-/// List the non-expired `executor.*` keys and decode each key's `{cap, in_flight}`
-/// value plus its age. A bucket that is absent or unreachable, or any per-key read
-/// failure, yields an empty list — the row then reads zero-fleet unhealthy, which
-/// is the honest signal when no executor can be observed.
-async fn collect_executor_ages(nats: &Client, timeout: Duration) -> Vec<ExecutorAge> {
-    let js = jetstream::new(nats.clone());
-    let Ok(store) = js.get_key_value(COMPONENT_LIVENESS_BUCKET).await else {
-        return Vec::new();
-    };
-    let Ok(mut keys) = store.keys().await else {
-        return Vec::new();
-    };
-
-    // Whole-millisecond age against each key's own `created` — the freshest
-    // beats the band. Seconds would truncate the `TTL/4` boundary too coarsely.
-    let now_ms = chrono::Utc::now().timestamp_millis() as i128;
-    let mut out = Vec::new();
-    while let Some(item) = keys.next().await {
-        let Ok(key) = item else { continue };
-        if !key.starts_with(EXECUTOR_KEY_PREFIX) {
-            continue;
-        }
-        let entry = match store.entry(&key).await {
-            Ok(Some(e)) if e.operation == Operation::Put => e,
-            // Tombstoned mid-scan, or a single-key read failure: not counted.
-            _ => continue,
-        };
-        let Ok(value) = serde_json::from_slice::<ComponentLivenessValue>(&entry.value) else {
-            continue;
-        };
-        let created_ms = entry.created.unix_timestamp_nanos() / 1_000_000;
-        let age = Duration::from_millis((now_ms - created_ms).max(0) as u64);
-        // Defensive: a key whose own age already reached the TTL is expired even
-        // if NATS hasn't reaped it yet — not counted.
-        if age < timeout {
-            out.push(ExecutorAge { value, age });
-        }
+/// The projection sees no NATS or Redis client and cannot return an admission
+/// permit or mutate queue state.
+pub async fn check_executor_fleet(fleet_status: &dyn ExecutorFleetStatus) -> ExecutorHealth {
+    match fleet_status.fleet_snapshot().await {
+        Ok(snapshot) => check_executor_fleet_observations(&snapshot),
+        Err(error) => ExecutorHealth {
+            status: ComponentStatus::Unhealthy,
+            detail: format!("executor fleet observation unavailable: {error}"),
+            detection_window: format!(
+                "observation expiry {}ms",
+                fleet_status.observation_ttl().as_millis()
+            ),
+            observed_executors: Some(0),
+            configured_process_slots: Some(0),
+            in_flight_count: Some(0),
+            capacity_interpretation: ExecutorCapacityInterpretation::ObservationOnly,
+            freshest_observation_age_ms: None,
+            oldest_observation_age_ms: None,
+            observation_ttl_ms: Some(
+                u64::try_from(fleet_status.observation_ttl().as_millis()).unwrap_or(u64::MAX),
+            ),
+        },
     }
-    out
+}
+
+/// Compatibility entry point for the existing all-NATS role-law evidence.
+pub async fn check_executors(nats: &Client, timeout: Duration) -> ExecutorHealth {
+    let fleet_status = NatsExecutorFleetStatus::new(nats.clone(), timeout);
+    let snapshot = fleet_status
+        .fleet_snapshot()
+        .await
+        .expect("all-NATS observations degrade to an empty snapshot");
+    let mut health = check_executor_fleet_observations(&snapshot);
+    health.detail = format!(
+        "{} observed executors · observed load {}/{} configured slots",
+        health.observed_executors.unwrap_or(0),
+        health.in_flight_count.unwrap_or(0),
+        health.configured_process_slots.unwrap_or(0)
+    );
+    let seconds = timeout.as_secs();
+    let window = if seconds > 0 && seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    };
+    health.detection_window = format!("liveness window {window}");
+    health.freshest_observation_age_ms = None;
+    health.oldest_observation_age_ms = None;
+    health.observation_ttl_ms = None;
+    health
 }
 
 /// The Conductor row — a command-plane-responsive check over the selected
@@ -568,7 +576,7 @@ pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHe
     }
 }
 
-/// Assemble the distributed formation's report.
+/// Assemble the all-NATS formation's report.
 pub async fn build_health_report(
     repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
@@ -585,8 +593,7 @@ pub async fn build_health_report(
     .await
 }
 
-/// Assemble a report with the formation-selected Command bus. NATS remains an
-/// independent input for the distributed KV and Executor rows.
+/// Compatibility wrapper for the existing all-NATS Command-bus tests.
 pub async fn build_health_report_with_command_bus(
     repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
@@ -594,30 +601,60 @@ pub async fn build_health_report_with_command_bus(
     coordinator: &CoordinatorClient,
     ping_deadline: Duration,
 ) -> HealthResponse {
+    let fleet_status = NatsExecutorFleetStatus::new(nats.clone(), liveness_timeout());
+    build_health_report_with_fleet_status(
+        repositories,
+        Some(nats),
+        command_bus,
+        coordinator,
+        &fleet_status,
+        ping_deadline,
+        None,
+    )
+    .await
+}
+
+/// Assemble a distributed report from selected role interfaces.
+pub async fn build_health_report_with_fleet_status(
+    repositories: &ReadOnlyRepositoryBundle,
+    nats: Option<&Client>,
+    command_bus: &CommandBus,
+    coordinator: &CoordinatorClient,
+    executor_fleet: &dyn ExecutorFleetStatus,
+    ping_deadline: Duration,
+    redis_capability: Option<serde_json::Value>,
+) -> HealthResponse {
+    let nats_kv = match nats {
+        Some(nats) => check_nats_kv(nats).await,
+        None => ComponentHealth::instant(
+            ComponentStatus::Degraded,
+            "not selected: formation uses non-NATS coordination",
+        ),
+    };
     HealthResponse {
         checked_at: chrono::Utc::now().to_rfc3339(),
         api: api_self(),
         data_plane_sql: check_data_plane_sql(repositories).await,
-        nats_kv: check_nats_kv(nats).await,
-        executors: check_executors(nats, liveness_timeout()).await,
+        nats_kv,
+        executors: check_executor_fleet(executor_fleet).await,
         conductor: check_command_bus(command_bus, ping_deadline).await,
         control_plane: check_control_plane(coordinator).await,
         formation: None,
         readiness: None,
         local_coordination: None,
         command_path: None,
+        redis_capability,
     }
 }
 
 /// Tickr Lite health retains the existing Console-facing rows while reporting
 /// the selected local roles and never probing an absent distributed substrate.
-use tickr_executor::local_pickup::ExecutorFleetStatus;
 
 pub async fn build_lite_health_report(
     repositories: &ReadOnlyRepositoryBundle,
     command_bus: &CommandBus,
     coordinator: &CoordinatorClient,
-    executor_fleet: &tickr_executor::local_pickup::LocalExecutorFleetStatus,
+    executor_fleet: &dyn ExecutorFleetStatus,
     formation: &ResolvedFormationHealth,
     ready: bool,
     ping_deadline: Duration,
@@ -625,7 +662,13 @@ pub async fn build_lite_health_report(
     let data_plane_sql = check_data_plane_sql(repositories).await;
     let conductor = check_command_bus(command_bus, ping_deadline).await;
     let control_plane = check_control_plane(coordinator).await;
-    let snapshot = executor_fleet.snapshot();
+    let snapshot = executor_fleet.fleet_snapshot().await.unwrap_or_else(|_| {
+        tickr_executor::local_pickup::ExecutorFleetSnapshot {
+            server_time_millis: 0,
+            observation_ttl_millis: 0,
+            observations: Vec::new(),
+        }
+    });
     let readiness_status = if ready {
         ComponentStatus::Healthy
     } else {
@@ -658,12 +701,14 @@ pub async fn build_lite_health_report(
         executors: ExecutorHealth::instant(
             readiness_status,
             format!(
-                "1 executor: {} configured process slots, {} in flight",
-                snapshot.configured_process_slots, snapshot.in_flight_count
+                "{} observed executor · observed load {}/{} configured slots",
+                snapshot.observed_executors(),
+                snapshot.in_flight_count(),
+                snapshot.configured_process_slots()
             ),
-            1,
-            snapshot.configured_process_slots,
-            snapshot.in_flight_count,
+            snapshot.observed_executors(),
+            snapshot.configured_process_slots(),
+            snapshot.in_flight_count(),
         ),
         conductor: conductor.clone(),
         control_plane,
@@ -701,5 +746,6 @@ pub async fn build_lite_health_report(
             detail: conductor.detail,
             detection_window: conductor.detection_window,
         }),
+        redis_capability: None,
     }
 }
