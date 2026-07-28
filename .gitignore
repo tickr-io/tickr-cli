@@ -25,6 +25,9 @@ CLAUDE.md
 .pi-subagents/
 __pycache__/
 
+# Redis admission test fixtures can survive an interrupted test process.
+redis-admission-*/
+
 # Node.js / npm
 node_modules/
 npm-debug.log*
