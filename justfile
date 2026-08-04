@@ -29,6 +29,8 @@ security-static:
     python3 scripts/security_source_gate.py --self-test
     python3 scripts/security_source_gate.py
     python3 scripts/license_gate.py --self-test
+    python3 scripts/npm_audit_gate.py --self-test
+    python3 scripts/npm_audit_gate.py
     python3 scripts/license_gate.py --check
     bash -c 'source .envrc; exec docker compose --file docker-compose-infra.yml config -q'
 
@@ -40,7 +42,6 @@ security:
     cargo audit --file Cargo.lock --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2025-0111 --ignore RUSTSEC-2023-0071
     cargo deny check advisories licenses bans sources
     gitleaks dir . --no-banner --redact --exit-code 1
-    cd console && npm audit --package-lock-only --audit-level=low
 
 licenses:
     python3 scripts/license_gate.py

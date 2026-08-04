@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -80,7 +81,7 @@ jobs:
       - name: Verify and test Console
         working-directory: console
         run: |
-          npm audit --package-lock-only --audit-level=low
+          python3 ../scripts/npm_audit_gate.py
           npm run check-openapi
           npm run check-api
           npm run lint

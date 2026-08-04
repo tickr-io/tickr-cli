@@ -14,7 +14,14 @@ env:
   NPM_VERSION: 11.13.0
 
 jobs:
+  ci:
+    name: verify complete CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: ci
     name: build ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -100,7 +107,7 @@ jobs:
           for checksum in *.sha256; do
             sha256sum --check "$checksum"
           done
-      - name: Publish immutable release assets
+      - name: Stage immutable release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -108,4 +115,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
-            --title "Tickr $GITHUB_REF_NAME"
+            --title "Tickr $GITHUB_REF_NAME" \
+            --draft
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
