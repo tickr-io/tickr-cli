@@ -75,8 +75,15 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - name: Pin npm for Cargo-owned Console build
         run: npm install --global npm@11.13.0
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and Nickel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          curl --fail --silent --show-error --location \
+            https://github.com/tweag/nickel/releases/download/1.16.0/nickel-x86_64-linux \
+            --output /tmp/nickel
+          echo "05d926d6cfdd3743731a65c08a558c2ae5edd55759f3cee57f5096acb2595816  /tmp/nickel" | sha256sum --check
+          sudo install -m 0755 /tmp/nickel /usr/local/bin/nickel
       - name: Rust tests with mandatory Docker integration coverage
         run: scripts/test_with_isolated_postgres.sh
 
