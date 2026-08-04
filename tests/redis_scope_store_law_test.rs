@@ -775,6 +775,13 @@ fn generate_tls(path: &PathBuf) -> String {
             .args(["-subj", "/CN=localhost"]),
         "generate Redis server request",
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&server_key, fs::Permissions::from_mode(0o644))
+            .expect("make Redis server key readable by the container");
+    }
     fs::write(
         &extensions,
         "subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n",
