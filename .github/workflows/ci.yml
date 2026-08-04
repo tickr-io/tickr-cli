@@ -10,6 +10,7 @@ permissions:
   contents: read
 
 env:
+  CARGO_INCREMENTAL: '0'
   TICKR_TENANT_SLUG: ci
   TICKR_NATS_URL: nats://127.0.0.1:4222
   TICKR_CONDUCTOR_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/tickr
@@ -56,8 +57,28 @@ jobs:
         run: just security
       - name: Build and boundary checks
         run: just check
+
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: rust-tests
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: Pin npm for Cargo-owned Console build
+        run: npm install --global npm@11.13.0
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Rust tests with mandatory Docker integration coverage
-        run: just test
+        run: scripts/test_with_isolated_postgres.sh
 
   console:
     runs-on: ubuntu-latest
