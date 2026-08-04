@@ -12,6 +12,9 @@ mod tests {
 
         let favicon = resolve("favicon.svg").expect("embedded Tickr favicon");
         assert_eq!(favicon.content_type(), "image/svg+xml");
-        assert!(favicon.bytes().windows(4).any(|window| window == b"6.55"));
+        assert_eq!(
+            favicon.bytes(),
+            include_bytes!("../console/public/favicon.svg")
+        );
     }
 }

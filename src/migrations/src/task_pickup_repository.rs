@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -14,7 +14,9 @@ const MAX_OWNER_BYTES: usize = 128;
 pub type PickupTimestamp = DateTime<Utc>;
 
 pub fn pickup_now() -> PickupTimestamp {
-    Utc::now()
+    let now = Utc::now();
+    now.with_nanosecond(now.nanosecond() / 1_000 * 1_000)
+        .expect("microsecond precision is a valid timestamp")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
