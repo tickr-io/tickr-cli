@@ -37,4 +37,5 @@ case "${endpoint}" in
 esac
 
 export TICKR_TEST_PG_URL="postgres://${TICKR_DEV_POSTGRES_USER}:${TICKR_DEV_POSTGRES_PASSWORD}@${endpoint}"
+cargo build --locked -p tickr_ctx --bin tickr-ctx
 cargo test --locked --workspace "$@" -- --test-threads=1
