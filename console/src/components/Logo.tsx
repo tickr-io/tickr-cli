@@ -1,7 +1,6 @@
 /**
- * Tickr Concentric clock logo: an open day-progress ring and inner dial arc
- * around the clock hands and central pivot. Teal via `--primary`, so the mark
- * themes in light and dark.
+ * Tickr clock logo: an open day-progress ring around two hands and a central
+ * pivot. Teal via `--primary`, so the mark themes in light and dark.
  */
 export function Logo({ size = 28, className }: { size?: number; className?: string }) {
   return (
@@ -14,12 +13,6 @@ export function Logo({ size = 28, className }: { size?: number; className?: stri
       className={className}
       aria-hidden
     >
-      <path
-        d="M 22.55 15.86 A 6.55 6.55 0 1 1 12.73 10.33"
-        stroke="hsl(var(--primary))"
-        strokeWidth="1.25"
-        strokeLinecap="round"
-      />
       <g
         stroke="hsl(var(--primary))"
         strokeWidth="2.5"
