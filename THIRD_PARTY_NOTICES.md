@@ -135,7 +135,7 @@ It is platform-independent and includes development and optional dependencies.
 | @radix-ui/rect | 1.1.1 | MIT | https://registry.npmjs.org/@radix-ui/rect/-/rect-1.1.1.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [e34b9b806c275e64](#e34b9b806c275e64) |
 | @redocly/ajv | 8.11.2 | MIT | https://registry.npmjs.org/@redocly/ajv/-/ajv-8.11.2.tgz | [9b6a90e9be787995](#9b6a90e9be787995) |
 | @redocly/config | 0.22.0 | MIT | https://registry.npmjs.org/@redocly/config/-/config-0.22.0.tgz | [92bb818822d131f7](#92bb818822d131f7) |
-| @redocly/openapi-core | 1.34.17 | MIT | https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.17.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [461c05f87aba3a0f](#461c05f87aba3a0f) |
+| @redocly/openapi-core | 1.34.18 | MIT | https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.18.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [a52ab1344e348b17](#a52ab1344e348b17) |
 | @reduxjs/toolkit | 2.11.2 | MIT | https://registry.npmjs.org/@reduxjs/toolkit/-/toolkit-2.11.2.tgz | [49784961ec6c4941](#49784961ec6c4941) |
 | @rolldown/pluginutils | 1.0.0-beta.27 | MIT | https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0-beta.27.tgz | [23ecfff35a5a2e80](#23ecfff35a5a2e80) |
 | @rollup/rollup-android-arm-eabi | 4.60.2 | MIT | https://registry.npmjs.org/@rollup/rollup-android-arm-eabi/-/rollup-android-arm-eabi-4.60.2.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [1354a4f90c43a750](#1354a4f90c43a750) |
@@ -272,9 +272,9 @@ It is platform-independent and includes development and optional dependencies.
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | [a9040321c3712d8f](#a9040321c3712d8f), [98181e7249d0c017](#98181e7249d0c017) |
 | bollard | 0.18.1 | Apache-2.0 | https://github.com/fussybeaver/bollard | [9231b34da0d3ca12](#9231b34da0d3ca12) |
 | bollard-stubs | 1.47.1-rc.27.3.1 | Apache-2.0 | registry+https://github.com/rust-lang/crates.io-index | [cfc7749b96f63bd3](#cfc7749b96f63bd3), [6a5a563d7bd58345](#6a5a563d7bd58345) |
-| brace-expansion | 1.1.14 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.14.tgz | [68f12f6e2c336886](#68f12f6e2c336886) |
-| brace-expansion | 2.1.0 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.1.0.tgz | [68f12f6e2c336886](#68f12f6e2c336886) |
-| brace-expansion | 5.0.7 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.7.tgz | [9c63a23124d68cd3](#9c63a23124d68cd3) |
+| brace-expansion | 1.1.18 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.18.tgz | [68f12f6e2c336886](#68f12f6e2c336886) |
+| brace-expansion | 2.1.4 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.1.4.tgz | [68f12f6e2c336886](#68f12f6e2c336886) |
+| brace-expansion | 5.0.9 | MIT | https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.9.tgz | [9c63a23124d68cd3](#9c63a23124d68cd3) |
 | braces | 3.0.3 | MIT | https://registry.npmjs.org/braces/-/braces-3.0.3.tgz | [35bdd8a443397194](#35bdd8a443397194) |
 | browserslist | 4.28.2 | MIT | https://registry.npmjs.org/browserslist/-/browserslist-4.28.2.tgz | [21c2679a63d7699c](#21c2679a63d7699c) |
 | bs58 | 0.5.1 | MIT/Apache-2.0 | https://github.com/Nullus157/bs58-rs | [a60eea8175145316](#a60eea8175145316), [42d3bf7e7d4d49d7](#42d3bf7e7d4d49d7) |
@@ -563,7 +563,7 @@ It is platform-independent and includes development and optional dependencies.
 | js-sys | 0.3.103 | MIT OR Apache-2.0 | https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys | [a60eea8175145316](#a60eea8175145316), [378f5840b258e277](#378f5840b258e277) |
 | js-tokens | 4.0.0 | MIT | https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz | [2213d91c606205c7](#2213d91c606205c7) |
 | js-tokens | 9.0.1 | MIT | https://registry.npmjs.org/js-tokens/-/js-tokens-9.0.1.tgz | [33038d552d766f45](#33038d552d766f45) |
-| js-yaml | 4.2.0 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.2.0.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
+| js-yaml | 4.3.0 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.0.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
 | jsdom | 25.0.1 | MIT | https://registry.npmjs.org/jsdom/-/jsdom-25.0.1.tgz | [242d37e7cab25cba](#242d37e7cab25cba) |
 | jsesc | 3.1.0 | MIT | https://registry.npmjs.org/jsesc/-/jsesc-3.1.0.tgz | [483acb265f182907](#483acb265f182907) |
 | json-buffer | 3.0.1 | MIT | https://registry.npmjs.org/json-buffer/-/json-buffer-3.0.1.tgz | [730f0dbd825a0a9e](#730f0dbd825a0a9e) |
@@ -625,7 +625,7 @@ It is platform-independent and includes development and optional dependencies.
 | multimap | 0.10.1 | MIT OR Apache-2.0 | https://github.com/havarnov/multimap | [a60eea8175145316](#a60eea8175145316), [23ce717d2face34a](#23ce717d2face34a) |
 | mz | 2.7.0 | MIT | https://registry.npmjs.org/mz/-/mz-2.7.0.tgz | [b54cad06af80663a](#b54cad06af80663a) |
 | naive-timer | 0.2.0 | MIT | https://github.com/rcore-os/naive-timer | [71f7cb1827c7719c](#71f7cb1827c7719c) |
-| nanoid | 3.3.11 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.11.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
+| nanoid | 3.3.16 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.16.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
 | natural-compare | 1.4.0 | MIT | https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [b528adb367b47667](#b528adb367b47667) |
 | nix | 0.30.1 | MIT | https://github.com/nix-rust/nix | [66e3ee1fa7f909ad](#66e3ee1fa7f909ad) |
 | nkeys | 0.4.5 | Apache-2.0 | https://github.com/wasmcloud/nkeys | [c71d239df91726fc](#c71d239df91726fc) |
@@ -697,7 +697,7 @@ It is platform-independent and includes development and optional dependencies.
 | pluralize | 8.0.0 | MIT | https://registry.npmjs.org/pluralize/-/pluralize-8.0.0.tgz | [5822e0d816e53e35](#5822e0d816e53e35) |
 | portable-atomic | 1.14.0 | Apache-2.0 OR MIT | https://github.com/taiki-e/portable-atomic | [0d542e0c8804e39a](#0d542e0c8804e39a), [23f18e03dc49df91](#23f18e03dc49df91) |
 | portable-atomic-util | 0.2.7 | Apache-2.0 OR MIT | https://github.com/taiki-e/portable-atomic-util | [0d542e0c8804e39a](#0d542e0c8804e39a), [23f18e03dc49df91](#23f18e03dc49df91) |
-| postcss | 8.5.12 | MIT | https://registry.npmjs.org/postcss/-/postcss-8.5.12.tgz | [5be1f3465bba68a6](#5be1f3465bba68a6) |
+| postcss | 8.5.25 | MIT | https://registry.npmjs.org/postcss/-/postcss-8.5.25.tgz | [5be1f3465bba68a6](#5be1f3465bba68a6) |
 | postcss-import | 15.1.0 | MIT | https://registry.npmjs.org/postcss-import/-/postcss-import-15.1.0.tgz | [e775239f3f181bf6](#e775239f3f181bf6) |
 | postcss-js | 4.1.0 | MIT | https://registry.npmjs.org/postcss-js/-/postcss-js-4.1.0.tgz | [d6998a4ba4e15bba](#d6998a4ba4e15bba) |
 | postcss-load-config | 6.0.1 | MIT | https://registry.npmjs.org/postcss-load-config/-/postcss-load-config-6.0.1.tgz | [21ffeb3616fb8bbc](#21ffeb3616fb8bbc) |
@@ -743,8 +743,8 @@ It is platform-independent and includes development and optional dependencies.
 | react-refresh | 0.17.0 | MIT | https://registry.npmjs.org/react-refresh/-/react-refresh-0.17.0.tgz | [da6d3703ed11cbe4](#da6d3703ed11cbe4) |
 | react-remove-scroll | 2.7.2 | MIT | https://registry.npmjs.org/react-remove-scroll/-/react-remove-scroll-2.7.2.tgz | [30f0cfddf483d112](#30f0cfddf483d112) |
 | react-remove-scroll-bar | 2.3.8 | MIT | https://registry.npmjs.org/react-remove-scroll-bar/-/react-remove-scroll-bar-2.3.8.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [60a12973822917b2](#60a12973822917b2) |
-| react-router | 7.18.1 | MIT | https://registry.npmjs.org/react-router/-/react-router-7.18.1.tgz | [77c9ee6a9c5d5782](#77c9ee6a9c5d5782) |
-| react-router-dom | 7.18.1 | MIT | https://registry.npmjs.org/react-router-dom/-/react-router-dom-7.18.1.tgz | [77c9ee6a9c5d5782](#77c9ee6a9c5d5782) |
+| react-router | 7.18.2 | MIT | https://registry.npmjs.org/react-router/-/react-router-7.18.2.tgz | [77c9ee6a9c5d5782](#77c9ee6a9c5d5782) |
+| react-router-dom | 7.18.2 | MIT | https://registry.npmjs.org/react-router-dom/-/react-router-dom-7.18.2.tgz | [77c9ee6a9c5d5782](#77c9ee6a9c5d5782) |
 | react-style-singleton | 2.2.3 | MIT | https://registry.npmjs.org/react-style-singleton/-/react-style-singleton-2.2.3.tgz | [30f0cfddf483d112](#30f0cfddf483d112) |
 | read-cache | 1.0.0 | MIT | https://registry.npmjs.org/read-cache/-/read-cache-1.0.0.tgz | [e6fba77459ca7919](#e6fba77459ca7919) |
 | readdirp | 3.6.0 | MIT | https://registry.npmjs.org/readdirp/-/readdirp-3.6.0.tgz | [dffec71d93f273d2](#dffec71d93f273d2) |
@@ -8442,19 +8442,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-```
-
-<a id="461c05f87aba3a0f"></a>
-### 461c05f87aba3a0f
-
-```text
-Installed-package attribution record
-Component: @redocly/openapi-core
-Version: 1.34.17
-Declared license: MIT
-Upstream source: https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.17.tgz
-Declared author/owner metadata: Roman Hotsiy <roman@redocly.com> (https://redocly.com/)
-The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
 <a id="46231df5a7733c3f"></a>
@@ -19664,6 +19651,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+<a id="a52ab1344e348b17"></a>
+### a52ab1344e348b17
+
+```text
+Installed-package attribution record
+Component: @redocly/openapi-core
+Version: 1.34.18
+Declared license: MIT
+Upstream source: https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.18.tgz
+Declared author/owner metadata: Roman Hotsiy <roman@redocly.com> (https://redocly.com/)
+The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
 <a id="a60eea8175145316"></a>

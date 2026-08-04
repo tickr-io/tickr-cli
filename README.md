@@ -11,12 +11,25 @@ services, and observing runtime state. This repository provides:
 - a local development formation using PostgreSQL, NATS/JetStream, and
   S3-compatible object storage.
 
-The current release is distributed from source and is intended for developers
-building or integrating the Tickr runtime.
+Tagged releases publish self-contained Tickr Lite archives for Linux x86-64,
+Linux ARM64, and Apple silicon. Each archive contains the `tickr` data-plane
+executable, the `tickr-ctx` Task-context helper, the embedded Console, the
+version-matched Core DSL, two runnable onboarding workflows, license notices,
+and an adjacent SHA-256 checksum.
 
-## Install the command
+Download the archive for your platform from
+[GitHub Releases](https://github.com/tickr-io/tickr-cli/releases), verify and
+extract it, then follow its `INSTALL.md`. The guide connects Tickr Lite to an
+existing compatible Control plane and takes both the Hello and deterministic
+runtime-Patch workflows from registration through a completed Run.
 
-With Rust 1.92 and the Protocol Buffers compiler (`protoc`) installed:
+The archive needs no source checkout or external Console/DSL asset directory.
+Nix remains a host prerequisite for building and running workflow Tasks; the
+guide installs the pinned Nickel evaluator used to parse workflow and Patch
+source.
+
+To install from source, use Rust 1.92, Node.js 24.16.0, npm 11.13.0, and the
+Protocol Buffers compiler (`protoc`):
 
 ```sh
 git clone https://github.com/tickr-io/tickr-cli.git
@@ -25,8 +38,8 @@ cargo install --locked --path .
 tickr --help
 ```
 
-The command provides the `conductor`, `api`, `executor`, and `migrate`
-subcommands. A complete local formation also needs the services listed below.
+The same command also provides the distributed `conductor`, `api`, `executor`,
+and `migrate` surfaces.
 
 ## Quickstart
 
@@ -36,7 +49,7 @@ Prerequisites:
 - [Just](https://github.com/casey/just);
 - [Overmind](https://github.com/DarthSim/overmind);
 - Rust 1.92 and the Protocol Buffers compiler (`protoc`);
-- Node.js 24 and npm;
+- Node.js 24.16.0 and npm 11.13.0;
 - [Nix](https://nixos.org/download/) for building and running workflow tasks.
 
 From a fresh clone:

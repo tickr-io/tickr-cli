@@ -1376,23 +1376,23 @@
     },
     "node_modules/@redocly/openapi-core": {
       "authors": "Roman Hotsiy <roman@redocly.com> (https://redocly.com/)",
-      "integrity": "sha512-wsV2keCt6B806XpSdezbWZ9aFJYf14YVh+XQf0ESt7M90yqVuxH9//PxvtC70sgj9OCkRM3nRaLfu4MsGQZRig==",
+      "integrity": "sha512-UyKIm0wTPw5BcY7Z2PkbK1Ma260um96LSBWXHrdSMe+ZV0EPMyDfAcUcjjm3qEiGST9OK/1TriekdPCZkn4Q3A==",
       "license": "MIT",
       "name": "@redocly/openapi-core",
       "refs": [],
-      "resolved": "https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.17.tgz",
-      "version": "1.34.17"
+      "resolved": "https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.18.tgz",
+      "version": "1.34.18"
     },
     "node_modules/@redocly/openapi-core/node_modules/brace-expansion": {
       "authors": "Julian Gruber <mail@juliangruber.com>",
-      "integrity": "sha512-TN1kCZAgdgweJhWWpgKYrQaMNHcDULHkWwQIspdtjV4Y5aurRdZpjAqn6yX3FPqTA9ngHCc4hJxMAMgGfve85w==",
+      "integrity": "sha512-hGfVzPxthbf3+2yjg/RBs60cB0FhqBS/zvdV/4wn4/BmN0bNMMHPc4V/BbFieqf1TKAGGAHnY4eSjajCl0f2Xg==",
       "license": "MIT",
       "name": "brace-expansion",
       "refs": [
         "68f12f6e2c336886"
       ],
-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.1.0.tgz",
-      "version": "2.1.0"
+      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.1.4.tgz",
+      "version": "2.1.4"
     },
     "node_modules/@redocly/openapi-core/node_modules/minimatch": {
       "authors": "Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me)",
@@ -2116,14 +2116,14 @@
     },
     "node_modules/@typescript-eslint/typescript-estree/node_modules/brace-expansion": {
       "authors": "",
-      "integrity": "sha512-7oFy703dxfY3/NLxC1fh2SUCQ0H9rmAY+5EpDVfXjUTTs+HEwR2nYaqLv+GWcTsumwxPfiz6CzCNkwXwBUwqCA==",
+      "integrity": "sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==",
       "license": "MIT",
       "name": "brace-expansion",
       "refs": [
         "9c63a23124d68cd3"
       ],
-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.7.tgz",
-      "version": "5.0.7"
+      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.9.tgz",
+      "version": "5.0.9"
     },
     "node_modules/@typescript-eslint/typescript-estree/node_modules/minimatch": {
       "authors": "Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me)",
@@ -2479,14 +2479,14 @@
     },
     "node_modules/brace-expansion": {
       "authors": "Julian Gruber <mail@juliangruber.com>",
-      "integrity": "sha512-MWPGfDxnyzKU7rNOW9SP/c50vi3xrmrua/+6hfPbCS2ABNWfx24vPidzvC7krjU/RTo235sV776ymlsMtGKj8g==",
+      "integrity": "sha512-Edep/X9fGqVNmzKBVsDYIOtD+z1tuezV70LBjdCst9Tqu76lsnvRiZ6oTic1n+/BIwX6QDGAO94PN4N2SADvtw==",
       "license": "MIT",
       "name": "brace-expansion",
       "refs": [
         "68f12f6e2c336886"
       ],
-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.14.tgz",
-      "version": "1.1.14"
+      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.18.tgz",
+      "version": "1.1.18"
     },
     "node_modules/braces": {
       "authors": "Jon Schlinkert (https://github.com/jonschlinkert), Brian Woodward (https://twitter.com/doowb), Elan Shanker (https://github.com/es128), Eugene Sharygin (https://github.com/eush77), hemanth.hm (http://h3manth.com), Jon Schlinkert (http://twitter.com/jonschlinkert)",
@@ -3886,14 +3886,14 @@
     },
     "node_modules/js-yaml": {
       "authors": "Vladimir Zapparov <dervus.grim@gmail.com>, Aleksey V Zapparov <ixti@member.fsf.org> (http://www.ixti.net/), Vitaly Puzrin <vitaly@rcdesign.ru> (https://github.com/puzrin), Martin Grenfell <martin.grenfell@gmail.com> (http://got-ravings.blogspot.com)",
-      "integrity": "sha512-ePWsvanv0DWuDRsW8dnt+R4jQ31SCRCQ7hhNcPXZPsoBZiemuZNYGf7adZdqX2D86j6rvKp3RpCxVTSb8WQlOw==",
+      "integrity": "sha512-1td788aAnnZ5qs7V2QIRl1owjtYpbKt749Y3xauqQgwIIGF/xXWz1wMTEBx5O3LK3lXLVuqXPdPxj2BoFHaW9Q==",
       "license": "MIT",
       "name": "js-yaml",
       "refs": [
         "a07bc24468b9654c"
       ],
-      "resolved": "https://registry.npmjs.org/js-yaml/-/js-yaml-4.2.0.tgz",
-      "version": "4.2.0"
+      "resolved": "https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.0.tgz",
+      "version": "4.3.0"
     },
     "node_modules/jsdom": {
       "authors": "",
@@ -4203,14 +4203,14 @@
     },
     "node_modules/nanoid": {
       "authors": "Andrey Sitnik <andrey@sitnik.ru>",
-      "integrity": "sha512-N8SpfPUnUp1bK+PMYW8qSWdl9U+wwNWI4QKxOYDy9JAro3WMX7p2OeVRF9v+347pnakNevPmiHhNmZ2HbFA76w==",
+      "integrity": "sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==",
       "license": "MIT",
       "name": "nanoid",
       "refs": [
         "da4db1480d9beea3"
       ],
-      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.11.tgz",
-      "version": "3.3.11"
+      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.16.tgz",
+      "version": "3.3.16"
     },
     "node_modules/natural-compare": {
       "authors": "Lauri Rooden (https://github.com/litejs/natural-compare-lite)",
@@ -4498,14 +4498,14 @@
     },
     "node_modules/postcss": {
       "authors": "Andrey Sitnik <andrey@sitnik.es>",
-      "integrity": "sha512-W62t/Se6rA0Az3DfCL0AqJwXuKwBeYg6nOaIgzP+xZ7N5BFCI7DYi1qs6ygUYT6rvfi6t9k65UMLJC+PHZpDAA==",
+      "integrity": "sha512-DTPx3RWSSnWyzLxQnlH0rJP+EW5ekl16ZU4/psbIhA0e53kJfdgaN5vKM+xP7yJtXVu+nfdVFmlgFDEKAe4Pyw==",
       "license": "MIT",
       "name": "postcss",
       "refs": [
         "5be1f3465bba68a6"
       ],
-      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.12.tgz",
-      "version": "8.5.12"
+      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.25.tgz",
+      "version": "8.5.25"
     },
     "node_modules/postcss-import": {
       "authors": "Maxime Thirouin",
@@ -4738,25 +4738,25 @@
     },
     "node_modules/react-router": {
       "authors": "Remix Software <hello@remix.run>",
-      "integrity": "sha512-GDLgg3i3uM0aeJO3Fm+TCS+sDQ7gu12T6x0qdTEzcwqEfleci7JwugVNIF3U//0FWKnJT7ptG+20B2jfDqnZAg==",
+      "integrity": "sha512-aUVMjFm3GAPTTZL7oYr5E7ETiqfQCHRLH+B+5afnICvf0r7kkK4eR6SMuwbSTJw/7t+12khT/Kahij49fqOCIg==",
       "license": "MIT",
       "name": "react-router",
       "refs": [
         "77c9ee6a9c5d5782"
       ],
-      "resolved": "https://registry.npmjs.org/react-router/-/react-router-7.18.1.tgz",
-      "version": "7.18.1"
+      "resolved": "https://registry.npmjs.org/react-router/-/react-router-7.18.2.tgz",
+      "version": "7.18.2"
     },
     "node_modules/react-router-dom": {
       "authors": "Remix Software <hello@remix.run>",
-      "integrity": "sha512-KaZh+X/6UtEp28x51AUYZDMg9NGoz2ja3dNHa+ta/tk40vCzKhQ/RypCWBMLbmDr6//E24Vv5uPsrqXFozdkAg==",
+      "integrity": "sha512-AIKJ/jgGlFb3EbfCXk5Gzshiwt+l3mqbCrNjmEWMMjqQxNJ3svBa6bgzFyCC2Sw3RA0VWF1kg3uQf2OFhxb8hw==",
       "license": "MIT",
       "name": "react-router-dom",
       "refs": [
         "77c9ee6a9c5d5782"
       ],
-      "resolved": "https://registry.npmjs.org/react-router-dom/-/react-router-dom-7.18.1.tgz",
-      "version": "7.18.1"
+      "resolved": "https://registry.npmjs.org/react-router-dom/-/react-router-dom-7.18.2.tgz",
+      "version": "7.18.2"
     },
     "node_modules/react-style-singleton": {
       "authors": "Anton Korzunov (thekashey@gmail.com)",

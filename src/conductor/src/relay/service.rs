@@ -2225,6 +2225,27 @@ async fn try_run_streaming_lite(
                 match EntityType::try_from(message.entity_type) {
                     Ok(EntityType::TaskQueueItem) => {
                         let dispatch = tc::TaskDispatch::decode(&message.payload[..])?;
+                        if let Some(signal_id) = dispatch
+                            .originating_signal_id
+                            .as_deref()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                        {
+                            if let Ok(workflow_instance_id) =
+                                Uuid::parse_str(&dispatch.workflow_instance_id)
+                            {
+                                if let Err(error) = crate::signal_captures::mark_materialized(
+                                    definition_repository.as_ref(),
+                                    signal_id,
+                                    workflow_instance_id,
+                                )
+                                .await
+                                {
+                                    eprintln!(
+                                        "Lite instance-creation linkage failed for signal {signal_id} / run {workflow_instance_id}: {error} (forwarding the task anyway)"
+                                    );
+                                }
+                            }
+                        }
                         roles.stage_task_dispatch(&message.payload).await?;
                         let delivered = tc::TaskEvent {
                             task_instance_id: dispatch.task_instance_id,
@@ -2347,6 +2368,7 @@ mod lite_relay_tests {
     struct TestRelay {
         connections: Arc<AtomicUsize>,
         outage: CancellationToken,
+        message: Option<ConductorRelayMessage>,
     }
 
     #[tonic::async_trait]
@@ -2360,7 +2382,13 @@ mod lite_relay_tests {
             self.connections.fetch_add(1, Ordering::Release);
             let (tx, rx) = mpsc::channel(1);
             let outage = self.outage.clone();
+            let message = self.message.clone();
             tokio::spawn(async move {
+                if let Some(message) = message {
+                    if tx.send(Ok(message)).await.is_err() {
+                        return;
+                    }
+                }
                 outage.cancelled().await;
                 drop(tx);
             });
@@ -2417,12 +2445,14 @@ mod lite_relay_tests {
         address: std::net::SocketAddr,
         connections: Arc<AtomicUsize>,
         outage: CancellationToken,
+        message: Option<ConductorRelayMessage>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(ConductorRelayServiceServer::new(TestRelay {
                     connections,
                     outage,
+                    message,
                 }))
                 .serve(address)
                 .await
@@ -2448,8 +2478,13 @@ mod lite_relay_tests {
         let relay_url = format!("http://{address}");
         let connections = Arc::new(AtomicUsize::new(0));
         let first_outage = CancellationToken::new();
-        let first_server =
-            start_relay(address, Arc::clone(&connections), first_outage.clone()).await;
+        let first_server = start_relay(
+            address,
+            Arc::clone(&connections),
+            first_outage.clone(),
+            None,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!first_server.is_finished(), "test relay failed to start");
         let (_directory, repository) = definition_repository().await;
@@ -2470,11 +2505,94 @@ mod lite_relay_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!relay.is_finished(), "a relay outage must not fail Lite");
 
-        let second_server =
-            start_relay(address, Arc::clone(&connections), CancellationToken::new()).await;
+        let second_server = start_relay(
+            address,
+            Arc::clone(&connections),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
         await_connections(&connections, 2).await;
         shutdown.cancel();
         relay.await.unwrap().unwrap();
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn lite_relay_links_trigger_signal_from_first_task_dispatch() {
+        let signal_id = Uuid::new_v4();
+        let workflow_id = Uuid::new_v4();
+        let workflow_instance_id = Uuid::new_v4();
+        let dispatch = tc::TaskDispatch {
+            task_instance_id: Uuid::new_v4().to_string(),
+            task_id: Uuid::new_v4().to_string(),
+            workflow_instance_id: workflow_instance_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            name: "dispatch-task".to_owned(),
+            task_type: 0,
+            nix_expression_path: "/p".to_owned(),
+            nix_args: vec![],
+            outputs: vec![],
+            inputs: vec![],
+            secrets: vec![],
+            tenant_id: "test-tenant".to_owned(),
+            originating_signal_id: Some(signal_id.to_string()),
+            gate_signal_ids: Default::default(),
+            gate_signal_ids_ambient: vec![],
+        };
+        let message = ConductorRelayMessage {
+            entity_type: EntityType::TaskQueueItem as i32,
+            payload: dispatch.encode_to_vec(),
+            tenant_id: None,
+        };
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let outage = CancellationToken::new();
+        let server = start_relay(
+            address,
+            Arc::clone(&connections),
+            outage.clone(),
+            Some(message),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!server.is_finished(), "test relay failed to start");
+
+        let (_directory, repository) = definition_repository().await;
+        crate::signal_captures::insert(&repository, signal_id, workflow_id, Some(1), &[])
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let relay = tokio::spawn(run_streaming_lite_at(
+            shutdown.clone(),
+            Arc::clone(&repository),
+            Arc::new(NoopRoles),
+            format!("http://{address}"),
+            "test-tenant".to_owned(),
+        ));
+
+        await_connections(&connections, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let row = crate::signal_captures::read(&repository, signal_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.materialized_run_id == Some(workflow_instance_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("trigger signal was not linked from the first Lite task dispatch");
+
+        shutdown.cancel();
+        relay.await.unwrap().unwrap();
+        outage.cancel();
+        server.abort();
     }
 }

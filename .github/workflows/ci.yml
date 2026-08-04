@@ -34,7 +34,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: 24.16.0
+      - name: Pin npm for Cargo-owned Console build
+        run: npm install --global npm@11.13.0
       - name: Install system tools
         run: |
           sudo apt-get update
@@ -65,9 +67,11 @@ jobs:
           toolchain: 1.92.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: 24.16.0
           cache: npm
           cache-dependency-path: console/package-lock.json
+      - name: Pin npm
+        run: npm install --global npm@11.13.0
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install Console dependencies

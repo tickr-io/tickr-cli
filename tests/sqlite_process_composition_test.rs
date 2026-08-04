@@ -1,5 +1,6 @@
 #![cfg(not(madsim))]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -802,4 +803,56 @@ async fn stale_sqlite_processes_refuse_before_substrate_startup() {
             "unexpected stale-schema error: {stderr}"
         );
     }
+}
+
+#[tokio::test]
+async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let data_root = directory.path().join("data");
+    std::fs::create_dir(&data_root).unwrap();
+    std::fs::set_permissions(&data_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = data_root.join("tickr.db");
+    let sqlite_url = sqlite_url(&database);
+
+    let migration = Command::new(env!("CARGO_BIN_EXE_tickr"))
+        .args(["migrate", "--formation", "tickr-lite"])
+        .env("TICKR_SQL_BACKEND", "sqlite")
+        .env("TICKR_SQL_TOPOLOGY", "single-node")
+        .env("TICKR_CONDUCTOR_SQLITE_URL", &sqlite_url)
+        .output()
+        .expect("migrate Tickr Lite startup fixture");
+    assert!(
+        migration.status.success(),
+        "Tickr Lite migration failed: {}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+
+    let port_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("127.0.0.1:{}", port_probe.local_addr().unwrap().port());
+    drop(port_probe);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    command
+        .arg("tickr-lite")
+        .current_dir(directory.path())
+        .env_remove("TICKR_CONDUCTOR_POSTGRES_URL")
+        .env_remove("TICKR_NATS_URL")
+        .env_remove("TICKR_LOG_STORAGE_ENDPOINT")
+        .env_remove("TICKR_CONSOLE_DIST")
+        .env("TICKR_SQL_BACKEND", "sqlite")
+        .env("TICKR_SQL_TOPOLOGY", "single-node")
+        .env("TICKR_CONDUCTOR_SQLITE_URL", &sqlite_url)
+        .env("TICKR_TENANT_SLUG", "lite-startup-probe")
+        .env("TICKR_API_BIND_ADDR", &address)
+        .env("TICKR_COORDINATOR_HTTP_URL", "http://127.0.0.1:1")
+        .env("TICKR_COORDINATOR_RELAY_URL", "http://127.0.0.1:1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut lite = ManagedChild {
+        label: "Tickr Lite",
+        child: command.spawn().expect("spawn Tickr Lite"),
+    };
+
+    wait_for_api(&address).await;
+    lite.terminate().await;
 }

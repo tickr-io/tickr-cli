@@ -1,0 +1,111 @@
+name: release-tickr-lite
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  NODE_VERSION: 24.16.0
+  NPM_VERSION: 11.13.0
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: Pin npm
+        run: npm install --global npm@${NPM_VERSION}
+      - name: Install protoc on Linux
+        if: startsWith(matrix.runner, 'ubuntu-')
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Install protoc on macOS
+        if: startsWith(matrix.runner, 'macos-')
+        run: brew install protobuf
+      - name: Verify generated Console contracts
+        working-directory: console
+        run: |
+          npm ci --no-audit --no-fund
+          npm run check-openapi
+          npm run check-api
+      - name: Build self-contained Tickr Lite executables
+        run: cargo build --locked --release -p tickr -p tickr_ctx --target "${{ matrix.target }}"
+      - name: Package Tickr Lite
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          python3 scripts/package_tickr_lite.py \
+            --binary "target/${TARGET}/release/tickr" \
+            --ctx-binary "target/${TARGET}/release/tickr-ctx" \
+            --version "$version" \
+            --target "$TARGET" \
+            --output dist
+          artifact="tickr-lite-v${version}-${TARGET}"
+          mkdir extracted
+          tar -xzf "dist/${artifact}.tar.gz" -C extracted
+          test -x "extracted/${artifact}/tickr-ctx"
+          test -f "extracted/${artifact}/INSTALL.md"
+          test -f "extracted/${artifact}/dsl/lib.ncl"
+          test -f "extracted/${artifact}/examples/hello-world.ncl"
+          test -f "extracted/${artifact}/examples/runtime-patch.ncl"
+          "extracted/${artifact}/tickr" tickr-lite --help
+      - name: Upload release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tickr-lite-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Verify release checksums
+        working-directory: artifacts
+        run: |
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "Tickr $GITHUB_REF_NAME"

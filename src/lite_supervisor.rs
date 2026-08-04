@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,7 +54,8 @@ use tickr_executor::task_log_shipper::{ShipperConfig, TaskLogShipper};
 use tickr_executor::wire::DispatchedTask;
 use tickr_migrations::backend::WriterRepositoryBundle;
 use tickr_migrations::scope_repository::{
-    CreateTickrCtxScopeInput, ScopeCreationOutcome, ScopeStore, ScopeValueInput,
+    CreateTickrCtxScopeInput, ScopeCreationOutcome, ScopeStore, ScopeValueInput, ScopeWriteOutcome,
+    WriteTickrCtxScopeInput,
 };
 use tickr_proto::config::DataPlaneSql;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -244,6 +245,12 @@ impl LiteSupervisor {
         {}
 
         let (pickup_client, pickup_writer) = LocalTaskPickupWriter::new(writer.as_ref().clone());
+        let mut children: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
+        let pickup_cancel = self.cancel.child_token();
+        spawn_child(&mut children, "task-pickup-writer", async move {
+            pickup_writer.run(pickup_cancel).await;
+            Ok(())
+        });
         let scope_store: Arc<dyn ScopeStore> = writer.clone();
 
         let (scope_writer_client, scope_writer) = TickrCtxScopeWriter::new(scope_store.clone());
@@ -266,6 +273,7 @@ impl LiteSupervisor {
                 data_directory: data_directory.clone(),
                 logs: Arc::new(Mutex::new(HashMap::new())),
                 scope_store: scope_store.clone(),
+                writer: writer.clone(),
                 log_config: ShipperConfig::from_env(),
                 shutdown: self.cancel.clone(),
             },
@@ -330,20 +338,13 @@ impl LiteSupervisor {
             writer: writer.clone(),
             data_directory: data_directory.clone(),
         })));
-        let console_root = console_root()?;
-        if !console_root.join("index.html").is_file() {
-            bail!(
-                "embedded Console assets are missing at {}; run the Console build first",
-                console_root.display()
-            );
-        }
         let api_state = tickr_api::http::routes::build_lite_app_state(
             command_bus,
             read_only,
             coordinator,
             logs,
             self.ready.clone(),
-            console_root,
+            crate::embedded_console::resolve,
             fleet,
             health_descriptor,
         );
@@ -353,12 +354,6 @@ impl LiteSupervisor {
             .context("binding Tickr Lite API listener")?;
 
         let (work_admission_tx, work_admission_rx) = watch::channel(false);
-        let mut children: JoinSet<(&'static str, Result<()>)> = JoinSet::new();
-        let pickup_cancel = self.cancel.child_token();
-        spawn_child(&mut children, "task-pickup-writer", async move {
-            pickup_writer.run(pickup_cancel).await;
-            Ok(())
-        });
         spawn_child(
             &mut children,
             "command-writer",
@@ -566,6 +561,7 @@ struct LiteTaskProcessLauncher {
     data_directory: Arc<DataDirectory>,
     logs: Arc<Mutex<HashMap<String, CapturedLogStream>>>,
     scope_store: Arc<dyn ScopeStore>,
+    writer: Arc<WriterRepositoryBundle>,
     log_config: ShipperConfig,
     shutdown: CancellationToken,
 }
@@ -577,6 +573,56 @@ impl LiteTaskProcessLauncher {
         };
         capture.shipper.finish(exit, &self.shutdown).await;
         Ok(())
+    }
+}
+
+async fn seed_trigger_captures(
+    writer: &WriterRepositoryBundle,
+    scope_id: Uuid,
+    signal_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(signal_id) = signal_id else {
+        return Ok(());
+    };
+    let row = tickr_conductor::signal_captures::read(writer, signal_id)
+        .await
+        .map_err(|error| format!("read Trigger-derived Event variables: {error}"))?
+        .ok_or_else(|| format!("Trigger-derived Event variables are absent for {signal_id}"))?;
+    if row.captures.is_empty() {
+        return Ok(());
+    }
+
+    let encoded = row
+        .captures
+        .into_iter()
+        .map(|capture| {
+            let key = format!(
+                "{}/{}",
+                signal_id,
+                tickr_ctx::scope::sanitize_segment(&capture.name)
+            );
+            let envelope = serde_json::to_vec(&capture.envelope)
+                .map_err(|error| format!("encode Trigger-derived Event variable: {error}"))?;
+            Ok((key, envelope))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let values = encoded
+        .iter()
+        .map(|(key, envelope)| ScopeValueInput { key, envelope })
+        .collect::<Vec<_>>();
+    let claim_id = Uuid::new_v5(&scope_id, signal_id.as_bytes());
+    match writer
+        .write_tickr_ctx_scope(WriteTickrCtxScopeInput {
+            scope_id,
+            claim_id,
+            values: &values,
+            now: Utc::now(),
+        })
+        .await
+        .map_err(|error| format!("seed Trigger-derived Event variables: {error}"))?
+    {
+        ScopeWriteOutcome::Applied { .. } | ScopeWriteOutcome::Idempotent => Ok(()),
+        outcome => Err(format!("seed Trigger-derived Event variables: {outcome:?}")),
     }
 }
 
@@ -610,6 +656,7 @@ impl TaskProcessLauncher for LiteTaskProcessLauncher {
             ScopeCreationOutcome::Collision { existing_scope_id } => existing_scope_id,
             outcome => return Err(format!("create tickr-ctx task scope: {outcome:?}")),
         };
+        seed_trigger_captures(self.writer.as_ref(), scope_id, task.originating_signal_id).await?;
         let task_id = task.task_instance_id.to_string();
         if self.logs.lock().await.contains_key(&task_id) {
             self.ctx.revoke_task(&task_id).await;
@@ -1229,13 +1276,6 @@ fn marker(terminal: FinalLogTerminal) -> Option<EndOfStreamMarker> {
     })
 }
 
-fn console_root() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TICKR_CONSOLE_DIST") {
-        return Ok(PathBuf::from(path));
-    }
-    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("console/dist"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,6 +1299,82 @@ mod tests {
         admit.send(true).unwrap();
         child.await.unwrap().unwrap();
         assert!(polled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn trigger_captures_are_seeded_into_the_materialized_run_scope() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use tickr_conductor::signal_captures::NamedEnvelope;
+        use tickr_ctx::envelope::{Envelope, Producer, SignalSource};
+        use tickr_migrations::backend::RepositoryFactory;
+        use tickr_migrations::scope_repository::ScopeReadOutcome;
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("scope.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(tickr_migrations::sqlite_writer_options(&url, true).unwrap())
+            .await
+            .unwrap();
+        tickr_migrations::apply_sqlite(tickr_migrations::MigrationTarget::Conductor, &pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let writer = RepositoryFactory::new(DataPlaneSql::Sqlite { url })
+            .open_writer()
+            .await
+            .unwrap();
+        let signal_id = Uuid::new_v4();
+        let workflow_id = Uuid::new_v4();
+        let scope_id = Uuid::new_v4();
+        let envelope = Envelope::new(
+            "json",
+            serde_json::json!(42),
+            false,
+            Producer::Signal {
+                signal_id,
+                source: SignalSource::Manual,
+            },
+        );
+        tickr_conductor::signal_captures::insert(
+            &writer,
+            signal_id,
+            workflow_id,
+            Some(1),
+            &[NamedEnvelope {
+                name: "seed".to_owned(),
+                envelope,
+            }],
+        )
+        .await
+        .unwrap();
+        writer
+            .create_tickr_ctx_scope(CreateTickrCtxScopeInput {
+                scope_id,
+                namespace: "default",
+                run_id: &scope_id.to_string(),
+                claim_id: Uuid::new_v4(),
+                values: &[],
+                now: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        seed_trigger_captures(&writer, scope_id, Some(signal_id))
+            .await
+            .unwrap();
+        let ScopeReadOutcome::Present(values) = writer
+            .read_tickr_ctx_scope(scope_id, Utc::now())
+            .await
+            .unwrap()
+        else {
+            panic!("materialized run scope must be readable");
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].key, format!("{signal_id}/seed"));
+        let stored: Envelope = serde_json::from_slice(&values[0].envelope).unwrap();
+        assert_eq!(stored.value, serde_json::json!(42));
+        writer.close().await;
     }
 
     #[tokio::test]

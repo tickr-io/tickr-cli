@@ -60,6 +60,32 @@ struct TenantInfoResponse {
     workflow_count: i64,
 }
 
+/// One immutable Console asset compiled into the Tickr data-plane binary.
+#[derive(Clone, Copy)]
+pub struct ConsoleAsset {
+    bytes: &'static [u8],
+    content_type: &'static str,
+}
+
+impl ConsoleAsset {
+    pub const fn new(bytes: &'static [u8], content_type: &'static str) -> Self {
+        Self {
+            bytes,
+            content_type,
+        }
+    }
+
+    pub const fn bytes(self) -> &'static [u8] {
+        self.bytes
+    }
+
+    pub const fn content_type(self) -> &'static str {
+        self.content_type
+    }
+}
+
+pub type ConsoleAssetResolver = fn(&str) -> Option<ConsoleAsset>;
+
 /// Application state shared across handlers. Every SQL-backed handler receives
 /// only the selected read-only repository operation bundle.
 #[derive(Clone)]
@@ -81,7 +107,7 @@ pub struct AppState {
     lite_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     distributed_ready: Option<FormationReadiness>,
     distributed_diagnostics: Option<FormationDiagnostics>,
-    console_root: Option<Arc<std::path::PathBuf>>,
+    console_assets: Option<ConsoleAssetResolver>,
     executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
     // Immutable, location-free projection of the admitted formation descriptor.
     lite_formation: Option<super::health::ResolvedFormationHealth>,
@@ -91,8 +117,8 @@ pub struct AppState {
 /// port directly can tell which binary answered.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/", responses((status = 200, body = HelloResponse)))]
 async fn hello_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(root) = &state.console_root {
-        return serve_console_file(root, "index.html").await;
+    if let Some(resolve) = state.console_assets {
+        return serve_console_asset(resolve, "index.html");
     }
     Json(HelloResponse {
         message: "Hello from Tickr API".to_string(),
@@ -2979,7 +3005,7 @@ fn neutralize_descriptions(value: &mut serde_json::Value) {
     }
 }
 
-async fn serve_console_file(root: &std::path::Path, requested: &str) -> Response {
+fn serve_console_asset(resolve: ConsoleAssetResolver, requested: &str) -> Response {
     let requested = std::path::Path::new(requested);
     if requested.components().any(|component| {
         matches!(
@@ -2991,27 +3017,16 @@ async fn serve_console_file(root: &std::path::Path, requested: &str) -> Response
     }) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let candidate = root.join(requested);
-    let path = if candidate.is_file() {
-        candidate
-    } else {
-        root.join("index.html")
+    let key = requested.to_string_lossy();
+    let Some(asset) = resolve(&key).or_else(|| resolve("index.html")) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let content_type = match path.extension().and_then(|extension| extension.to_str()) {
-                Some("html") => "text/html; charset=utf-8",
-                Some("js") => "text/javascript; charset=utf-8",
-                Some("css") => "text/css; charset=utf-8",
-                Some("svg") => "image/svg+xml",
-                Some("json") => "application/json",
-                Some("png") => "image/png",
-                _ => "application/octet-stream",
-            };
-            ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+    let mut response = Response::new(axum::body::Body::from(asset.bytes()));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(asset.content_type()),
+    );
+    response
 }
 
 /// Serialize the generated document deterministically for the committed
@@ -3106,7 +3121,7 @@ pub fn build_app_state_with_runtime_readiness(
         lite_ready: None,
         distributed_ready,
         distributed_diagnostics,
-        console_root: None,
+        console_assets: None,
         executor_fleet,
         lite_formation: None,
     })
@@ -3119,7 +3134,7 @@ pub fn build_lite_app_state(
     coordinator: Arc<super::coordinator_client::CoordinatorClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
     ready: Arc<std::sync::atomic::AtomicBool>,
-    console_root: std::path::PathBuf,
+    console_assets: ConsoleAssetResolver,
     executor_fleet: tickr_executor::local_pickup::LocalExecutorFleetStatus,
     formation: super::health::ResolvedFormationHealth,
 ) -> Arc<AppState> {
@@ -3133,7 +3148,7 @@ pub fn build_lite_app_state(
         lite_ready: Some(ready),
         distributed_ready: None,
         distributed_diagnostics: None,
-        console_root: Some(Arc::new(console_root)),
+        console_assets: Some(console_assets),
         executor_fleet: Arc::new(executor_fleet),
         lite_formation: Some(formation),
     })
@@ -3157,20 +3172,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Add the Console's client-side routes without changing the documented API
 /// surface. Unknown paths fall back to `index.html` for SPA navigation.
 pub fn build_lite_router(state: Arc<AppState>) -> Router {
-    let console_root = state
-        .console_root
-        .clone()
-        .expect("Tickr Lite AppState carries Console assets");
+    let console_assets = state
+        .console_assets
+        .expect("Tickr Lite AppState carries embedded Console assets");
     let ready = state
         .lite_ready
         .clone()
         .expect("Tickr Lite AppState carries its readiness gate");
     build_router(state)
-        .fallback(get(move |OriginalUri(uri): OriginalUri| {
-            let console_root = console_root.clone();
-            async move {
-                serve_console_file(&console_root, uri.path().trim_start_matches('/')).await
-            }
+        .fallback(get(move |OriginalUri(uri): OriginalUri| async move {
+            serve_console_asset(console_assets, uri.path().trim_start_matches('/'))
         }))
         .layer(from_fn_with_state(ready, lite_admission_guard))
 }

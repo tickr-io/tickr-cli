@@ -2,7 +2,7 @@ let tickr = import "lib.ncl" in
 let hello = tickr.mkTask {
   name = "hello",
   args = ["hello from Tickr"],
-  nix_expression_path = "./examples/hello.nix",
+  nix_expression_path = "path:./examples#hello",
   outputs = [],
 } in
 tickr.mkWorkflow {
@@ -10,5 +10,12 @@ tickr.mkWorkflow {
   name = "hello-world",
   args = [],
   outputs = [],
-  tasks = [hello],
+  tasks = [
+    tickr.mkTaskGroup {
+      name = "hello",
+      args = [],
+      outputs = [],
+      tasks = [ hello ],
+    },
+  ],
 }

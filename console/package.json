@@ -1,7 +1,7 @@
 {
   "name": "tickr-console",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -9,6 +9,11 @@
     "directory": "console"
   },
   "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": "24.16.0",
+    "npm": "11.13.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -45,7 +50,7 @@
     "react": "^19.1.0",
     "react-day-picker": "^9.14.0",
     "react-dom": "^19.1.0",
-    "react-router-dom": "^7.13.0",
+    "react-router-dom": "^7.18.2",
     "recharts": "^3.8.1",
     "tailwind-merge": "^3.3.1"
   },

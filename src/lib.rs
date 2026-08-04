@@ -1,5 +1,6 @@
 pub mod all_redis_formation;
 pub mod data_directory;
+mod embedded_console;
 pub mod formation;
 pub mod formation_manifest;
 pub mod lite_supervisor;

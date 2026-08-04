@@ -45,6 +45,7 @@ use tickr_api::http::health::{
 use tickr_api::http::logs_resolver::{
     LocalTaskLogStore, LogBatchPage, LogsError, LogsResolver, TaskLogs,
 };
+use tickr_api::http::routes::ConsoleAsset;
 use tickr_executor::local_pickup::{
     ExecutorCapacityObservation, ExecutorFleetSnapshot, LocalExecutorCapacity,
 };
@@ -1135,11 +1136,23 @@ async fn spawn_mutable_control_plane() -> (String, Arc<AtomicU8>) {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{address}"), state)
 }
+fn test_console_asset(path: &str) -> Option<ConsoleAsset> {
+    match path {
+        "index.html" => Some(ConsoleAsset::new(
+            b"<!doctype html><title>Tickr test Console</title>",
+            "text/html; charset=utf-8",
+        )),
+        "favicon.svg" => Some(ConsoleAsset::new(
+            b"<svg><path data-mark=\"concentric\"/></svg>",
+            "image/svg+xml",
+        )),
+        _ => None,
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_states() {
     let (directory, _url, repositories) = migrated_sqlite_repository().await;
-    std::fs::write(directory.path().join("index.html"), "<html></html>").unwrap();
     let (coordinator_url, control_plane_state) = spawn_mutable_control_plane().await;
     let coordinator = Arc::new(CoordinatorClient::new(coordinator_url));
     let (command_bus, command_writer) = CommandBus::local(LocalCommandBusConfig::default());
@@ -1173,7 +1186,7 @@ async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_s
         coordinator,
         Arc::new(LogsResolver::local(Arc::new(UnusedLocalLogs))),
         ready.clone(),
-        directory.path().to_path_buf(),
+        test_console_asset,
         fleet,
         lite_formation_health(),
     );
@@ -1214,6 +1227,31 @@ async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_s
     ready.store(true, Ordering::Release);
     let ready_response = client.get(format!("{base}/health")).send().await.unwrap();
     assert_eq!(ready_response.status(), reqwest::StatusCode::OK);
+    let index = client.get(&base).send().await.unwrap();
+    assert_eq!(index.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        index.text().await.unwrap(),
+        "<!doctype html><title>Tickr test Console</title>"
+    );
+    let favicon = client
+        .get(format!("{base}/favicon.svg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(favicon.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        favicon.headers()[reqwest::header::CONTENT_TYPE],
+        "image/svg+xml"
+    );
+    let spa = client
+        .get(format!("{base}/workflows/example"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        spa.text().await.unwrap(),
+        "<!doctype html><title>Tickr test Console</title>"
+    );
     let healthy: serde_json::Value = client
         .get(format!("{base}/api/health"))
         .send()

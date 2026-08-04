@@ -4146,7 +4146,7 @@ dependencies = [
 
 [[package]]
 name = "tickr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_conductor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_ctx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_executor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -4308,7 +4308,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_migrations"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "tickr_proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
