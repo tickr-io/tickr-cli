@@ -175,6 +175,8 @@ locally before every commit.
 
 ## Documentation
 
+- [Tickr Documentation](https://tickr-io.github.io/tickr-cli/) — install, author,
+  operate, integrate, and reference guides for supported release lines
 - [Architecture](docs/architecture.md)
 - [Production hardening](docs/production-hardening.md)
 - [Contributing](CONTRIBUTING.md)

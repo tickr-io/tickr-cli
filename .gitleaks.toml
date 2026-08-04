@@ -5,4 +5,5 @@ useDefault = true
 description = "Ignored build output and local runtime state"
 paths = [
   '''(^|/)(target|node_modules|dist|infra|logs|\.pi-subagents)(/|$)''',
+  '''^docs-site/(\.docusaurus|build|docs/api)(/|$)''',
 ]

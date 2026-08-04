@@ -9,7 +9,10 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCK = json.loads((ROOT / "console/package-lock.json").read_text())["packages"]
+LOCKFILES = (
+    ROOT / "console/package-lock.json",
+    ROOT / "docs-site/package-lock.json",
+)
 OUTPUT = ROOT / "third_party/npm-attribution.json"
 LICENSE_NAMES = ("license", "copying", "notice", "copyright")
 
@@ -49,6 +52,26 @@ def author_string(package):
             values.append(contributor["name"])
     return ", ".join(dict.fromkeys(values))
 
+def license_string(package, metadata):
+    declaration = (
+        metadata.get("license")
+        or package.get("license")
+        or package.get("licenses")
+        or "UNKNOWN"
+    )
+    if isinstance(declaration, str):
+        return declaration
+    if isinstance(declaration, dict):
+        return declaration.get("type") or declaration.get("name") or "UNKNOWN"
+    if isinstance(declaration, list):
+        identifiers = [
+            item.get("type") or item.get("name") if isinstance(item, dict) else str(item)
+            for item in declaration
+        ]
+        identifiers = list(dict.fromkeys(item for item in identifiers if item))
+        return " OR ".join(identifiers) or "UNKNOWN"
+    return "UNKNOWN"
+
 
 def fetch_package(metadata, texts):
     url = metadata["resolved"]
@@ -76,26 +99,38 @@ def fetch_package(metadata, texts):
     return package_json, sorted(set(refs))
 
 
+def locked_packages():
+    for lockfile in LOCKFILES:
+        scope = lockfile.parent.name
+        packages = json.loads(lockfile.read_text())["packages"]
+        for path, metadata in packages.items():
+            if path and "node_modules/" in path:
+                yield f"{scope}/{path}", metadata
+
+
+
+
 def main():
     texts = {}
     packages = {}
-    entries = [
-        (path, metadata) for path, metadata in sorted(LOCK.items())
-        if path and "node_modules/" in path
-    ]
+    fetched = {}
+    entries = sorted(locked_packages())
     for index, (path, metadata) in enumerate(entries, 1):
-        package, refs = fetch_package(metadata, texts)
+        cache_key = (metadata["resolved"], metadata["integrity"])
+        if cache_key not in fetched:
+            fetched[cache_key] = fetch_package(metadata, texts)
+        package, refs = fetched[cache_key]
         packages[path] = {
             "name": package_name(path),
             "version": metadata.get("version", "UNKNOWN"),
-            "license": metadata.get("license", "UNKNOWN"),
+            "license": license_string(package, metadata),
             "resolved": metadata["resolved"],
             "integrity": metadata["integrity"],
             "authors": author_string(package),
             "refs": refs,
         }
         print(f"[{index}/{len(entries)}] {path}")
-    payload = {"schema": 1, "texts": dict(sorted(texts.items())), "packages": packages}
+    payload = {"schema": 2, "texts": dict(sorted(texts.items())), "packages": packages}
     OUTPUT.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     print(f"wrote {OUTPUT.relative_to(ROOT)}")
 

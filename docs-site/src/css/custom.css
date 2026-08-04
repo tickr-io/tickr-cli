@@ -1,0 +1,288 @@
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import '@fontsource/ibm-plex-mono/600.css';
+
+:root {
+  --tickr-paper: #f6f3ea;
+  --tickr-panel: #fbf9f2;
+  --tickr-ink: #14181b;
+  --tickr-ink-2: #464d52;
+  --tickr-graphite: #3b4348;
+  --tickr-line: rgba(59, 67, 72, 0.24);
+  --tickr-grid: rgba(59, 67, 72, 0.09);
+  --tickr-brand: #14b8a6;
+  --tickr-brand-strong: #0a6e68;
+  --tickr-brand-soft: rgba(20, 184, 166, 0.12);
+
+  --ifm-color-primary: #0a6e68;
+  --ifm-color-primary-dark: #08635e;
+  --ifm-color-primary-darker: #075e59;
+  --ifm-color-primary-darkest: #064d49;
+  --ifm-color-primary-light: #0b7972;
+  --ifm-color-primary-lighter: #0c7e77;
+  --ifm-color-primary-lightest: #0d8f87;
+  --ifm-background-color: var(--tickr-paper);
+  --ifm-background-surface-color: var(--tickr-panel);
+  --ifm-font-color-base: var(--tickr-ink);
+  --ifm-font-color-secondary: var(--tickr-ink-2);
+  --ifm-font-family-base: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --ifm-font-family-monospace: 'IBM Plex Mono', ui-monospace, monospace;
+  --ifm-heading-font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --ifm-heading-font-weight: 600;
+  --ifm-code-font-size: 90%;
+  --ifm-global-radius: 2px;
+  --ifm-navbar-height: 4.25rem;
+  --ifm-toc-border-color: var(--tickr-line);
+  --ifm-hr-border-color: var(--tickr-line);
+  --ifm-table-border-color: var(--tickr-line);
+  --ifm-footer-background-color: #14181b;
+  --doc-sidebar-width: 19rem;
+}
+
+[data-theme='dark'] {
+  --tickr-paper: #0e1214;
+  --tickr-panel: #141a1d;
+  --tickr-ink: #ede9de;
+  --tickr-ink-2: rgba(237, 233, 222, 0.74);
+  --tickr-graphite: #8a949a;
+  --tickr-line: rgba(138, 148, 154, 0.24);
+  --tickr-grid: rgba(138, 148, 154, 0.09);
+  --tickr-brand: #2cc4b9;
+  --tickr-brand-strong: #4fd6cc;
+  --tickr-brand-soft: rgba(44, 196, 185, 0.14);
+
+  --ifm-color-primary: #4fd6cc;
+  --ifm-color-primary-dark: #34cfc4;
+  --ifm-color-primary-darker: #28c7bc;
+  --ifm-color-primary-darkest: #21a49b;
+  --ifm-color-primary-light: #6adcd4;
+  --ifm-color-primary-lighter: #77dfd8;
+  --ifm-color-primary-lightest: #9fe8e3;
+  --ifm-background-color: var(--tickr-paper);
+  --ifm-background-surface-color: var(--tickr-panel);
+  --ifm-font-color-base: var(--tickr-ink);
+}
+
+html {
+  scroll-padding-top: calc(var(--ifm-navbar-height) + 1rem);
+}
+
+body {
+  background:
+    linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), var(--tickr-grid) calc(100% - 1px)) 0 0 / 32px 100%,
+    var(--tickr-paper);
+  font-feature-settings: 'ss02' 1, 'cv02' 1;
+}
+
+.navbar {
+  border-bottom: 1px solid var(--tickr-line);
+  background: color-mix(in srgb, var(--tickr-paper) 90%, transparent);
+  box-shadow: none;
+  backdrop-filter: blur(14px);
+}
+
+.navbar__brand {
+  gap: 0.65rem;
+}
+
+.navbar__logo {
+  width: 2rem;
+  height: 2rem;
+}
+
+.navbar__title {
+  color: var(--tickr-ink);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.navbar__link {
+  font-size: 0.88rem;
+  font-weight: 500;
+}
+
+.button {
+  border-width: 1px;
+  border-radius: 2px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.button--primary {
+  border-color: var(--tickr-brand-strong);
+  background: var(--tickr-brand-strong);
+}
+
+.button--outline {
+  border-color: var(--tickr-line);
+  color: var(--tickr-ink);
+  background: var(--tickr-panel);
+}
+
+.button--outline:hover {
+  border-color: var(--tickr-brand-strong);
+  color: var(--tickr-brand-strong);
+  background: var(--tickr-brand-soft);
+}
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--tickr-line) !important;
+  background: color-mix(in srgb, var(--tickr-panel) 78%, transparent);
+}
+
+.menu {
+  padding: 1.25rem 1rem !important;
+  font-size: 0.88rem;
+}
+
+.menu__link,
+.table-of-contents__link {
+  border-radius: 2px;
+}
+
+.menu__link--active:not(.menu__link--sublist) {
+  color: var(--tickr-brand-strong);
+  background: var(--tickr-brand-soft);
+}
+
+.theme-doc-markdown {
+  max-width: 48rem;
+}
+
+.theme-doc-markdown > header + p,
+.theme-doc-markdown > h1 + p {
+  color: var(--tickr-ink-2);
+  font-size: 1.12rem;
+  line-height: 1.7;
+}
+
+.theme-doc-markdown h1 {
+  margin-bottom: 1.25rem;
+  font-size: clamp(2.35rem, 5vw, 4rem);
+  letter-spacing: -0.055em;
+  line-height: 1;
+}
+
+.theme-doc-markdown h2 {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--tickr-line);
+  font-size: clamp(1.55rem, 3vw, 2rem);
+  letter-spacing: -0.035em;
+}
+
+.theme-doc-markdown h3 {
+  margin-top: 2rem;
+  letter-spacing: -0.02em;
+}
+
+.theme-doc-breadcrumbs {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+code {
+  border: 1px solid var(--tickr-line);
+}
+
+pre code {
+  border: 0;
+}
+
+.theme-code-block {
+  border: 1px solid var(--tickr-line);
+  box-shadow: 8px 8px 0 var(--tickr-grid);
+}
+
+.alert {
+  border-width: 1px;
+  border-left-width: 4px;
+  border-radius: 2px;
+}
+
+.alert--secondary {
+  --ifm-alert-background-color: var(--tickr-panel);
+  --ifm-alert-border-color: var(--tickr-line);
+}
+
+table {
+  display: table;
+  width: 100%;
+  background: var(--tickr-panel);
+}
+
+thead {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.76rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.pagination-nav__link {
+  border: 1px solid var(--tickr-line);
+  border-radius: 2px;
+  background: var(--tickr-panel);
+}
+
+.pagination-nav__link:hover {
+  border-color: var(--tickr-brand);
+}
+
+.theme-doc-version-banner {
+  border: 1px solid #b45309;
+  border-left-width: 5px;
+  border-radius: 2px;
+  background: color-mix(in srgb, #f59e0b 12%, var(--tickr-panel));
+}
+
+.footer {
+  border-top: 3px solid var(--tickr-brand);
+}
+
+.footer__title,
+.footer__link-item {
+  font-size: 0.85rem;
+}
+
+.DocSearch-Button,
+.navbar__search-input {
+  border: 1px solid var(--tickr-line);
+  border-radius: 2px;
+  background: var(--tickr-panel);
+}
+
+*:focus-visible {
+  outline: 3px solid var(--tickr-brand);
+  outline-offset: 3px;
+}
+
+@media (max-width: 996px) {
+  .navbar__items--right > .navbar__item:not(.navbar__search) {
+    display: none;
+  }
+
+  .theme-doc-markdown {
+    max-width: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

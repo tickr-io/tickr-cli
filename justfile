@@ -268,6 +268,22 @@ console-test:
 console-build:
     cd console && npm run build
 
+docs-install:
+    cd docs-site && npm ci
+
+docs-start:
+    cd docs-site && npm run start
+
+docs-typecheck:
+    cd docs-site && npm run typecheck
+
+docs-build:
+    cd docs-site && npm run build
+
+docs-check: docs-install
+    cd docs-site && npm run typecheck
+    cd docs-site && npm run build
+
 # Regenerate the code-first OpenAPI contract and Console TypeScript bindings.
 generate-openapi:
     cargo run -p tickr_api --bin generate_openapi

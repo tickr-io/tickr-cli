@@ -10,6 +10,9 @@ nix-store/
 !console/tsconfig.app.json
 !console/tsconfig.node.json
 !third_party/npm-attribution.json
+!docs-site/package.json
+!docs-site/package-lock.json
+!docs-site/tsconfig.json
 !console/src/test/fixtures/routing-var-workflow.json
 !src/conductor/tests/fixtures/terminal_union_instance.json
 !src/conductor/tests/fixtures/secondary_union_instance.json
@@ -40,6 +43,11 @@ lerna-debug.log*
 console/dist
 console/dist-ssr
 console/*.local
+
+# Documentation build output
+docs-site/.docusaurus/
+docs-site/build/
+docs-site/docs/api/
 
 # Editor directories and files
 .vscode/*

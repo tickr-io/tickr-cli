@@ -22,14 +22,15 @@ def public_documents(root: Path):
         path = root / name
         if path.is_file():
             yield path
-    docs = root / "docs"
-    if docs.is_dir():
-        yield from sorted(docs.rglob("*.md"))
+    for directory in ("docs", "docs-site/docs"):
+        docs = root / directory
+        if docs.is_dir():
+            yield from sorted(docs.rglob("*.md"))
 
 
 def inspected_files(root: Path):
     yield from public_documents(root)
-    for directory in ("src", "proto", "console/src", "examples"):
+    for directory in ("src", "proto", "console/src", "docs-site/src", "examples"):
         base = root / directory
         if base.is_dir():
             yield from (

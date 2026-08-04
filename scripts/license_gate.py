@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "THIRD_PARTY_NOTICES.md"
 NPM_ATTRIBUTION = ROOT / "third_party/npm-attribution.json"
 LICENSE_NAMES = ("license", "copying", "notice", "copyright")
+NPM_PACKAGE_DIRS = ("console", "docs-site")
 CANONICAL_LICENSES = {
     "Apache-2.0": ROOT / "LICENSE",
     **{
@@ -42,9 +43,10 @@ def manifest_policy_findings(root=ROOT):
                 findings.append(f"{path.relative_to(root)}: {key} must inherit workspace metadata")
         if "publish = false" not in package:
             findings.append(f"{path.relative_to(root)}: publish must be false")
-    package = json.loads((root / "console/package.json").read_text())
-    if package.get("private") is not True or package.get("license") != "Apache-2.0":
-        findings.append("console/package.json: expected private Apache-2.0 package")
+    for directory in NPM_PACKAGE_DIRS:
+        package = json.loads((root / directory / "package.json").read_text())
+        if package.get("private") is not True or package.get("license") != "Apache-2.0":
+            findings.append(f"{directory}/package.json: expected private Apache-2.0 package")
     if not (root / "LICENSE").is_file() or not (root / "NOTICE").is_file():
         findings.append("root LICENSE and NOTICE are required")
     return findings
@@ -118,33 +120,50 @@ def npm_name(path):
     return "/".join(parts[:2]) if parts[0].startswith("@") else parts[0]
 
 
+def locked_npm_packages():
+    packages = {}
+    for directory in NPM_PACKAGE_DIRS:
+        lock = json.loads((ROOT / directory / "package-lock.json").read_text())["packages"]
+        packages.update({
+            f"{directory}/{path}": metadata
+            for path, metadata in lock.items()
+            if path and "node_modules/" in path
+        })
+    return packages
+
+
+
+
 def npm_components(texts):
-    lock = json.loads((ROOT / "console/package-lock.json").read_text())["packages"]
+    packages = locked_npm_packages()
     cache = json.loads(NPM_ATTRIBUTION.read_text(encoding="utf-8"))
-    if cache.get("schema") != 1:
+    if cache.get("schema") != 2:
         raise RuntimeError("unsupported npm attribution cache schema")
     cached_packages = cache.get("packages", {})
     cached_texts = cache.get("texts", {})
-    expected_paths = {p for p in lock if p and "node_modules/" in p}
+    expected_paths = set(packages)
     if set(cached_packages) != expected_paths:
         raise RuntimeError(
-            "npm attribution cache does not cover package-lock.json; "
+            "npm attribution cache does not cover the package lockfiles; "
             "run: just refresh-npm-attribution"
         )
 
     components = []
     for path in sorted(expected_paths):
-        package = lock[path]
+        package = packages[path]
         cached = cached_packages[path]
         name = npm_name(path)
         version = package.get("version", "UNKNOWN")
-        license_id = package.get("license", "UNKNOWN")
+        license_id = cached.get("license", "UNKNOWN")
         source = package.get("resolved") or f"https://registry.npmjs.org/{name}"
-        pinned = (name, version, license_id, source, package.get("integrity"))
+        pinned = (name, version, source, package.get("integrity"))
         recorded = tuple(cached.get(key) for key in (
-            "name", "version", "license", "resolved", "integrity"
+            "name", "version", "resolved", "integrity"
         ))
-        if recorded != pinned:
+        locked_license = package.get("license")
+        if recorded != pinned or (
+            locked_license is not None and license_id != locked_license
+        ):
             raise RuntimeError(
                 f"{path}: npm attribution cache is stale; "
                 "run: just refresh-npm-attribution"

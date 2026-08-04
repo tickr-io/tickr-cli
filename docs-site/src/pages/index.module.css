@@ -1,0 +1,369 @@
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(20rem, 0.85fr);
+  gap: clamp(3rem, 7vw, 7rem);
+  align-items: center;
+  width: min(78rem, calc(100% - 2.5rem));
+  min-height: calc(100vh - var(--ifm-navbar-height));
+  margin: 0 auto;
+  padding: clamp(4rem, 8vw, 8rem) 0;
+}
+
+.heroCopy h1 {
+  max-width: 12ch;
+  margin: 1.25rem 0 1.5rem;
+  color: var(--tickr-ink);
+  font-size: clamp(3.4rem, 8vw, 7.4rem);
+  font-weight: 600;
+  letter-spacing: -0.075em;
+  line-height: 0.88;
+}
+
+.releaseLabel,
+.sectionLabel,
+.routeEyebrow,
+.formation span,
+.timeline span {
+  color: var(--tickr-brand-strong);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.releaseLabel {
+  display: inline-flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--tickr-line);
+  background: var(--tickr-panel);
+}
+
+.liveDot {
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 50%;
+  background: var(--tickr-brand);
+  box-shadow: 0 0 0 0.28rem var(--tickr-brand-soft);
+}
+
+.lede {
+  max-width: 42rem;
+  color: var(--tickr-ink-2);
+  font-size: clamp(1.1rem, 2vw, 1.32rem);
+  line-height: 1.65;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 2rem;
+}
+
+.clockPanel {
+  position: relative;
+  overflow: hidden;
+  min-height: 35rem;
+  border: 1px solid var(--tickr-line);
+  background:
+    linear-gradient(var(--tickr-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--tickr-grid) 1px, transparent 1px),
+    var(--tickr-panel);
+  background-size: 32px 32px;
+  box-shadow: 18px 18px 0 var(--tickr-brand-soft);
+}
+
+.clockPanel::before,
+.clockPanel::after {
+  position: absolute;
+  z-index: 2;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-color: var(--tickr-graphite);
+  content: '';
+}
+
+.clockPanel::before {
+  top: 0.7rem;
+  left: 0.7rem;
+  border-top: 1px solid;
+  border-left: 1px solid;
+}
+
+.clockPanel::after {
+  right: 0.7rem;
+  bottom: 0.7rem;
+  border-right: 1px solid;
+  border-bottom: 1px solid;
+}
+
+.clockMark {
+  width: min(70%, 17rem);
+  margin: 2.5rem auto 1.5rem;
+  color: var(--tickr-graphite);
+}
+
+.clockMark svg line,
+.clockFace {
+  stroke: currentColor;
+  stroke-width: 1.2;
+}
+
+.clockHands {
+  stroke: var(--tickr-brand);
+  stroke-linecap: round;
+  stroke-width: 4;
+}
+
+.clockPivot {
+  fill: var(--tickr-brand);
+}
+
+.timeline {
+  position: relative;
+  width: calc(100% - 4rem);
+  margin: 0 auto 2.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline::before {
+  position: absolute;
+  top: 0.35rem;
+  bottom: 0.35rem;
+  left: 0.32rem;
+  width: 1px;
+  background: var(--tickr-line);
+  content: '';
+}
+
+.timeline li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 5rem 1fr;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0 0 1.25rem 1.4rem;
+}
+
+.timeline li::before {
+  position: absolute;
+  top: 0.28rem;
+  left: 0;
+  width: 0.68rem;
+  height: 0.68rem;
+  border: 1px solid var(--tickr-graphite);
+  border-radius: 50%;
+  background: var(--tickr-panel);
+  content: '';
+}
+
+.timelineLive::before {
+  border-color: var(--tickr-brand) !important;
+  background: var(--tickr-brand) !important;
+  box-shadow: 0 0 0 0.3rem var(--tickr-brand-soft);
+}
+
+.timeline strong {
+  color: var(--tickr-ink);
+  font-size: 0.92rem;
+  font-weight: 500;
+}
+
+.timeRail {
+  position: relative;
+  height: 3rem;
+  border-top: 1px solid var(--tickr-line);
+  border-bottom: 1px solid var(--tickr-line);
+  background: repeating-linear-gradient(90deg, transparent 0 31px, var(--tickr-grid) 31px 32px);
+}
+
+.timeRail span {
+  position: absolute;
+  top: -0.35rem;
+  left: 68%;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--tickr-brand);
+  box-shadow: 0 0 0 0.35rem var(--tickr-brand-soft);
+}
+
+.routeSection,
+.formationSection {
+  width: min(78rem, calc(100% - 2.5rem));
+  margin: 0 auto;
+  padding: clamp(5rem, 9vw, 8rem) 0;
+}
+
+.sectionIntro {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem 4rem;
+  align-items: end;
+  margin-bottom: 2.5rem;
+}
+
+.sectionIntro .sectionLabel {
+  grid-column: 1 / -1;
+}
+
+.sectionIntro h2,
+.formationSection h2 {
+  max-width: 16ch;
+  margin: 0;
+  color: var(--tickr-ink);
+  font-size: clamp(2.1rem, 5vw, 4rem);
+  letter-spacing: -0.045em;
+  line-height: 1;
+}
+
+.sectionIntro p {
+  max-width: 38rem;
+  margin: 0;
+  color: var(--tickr-ink-2);
+  line-height: 1.7;
+}
+
+.routeGrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  border-top: 1px solid var(--tickr-line);
+  border-left: 1px solid var(--tickr-line);
+}
+
+.routeCard {
+  display: flex;
+  min-height: 18rem;
+  flex-direction: column;
+  padding: clamp(1.5rem, 4vw, 2.5rem);
+  border-right: 1px solid var(--tickr-line);
+  border-bottom: 1px solid var(--tickr-line);
+  color: inherit;
+  background: color-mix(in srgb, var(--tickr-panel) 82%, transparent);
+  transition: background 150ms ease, color 150ms ease;
+}
+
+.routeCard:hover {
+  color: inherit;
+  background: var(--tickr-brand-soft);
+  text-decoration: none;
+}
+
+.routeCard h3 {
+  margin: 1.4rem 0 0.7rem;
+  color: var(--tickr-ink);
+  font-size: clamp(1.55rem, 3vw, 2.25rem);
+  letter-spacing: -0.035em;
+}
+
+.routeCard p {
+  max-width: 34rem;
+  color: var(--tickr-ink-2);
+  line-height: 1.65;
+}
+
+.routeAction {
+  margin-top: auto;
+  color: var(--tickr-brand-strong);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.formationSection {
+  display: grid;
+  grid-template-columns: 0.8fr 1.2fr;
+  gap: clamp(3rem, 7vw, 7rem);
+  border-top: 1px solid var(--tickr-line);
+}
+
+.formationGrid {
+  display: grid;
+}
+
+.formation {
+  display: grid;
+  grid-template-columns: 6rem 8rem 1fr;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 1.35rem 1rem;
+  border-bottom: 1px solid var(--tickr-line);
+}
+
+.formation strong {
+  color: var(--tickr-ink);
+  font-family: var(--ifm-font-family-monospace);
+}
+
+.formation p {
+  margin: 0;
+  color: var(--tickr-ink-2);
+  font-size: 0.88rem;
+}
+
+.formationPrimary {
+  background: var(--tickr-brand-soft);
+}
+
+@media (max-width: 900px) {
+  .hero,
+  .formationSection {
+    grid-template-columns: 1fr;
+  }
+
+  .hero {
+    min-height: auto;
+  }
+
+  .clockPanel {
+    min-height: 31rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .hero,
+  .routeSection,
+  .formationSection {
+    width: min(100% - 1.5rem, 78rem);
+  }
+
+  .heroCopy h1 {
+    font-size: clamp(3rem, 17vw, 4.5rem);
+  }
+
+  .sectionIntro,
+  .routeGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .clockPanel {
+    min-height: 29rem;
+    box-shadow: 8px 8px 0 var(--tickr-brand-soft);
+  }
+
+  .timeline {
+    width: calc(100% - 2.5rem);
+  }
+
+  .timeline li {
+    grid-template-columns: 4.3rem 1fr;
+  }
+
+  .formation {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .formation p {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .routeCard {
+    transition: none;
+  }
+}

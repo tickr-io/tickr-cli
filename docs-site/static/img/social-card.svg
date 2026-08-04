@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#f6f3ea"/>
+  <g stroke="#3b4348" opacity=".13">
+    <path d="M0 90H1200M0 180H1200M0 270H1200M0 360H1200M0 450H1200M0 540H1200"/>
+    <path d="M120 0V630M240 0V630M360 0V630M480 0V630M600 0V630M720 0V630M840 0V630M960 0V630M1080 0V630"/>
+  </g>
+  <g transform="translate(96 84) scale(2.4)" fill="none" stroke="#14b8a6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 5.6 A 12 12 0 1 1 10 5.6"/>
+    <path d="M16 16 V2.4"/>
+    <path d="M16 16 L21.6 12.6"/>
+    <circle cx="16" cy="16" r="1.6" fill="#14b8a6" stroke="none"/>
+  </g>
+  <text x="96" y="315" fill="#14181b" font-family="IBM Plex Sans, sans-serif" font-size="88" font-weight="600">Tickr Documentation</text>
+  <text x="100" y="386" fill="#464d52" font-family="IBM Plex Mono, monospace" font-size="28">AUTHOR · OPERATE · INTEGRATE</text>
+  <path d="M100 486H1100" stroke="#3b4348" opacity=".28"/>
+  <circle cx="840" cy="486" r="8" fill="#14b8a6"/>
+  <text x="100" y="542" fill="#0a6e68" font-family="IBM Plex Mono, monospace" font-size="24">CURRENT RELEASE LINE 0.1</text>
+</svg>
