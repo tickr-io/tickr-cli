@@ -1,8 +1,8 @@
 #[cfg(target_os = "linux")]
 use std::ffi::c_long;
 #[cfg(target_os = "macos")]
-use std::ffi::{c_char, CStr};
-use std::ffi::{c_int, CString, OsStr};
+use std::ffi::CStr;
+use std::ffi::{c_char, c_int, CString, OsStr};
 use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
