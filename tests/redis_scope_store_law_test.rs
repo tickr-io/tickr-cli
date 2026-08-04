@@ -146,13 +146,14 @@ impl RedisFixture {
             "start Redis ScopeStore fixture",
         );
         let port = docker_port(&name);
-        wait_for_port(&name, port).await;
-        Self {
+        let fixture = Self {
             _directory: directory,
             name,
             port,
             trust_roots,
-        }
+        };
+        fixture.wait_until_ready().await;
+        fixture
     }
 
     fn client(&self) -> redis::Client {
@@ -178,13 +179,36 @@ impl RedisFixture {
         .expect("Redis TLS client")
     }
 
+    async fn wait_until_ready(&self) {
+        for _ in 0..200 {
+            if self
+                .client()
+                .get_multiplexed_tokio_connection()
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let output = Command::new("docker")
+            .args(["logs", &self.name])
+            .output()
+            .expect("read Redis fixture logs");
+        panic!(
+            "Redis ScopeStore fixture did not become ready: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn restart(&mut self) {
         run(
             Command::new("docker").args(["restart", &self.name]),
             "restart Redis ScopeStore fixture",
         );
         self.port = docker_port(&self.name);
-        wait_for_port(&self.name, self.port).await;
+        self.wait_until_ready().await;
     }
 }
 
@@ -713,27 +737,6 @@ fn docker_port(name: &str) -> u16 {
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok())
         .expect("Docker returned Redis port")
-}
-
-async fn wait_for_port(name: &str, port: u16) {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let output = Command::new("docker")
-        .args(["logs", name])
-        .output()
-        .expect("read Redis fixture logs");
-    panic!(
-        "Redis ScopeStore fixture did not become ready: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn generate_tls(path: &PathBuf) -> String {
