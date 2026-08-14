@@ -449,7 +449,7 @@ It is platform-independent and includes development and optional dependencies.
 | @redocly/ajv | 8.18.3 | MIT | https://registry.npmjs.org/@redocly/ajv/-/ajv-8.18.3.tgz | [9b6a90e9be787995](#9b6a90e9be787995) |
 | @redocly/config | 0.22.0 | MIT | https://registry.npmjs.org/@redocly/config/-/config-0.22.0.tgz | [92bb818822d131f7](#92bb818822d131f7) |
 | @redocly/config | 0.53.1 | MIT | https://registry.npmjs.org/@redocly/config/-/config-0.53.1.tgz | [92bb818822d131f7](#92bb818822d131f7) |
-| @redocly/openapi-core | 1.34.18 | MIT | https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.18.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [a52ab1344e348b17](#a52ab1344e348b17) |
+| @redocly/openapi-core | 1.34.19 | MIT | https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.19.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [0740039b3b3888d1](#0740039b3b3888d1) |
 | @redocly/openapi-core | 2.43.3 | MIT | https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-2.43.3.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [4d534fabbbe1c5b5](#4d534fabbbe1c5b5) |
 | @reduxjs/toolkit | 2.11.2 | MIT | https://registry.npmjs.org/@reduxjs/toolkit/-/toolkit-2.11.2.tgz | [49784961ec6c4941](#49784961ec6c4941) |
 | @reduxjs/toolkit | 2.12.0 | MIT | https://registry.npmjs.org/@reduxjs/toolkit/-/toolkit-2.12.0.tgz | [49784961ec6c4941](#49784961ec6c4941) |
@@ -878,8 +878,8 @@ It is platform-independent and includes development and optional dependencies.
 | common-path-prefix | 3.0.0 | ISC | https://registry.npmjs.org/common-path-prefix/-/common-path-prefix-3.0.0.tgz | [f42f21feb7e11a6f](#f42f21feb7e11a6f) |
 | compressible | 2.0.18 | MIT | https://registry.npmjs.org/compressible/-/compressible-2.0.18.tgz | [b6be1b6c4e8c0441](#b6be1b6c4e8c0441) |
 | compression | 1.8.1 | MIT | https://registry.npmjs.org/compression/-/compression-1.8.1.tgz | [23d466b1b134b415](#23d466b1b134b415) |
-| compute-gcd | 1.2.1 | UNKNOWN | https://registry.npmjs.org/compute-gcd/-/compute-gcd-1.2.1.tgz | [1fb269e9661682c0](#1fb269e9661682c0) |
-| compute-lcm | 1.1.2 | UNKNOWN | https://registry.npmjs.org/compute-lcm/-/compute-lcm-1.1.2.tgz | [1fb269e9661682c0](#1fb269e9661682c0) |
+| compute-gcd | 1.2.1 | MIT | https://registry.npmjs.org/compute-gcd/-/compute-gcd-1.2.1.tgz | [1fb269e9661682c0](#1fb269e9661682c0) |
+| compute-lcm | 1.1.2 | MIT | https://registry.npmjs.org/compute-lcm/-/compute-lcm-1.1.2.tgz | [1fb269e9661682c0](#1fb269e9661682c0) |
 | concat-map | 0.0.1 | MIT | https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz | [435a6722c786b0a5](#435a6722c786b0a5) |
 | concat-map | 0.0.1 | MIT | https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz | [435a6722c786b0a5](#435a6722c786b0a5) |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | https://github.com/smol-rs/concurrent-queue | [a60eea8175145316](#a60eea8175145316), [23f18e03dc49df91](#23f18e03dc49df91) |
@@ -1167,7 +1167,7 @@ It is platform-independent and includes development and optional dependencies.
 | eta | 2.2.0 | MIT | https://registry.npmjs.org/eta/-/eta-2.2.0.tgz | [ffae00b51ffea9ff](#ffae00b51ffea9ff) |
 | etag | 1.8.1 | MIT | https://registry.npmjs.org/etag/-/etag-1.8.1.tgz | [a7996721249a136f](#a7996721249a136f) |
 | etcetera | 0.8.0 | MIT OR Apache-2.0 | https://github.com/lunacookies/etcetera | [62c7a1e35f564068](#62c7a1e35f564068), [23f18e03dc49df91](#23f18e03dc49df91) |
-| eval | 0.1.8 | UNKNOWN | https://registry.npmjs.org/eval/-/eval-0.1.8.tgz | [930fc5d8c9e35ec3](#930fc5d8c9e35ec3) |
+| eval | 0.1.8 | MIT | https://registry.npmjs.org/eval/-/eval-0.1.8.tgz | [930fc5d8c9e35ec3](#930fc5d8c9e35ec3) |
 | event-listener | 5.4.1 | Apache-2.0 OR MIT | https://github.com/smol-rs/event-listener | [a60eea8175145316](#a60eea8175145316), [23f18e03dc49df91](#23f18e03dc49df91) |
 | event-listener-strategy | 0.5.4 | Apache-2.0 OR MIT | https://github.com/smol-rs/event-listener-strategy | [a60eea8175145316](#a60eea8175145316), [23f18e03dc49df91](#23f18e03dc49df91) |
 | eventemitter3 | 4.0.7 | MIT | https://registry.npmjs.org/eventemitter3/-/eventemitter3-4.0.7.tgz | [3aecc12b1cb28832](#3aecc12b1cb28832) |
@@ -1479,8 +1479,7 @@ It is platform-independent and includes development and optional dependencies.
 | js-tokens | 4.0.0 | MIT | https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz | [2213d91c606205c7](#2213d91c606205c7) |
 | js-tokens | 4.0.0 | MIT | https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz | [2213d91c606205c7](#2213d91c606205c7) |
 | js-tokens | 9.0.1 | MIT | https://registry.npmjs.org/js-tokens/-/js-tokens-9.0.1.tgz | [33038d552d766f45](#33038d552d766f45) |
-| js-yaml | 4.3.0 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.0.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
-| js-yaml | 4.3.0 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.0.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
+| js-yaml | 4.3.1 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.1.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
 | js-yaml | 4.3.1 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.1.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
 | js-yaml | 5.2.3 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-5.2.3.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
 | js-yaml | 5.2.3 | MIT | https://registry.npmjs.org/js-yaml/-/js-yaml-5.2.3.tgz | [a07bc24468b9654c](#a07bc24468b9654c) |
@@ -1600,7 +1599,7 @@ It is platform-independent and includes development and optional dependencies.
 | merge-stream | 2.0.0 | MIT | https://registry.npmjs.org/merge-stream/-/merge-stream-2.0.0.tgz | [2cee71bf4612fc2e](#2cee71bf4612fc2e) |
 | merge2 | 1.4.1 | MIT | https://registry.npmjs.org/merge2/-/merge2-1.4.1.tgz | [b2590e53ea6e0505](#b2590e53ea6e0505) |
 | merge2 | 1.4.1 | MIT | https://registry.npmjs.org/merge2/-/merge2-1.4.1.tgz | [b2590e53ea6e0505](#b2590e53ea6e0505) |
-| mermaid | 11.16.0 | MIT | https://registry.npmjs.org/mermaid/-/mermaid-11.16.0.tgz | [ec9fb67dcb25eccc](#ec9fb67dcb25eccc) |
+| mermaid | 11.16.1 | MIT | https://registry.npmjs.org/mermaid/-/mermaid-11.16.1.tgz | [ec9fb67dcb25eccc](#ec9fb67dcb25eccc) |
 | methods | 1.1.2 | MIT | https://registry.npmjs.org/methods/-/methods-1.1.2.tgz | [ce9fb515b91fedfd](#ce9fb515b91fedfd) |
 | micromark | 4.0.2 | MIT | https://registry.npmjs.org/micromark/-/micromark-4.0.2.tgz | [dd1081884a929528](#dd1081884a929528) |
 | micromark-core-commonmark | 2.0.3 | MIT | https://registry.npmjs.org/micromark-core-commonmark/-/micromark-core-commonmark-2.0.3.tgz | [dd1081884a929528](#dd1081884a929528) |
@@ -1754,8 +1753,8 @@ It is platform-independent and includes development and optional dependencies.
 | mz | 2.7.0 | MIT | https://registry.npmjs.org/mz/-/mz-2.7.0.tgz | [b54cad06af80663a](#b54cad06af80663a) |
 | mz | 2.7.0 | MIT | https://registry.npmjs.org/mz/-/mz-2.7.0.tgz | [b54cad06af80663a](#b54cad06af80663a) |
 | naive-timer | 0.2.0 | MIT | https://github.com/rcore-os/naive-timer | [71f7cb1827c7719c](#71f7cb1827c7719c) |
-| nanoid | 3.3.16 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.16.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
-| nanoid | 3.3.17 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.17.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
+| nanoid | 3.3.18 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.18.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
+| nanoid | 3.3.18 | MIT | https://registry.npmjs.org/nanoid/-/nanoid-3.3.18.tgz | [da4db1480d9beea3](#da4db1480d9beea3) |
 | natural-compare | 1.4.0 | MIT | https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz | [b05785f9f18e6716](#b05785f9f18e6716), [b528adb367b47667](#b528adb367b47667) |
 | negotiator | 0.6.3 | MIT | https://registry.npmjs.org/negotiator/-/negotiator-0.6.3.tgz | [553d4d20029a24e3](#553d4d20029a24e3) |
 | negotiator | 0.6.4 | MIT | https://registry.npmjs.org/negotiator/-/negotiator-0.6.4.tgz | [553d4d20029a24e3](#553d4d20029a24e3) |
@@ -1811,7 +1810,7 @@ It is platform-independent and includes development and optional dependencies.
 | open | 10.2.0 | MIT | https://registry.npmjs.org/open/-/open-10.2.0.tgz | [5c932d88256b4ab9](#5c932d88256b4ab9) |
 | open | 8.4.2 | MIT | https://registry.npmjs.org/open/-/open-8.4.2.tgz | [5c932d88256b4ab9](#5c932d88256b4ab9) |
 | openapi-fetch | 0.13.8 | MIT | https://registry.npmjs.org/openapi-fetch/-/openapi-fetch-0.13.8.tgz | [bbcaaa447169c969](#bbcaaa447169c969) |
-| openapi-to-postmanv2 | 6.3.2 | Apache-2.0 | https://registry.npmjs.org/openapi-to-postmanv2/-/openapi-to-postmanv2-6.3.2.tgz | [f26d4174720d2a45](#f26d4174720d2a45) |
+| openapi-to-postmanv2 | 6.3.3 | Apache-2.0 | https://registry.npmjs.org/openapi-to-postmanv2/-/openapi-to-postmanv2-6.3.3.tgz | [f26d4174720d2a45](#f26d4174720d2a45) |
 | openapi-types | 12.1.3 | MIT | https://registry.npmjs.org/openapi-types/-/openapi-types-12.1.3.tgz | [a5b243ddbec533f2](#a5b243ddbec533f2) |
 | openapi-typescript | 7.13.0 | MIT | https://registry.npmjs.org/openapi-typescript/-/openapi-typescript-7.13.0.tgz | [ed4b2c8f3a9aad2b](#ed4b2c8f3a9aad2b) |
 | openapi-typescript-helpers | 0.0.15 | MIT | https://registry.npmjs.org/openapi-typescript-helpers/-/openapi-typescript-helpers-0.0.15.tgz | [bbcaaa447169c969](#bbcaaa447169c969) |
@@ -2091,7 +2090,7 @@ It is platform-independent and includes development and optional dependencies.
 | readdirp | 3.6.0 | MIT | https://registry.npmjs.org/readdirp/-/readdirp-3.6.0.tgz | [dffec71d93f273d2](#dffec71d93f273d2) |
 | readdirp | 5.0.0 | MIT | https://registry.npmjs.org/readdirp/-/readdirp-5.0.0.tgz | [dffec71d93f273d2](#dffec71d93f273d2) |
 | recharts | 3.8.1 | MIT | https://registry.npmjs.org/recharts/-/recharts-3.8.1.tgz | [e65e92a0a65f60ce](#e65e92a0a65f60ce) |
-| rechoir | 0.6.2 | UNKNOWN | https://registry.npmjs.org/rechoir/-/rechoir-0.6.2.tgz | [55d982a7adf64650](#55d982a7adf64650) |
+| rechoir | 0.6.2 | MIT | https://registry.npmjs.org/rechoir/-/rechoir-0.6.2.tgz | [55d982a7adf64650](#55d982a7adf64650) |
 | recma-build-jsx | 1.0.0 | MIT | https://registry.npmjs.org/recma-build-jsx/-/recma-build-jsx-1.0.0.tgz | [e18cf5173e928f80](#e18cf5173e928f80) |
 | recma-jsx | 1.0.1 | MIT | https://registry.npmjs.org/recma-jsx/-/recma-jsx-1.0.1.tgz | [e18cf5173e928f80](#e18cf5173e928f80) |
 | recma-parse | 1.0.0 | MIT | https://registry.npmjs.org/recma-parse/-/recma-parse-1.0.0.tgz | [e18cf5173e928f80](#e18cf5173e928f80) |
@@ -2511,10 +2510,10 @@ It is platform-independent and includes development and optional dependencies.
 | uuid | 11.1.1 | MIT | https://registry.npmjs.org/uuid/-/uuid-11.1.1.tgz | [beaa6b04fb82e41d](#beaa6b04fb82e41d) |
 | uuid | 11.1.1 | MIT | https://registry.npmjs.org/uuid/-/uuid-11.1.1.tgz | [beaa6b04fb82e41d](#beaa6b04fb82e41d) |
 | validate.io-array | 1.0.6 | MIT | https://registry.npmjs.org/validate.io-array/-/validate.io-array-1.0.6.tgz | [1fb269e9661682c0](#1fb269e9661682c0) |
-| validate.io-function | 1.0.2 | UNKNOWN | https://registry.npmjs.org/validate.io-function/-/validate.io-function-1.0.2.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
-| validate.io-integer | 1.0.5 | UNKNOWN | https://registry.npmjs.org/validate.io-integer/-/validate.io-integer-1.0.5.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
-| validate.io-integer-array | 1.0.0 | UNKNOWN | https://registry.npmjs.org/validate.io-integer-array/-/validate.io-integer-array-1.0.0.tgz | [c37f753f603ae4da](#c37f753f603ae4da) |
-| validate.io-number | 1.0.3 | UNKNOWN | https://registry.npmjs.org/validate.io-number/-/validate.io-number-1.0.3.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
+| validate.io-function | 1.0.2 | MIT | https://registry.npmjs.org/validate.io-function/-/validate.io-function-1.0.2.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
+| validate.io-integer | 1.0.5 | MIT | https://registry.npmjs.org/validate.io-integer/-/validate.io-integer-1.0.5.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
+| validate.io-integer-array | 1.0.0 | MIT | https://registry.npmjs.org/validate.io-integer-array/-/validate.io-integer-array-1.0.0.tgz | [c37f753f603ae4da](#c37f753f603ae4da) |
+| validate.io-number | 1.0.3 | MIT | https://registry.npmjs.org/validate.io-number/-/validate.io-number-1.0.3.tgz | [93ea1a5530e80be0](#93ea1a5530e80be0) |
 | valuable | 0.1.1 | MIT | https://github.com/tokio-rs/valuable | [b05785f9f18e6716](#b05785f9f18e6716), [da720039832bb4bc](#da720039832bb4bc) |
 | value-equal | 1.0.1 | MIT | https://registry.npmjs.org/value-equal/-/value-equal-1.0.1.tgz | [e0dca6c79586466b](#e0dca6c79586466b) |
 | vary | 1.1.2 | MIT | https://registry.npmjs.org/vary/-/vary-1.1.2.tgz | [bd47ce7b88c77596](#bd47ce7b88c77596) |
@@ -3782,6 +3781,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+<a id="0740039b3b3888d1"></a>
+### 0740039b3b3888d1
+
+```text
+Installed-package attribution record
+Component: @redocly/openapi-core
+Version: 1.34.19
+Declared license: MIT
+Upstream source: https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.19.tgz
+Declared author/owner metadata: Roman Hotsiy <roman@redocly.com> (https://redocly.com/)
+The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
 <a id="0747bebeb06b1095"></a>
@@ -33596,19 +33608,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-```
-
-<a id="a52ab1344e348b17"></a>
-### a52ab1344e348b17
-
-```text
-Installed-package attribution record
-Component: @redocly/openapi-core
-Version: 1.34.18
-Declared license: MIT
-Upstream source: https://registry.npmjs.org/@redocly/openapi-core/-/openapi-core-1.34.18.tgz
-Declared author/owner metadata: Roman Hotsiy <roman@redocly.com> (https://redocly.com/)
-The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
 <a id="a5528b78e9e9375f"></a>
