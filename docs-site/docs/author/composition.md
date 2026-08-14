@@ -72,7 +72,42 @@ let join = tickr.mkEdge { from = [left, right], to = summarize } in
 
 ## Loops
 
-Use `mkLoop` for the Core DSL's loop document rather than synthesizing a cycle from ordinary control edges. Loop edges carry explicit loop semantics and gates.
+Use `mkLoop` for the Core DSL's loop document rather than synthesizing a cycle from ordinary control edges. The `tasks` array is an ordered ring: each Task hands control to the next, and the last hands control back to the head.
+
+One Task is the loop's `producer`. It defaults to the head, but you can select a later Task in the ring. The producer alone owns the reserved `loop_control` routing variable. When it omits that value, the loop continues; `done` exits successfully, while `fail` terminates the loop unsuccessfully. Non-producer Tasks do not emit `loop_control` and park between turns.
+
+```nickel
+let inspect = tickr.mkTask {
+  name = "inspect",
+  nix_expression_path = "path:./tasks#inspect",
+  args = [],
+} in
+let decide = tickr.mkTask {
+  name = "decide",
+  nix_expression_path = "path:./tasks#decide",
+  args = [],
+} in
+let after_loop = tickr.mkTask {
+  name = "after-loop",
+  nix_expression_path = "path:./tasks#after-loop",
+  args = [],
+} in
+let review_loop = tickr.mkLoop {
+  name = "review-loop",
+  tasks = [inspect, decide],
+  producer = decide,
+  exitTo = after_loop,
+} in
+
+tickr.mkTaskGroup {
+  name = "review",
+  args = [],
+  outputs = [],
+  tasks = [review_loop, after_loop],
+}
+```
+
+Here `inspect` remains the head and runs first on every lap. `decide` is the sole Task that may return `loop_control`; choosing `done` sends control to `after-loop`.
 
 ## Keep gated seams explicit
 

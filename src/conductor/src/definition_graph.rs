@@ -49,12 +49,15 @@ impl ProtoDefinitionGraph {
     /// still wired to both ends (its exit to End is an explicit gated edge, not
     /// a seal artifact).
     ///
-    /// A loop body is entered **once**: a loop-SCC member is start-wired only
-    /// when no member of its SCC already has a non-loop incoming edge (the
-    /// author's entry into the head, or an upstream task). Otherwise wiring
-    /// start to every ring member would dispatch the whole body at once,
-    /// breaking the sequential ring. A single-node self-loop is an SCC of one
-    /// with no entry, so it is still wired.
+    /// A loop body is entered and exited **as a unit**. A loop-SCC member is
+    /// start-wired only when no member already has a non-loop incoming edge (the
+    /// author's entry into the head, or an upstream task). Likewise, members
+    /// are end-wired only when no member has an authored non-loop exit. The
+    /// runtime's SCC teardown grounds all parked siblings when the producer
+    /// emits a terminal `loop_control`, so adding a plain sibling→end edge beside
+    /// a producer-only gated exit would create a spurious, non-terminable exit.
+    /// A single-node self-loop is an SCC of one, so the same aggregate rules
+    /// preserve its ordinary start/exit sealing.
     pub fn seal(&mut self) {
         let start = self.graph.start.clone();
         let end = self.graph.end.clone();
@@ -84,11 +87,21 @@ impl ProtoDefinitionGraph {
             self.add_seal_edge(&start, tid);
         }
 
-        // Tasks with no (non-loop) outgoing edges — wire to end. A start→task
-        // edge added above gives the task an incoming, never an outgoing, so
-        // this pass is unaffected by the one above.
+        // Snapshot loop bodies that already have an authored exit before
+        // adding any seal edge. Evaluating this live inside the loop would make
+        // the first synthesized member→end edge look like an authored body
+        // exit and incorrectly suppress sealing the remaining members.
+        let exiting_loop_members: HashSet<String> = loop_bodies
+            .iter()
+            .filter(|body| has_non_loop_edge_leaving_body(&self.graph, body))
+            .flat_map(|body| body.iter().cloned())
+            .collect();
+
+        // Tasks with no (non-loop) outgoing edges — wire to end. An authored
+        // exit from any member closes its whole loop body because loop teardown
+        // grounds the SCC as a unit; do not synthesize competing sibling exits.
         for tid in &task_ids {
-            if !has_non_loop_outgoing(&self.graph, tid) {
+            if !has_non_loop_outgoing(&self.graph, tid) && !exiting_loop_members.contains(tid) {
                 self.add_seal_edge(tid, &end);
             }
         }
@@ -130,6 +143,15 @@ fn has_non_loop_outgoing(graph: &wf::TaskGraph, tid: &str) -> bool {
         .any(|e| !is_loop_edge(e) && e.sources.iter().any(|s| s == tid))
 }
 
+/// True iff a non-loop edge has a source in `body` and a target outside it.
+fn has_non_loop_edge_leaving_body(graph: &wf::TaskGraph, body: &HashSet<String>) -> bool {
+    graph.edges.iter().any(|edge| {
+        !is_loop_edge(edge)
+            && edge.sources.iter().any(|source| body.contains(source))
+            && edge.targets.iter().any(|target| !body.contains(target))
+    })
+}
+
 /// Adjacency over `kind = loop` edges only: `source → target` for every loop
 /// edge. Forward (`control` / `data`) edges are invisible — a loop body is a
 /// back-edge structure.
@@ -166,7 +188,7 @@ fn has_loop_self_edge(graph: &wf::TaskGraph, node: &str) -> bool {
 /// Tarjan's SCC, iterated rather than recursed so a pathological chain cannot
 /// exhaust the stack. Components are keyed on `kind = loop` edges, not graph
 /// cycles in general.
-fn loop_sccs(graph: &wf::TaskGraph) -> Vec<HashSet<String>> {
+pub(crate) fn loop_sccs(graph: &wf::TaskGraph) -> Vec<HashSet<String>> {
     let adj = loop_adjacency(graph);
 
     let mut index_of: HashMap<String, usize> = HashMap::new();
@@ -907,6 +929,56 @@ mod tests {
     #[test]
     fn seal_closes_loop_ring_with_entry() {
         assert_seal_loop_ring_with_entry();
+    }
+
+    #[test]
+    fn seal_does_not_add_sibling_exit_when_loop_body_has_producer_exit() {
+        let (start, end) = sentinels();
+        let (head, producer, downstream) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let def = definition(
+            &start,
+            &end,
+            vec![
+                task_def(head, "head"),
+                task_def(producer, "producer"),
+                task_def(downstream, "downstream"),
+            ],
+            vec![
+                edge(CONTROL, vec![start.clone()], vec![head.to_string()], vec![]),
+                edge(
+                    LOOP,
+                    vec![head.to_string()],
+                    vec![producer.to_string()],
+                    vec![predicate_gate("loop_control", "continue")],
+                ),
+                edge(
+                    LOOP,
+                    vec![producer.to_string()],
+                    vec![head.to_string()],
+                    vec![predicate_gate("loop_control", "continue")],
+                ),
+                edge(
+                    DATA,
+                    vec![producer.to_string()],
+                    vec![downstream.to_string()],
+                    vec![predicate_gate("loop_control", "done")],
+                ),
+            ],
+        );
+
+        let graph = seal(&def);
+        assert!(
+            !end_wires(&graph, head),
+            "the producer's authored exit closes the loop body; the seal must not add a competing head → End edge"
+        );
+        assert!(
+            !end_wires(&graph, producer),
+            "the producer already has an authored exit"
+        );
+        assert!(
+            end_wires(&graph, downstream),
+            "ordinary downstream orphan sealing remains unchanged"
+        );
     }
 
     /// A fan-in: two orphan-source tasks both feeding one sink via a single

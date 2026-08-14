@@ -119,6 +119,7 @@ fn every_expected_fixture_is_present_on_disk() {
         "slug_invalid_rejected.ncl",
         "mkloop_single_task.ncl",
         "mkloop_multi_task_ring.ncl",
+        "mkloop_non_head_producer.ncl",
         "chain_serial_spine.ncl",
         "handwired_serial_spine.ncl",
         "nested_chain_spine.ncl",
@@ -749,6 +750,121 @@ async fn mkloop_multi_task_ring_evaluates_and_parses_into_runnable_loop_body() {
         &g.kind,
         Some(wf::gate::Kind::PredicateHolds(ph)) if ph.routing_var == "loop_control"
     )));
+}
+
+/// A non-head `mkLoop.producer` controls both continuation and exit. The first
+/// task is reached directly from the entry and therefore cannot be dominated by
+/// the second task on lap one. Its ring edge still carries mkLoop's declarative
+/// `loop_control == continue` gate, but parses because runtime loop advancement
+/// is park-fired from the completing turn rather than predicate-gate-fired from
+/// grounded sources. The default whole-body exit also parses because terminal
+/// SCC teardown grounds the sibling only after the producer's verdict arrives.
+#[tokio::test]
+async fn mkloop_non_head_producer_controls_continue_and_exit() {
+    if !nickel_available() {
+        eprintln!("skipping: `nickel` not on PATH");
+        return;
+    }
+    let json = eval("mkloop_non_head_producer.ncl").await;
+    let value: serde_json::Value = serde_json::from_str(&json).expect("mkLoop JSON parses");
+    let group = &value["tasks"][0];
+    let tasks = group["tasks"].as_array().expect("body tasks present");
+    let declares_loop_control = |name: &str| {
+        tasks
+            .iter()
+            .find(|task| task["name"].as_str() == Some(name))
+            .and_then(|task| task["routing_vars"].as_array())
+            .is_some_and(|vars| {
+                vars.iter()
+                    .any(|var| var["name"].as_str() == Some("loop_control"))
+            })
+    };
+    assert!(
+        !declares_loop_control("inspect"),
+        "the first task is read-only"
+    );
+    assert!(
+        declares_loop_control("decide"),
+        "only the non-head controller declares loop_control"
+    );
+
+    let edges = group["edges"].as_array().expect("loop edges present");
+    let edge = |source: &str, target: &str| {
+        edges.iter().find(|edge| {
+            edge["sources"]
+                .as_array()
+                .is_some_and(|sources| sources.len() == 1 && sources[0].as_str() == Some(source))
+                && edge["targets"].as_array().is_some_and(|targets| {
+                    targets.len() == 1 && targets[0].as_str() == Some(target)
+                })
+        })
+    };
+    let first_to_controller = edge("inspect", "decide").expect("inspect -> decide ring edge");
+    assert_eq!(first_to_controller["kind"].as_str(), Some("loop"));
+    assert_eq!(
+        first_to_controller["gate"]["value"].as_str(),
+        Some("continue")
+    );
+    let controller_to_first = edge("decide", "inspect").expect("decide -> inspect ring edge");
+    assert_eq!(controller_to_first["kind"].as_str(), Some("loop"));
+    assert_eq!(
+        controller_to_first["gate"]["value"].as_str(),
+        Some("continue")
+    );
+    let exit = edges
+        .iter()
+        .find(|edge| {
+            edge["targets"].as_array().is_some_and(|targets| {
+                targets.len() == 1 && targets[0].as_str() == Some("finalize")
+            })
+        })
+        .expect("whole-body exit");
+    assert_eq!(exit["kind"].as_str(), Some("data"));
+    assert_eq!(exit["gate"]["value"].as_str(), Some("done"));
+    let exit_sources: Vec<&str> = exit["sources"]
+        .as_array()
+        .expect("exit sources")
+        .iter()
+        .map(|source| source.as_str().expect("task name source"))
+        .collect();
+    assert_eq!(exit_sources, ["inspect", "decide"]);
+
+    let def = Parser::parse_workflow_from_json(&json, "default")
+        .await
+        .expect("a non-head loop_control producer parses");
+    let inspect = task_by_name(&def, "inspect");
+    let decide = task_by_name(&def, "decide");
+    let finalize = task_by_name(&def, "finalize");
+    assert!(inspect.loop_participant && decide.loop_participant);
+    assert!(!finalize.loop_participant);
+
+    let graph = task_graph(&def);
+    assert!(
+        !graph.edges.iter().any(|edge| {
+            edge.sources == [inspect.id.clone()] && edge.targets == [graph.end.clone()]
+        }),
+        "the authored whole-body exit leaves no synthesized inspect -> End edge"
+    );
+    let first_to_controller = graph
+        .edges
+        .iter()
+        .find(|edge| edge.sources == [inspect.id.clone()] && edge.targets == [decide.id.clone()])
+        .expect("parsed inspect -> decide ring edge");
+    assert_eq!(first_to_controller.kind, wf::EdgeKind::Loop as i32);
+    assert!(first_to_controller.gates.iter().any(|gate| matches!(
+        &gate.kind,
+        Some(wf::gate::Kind::PredicateHolds(predicate))
+            if predicate.routing_var == "loop_control"
+    )));
+    let exit = graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.sources == [inspect.id.clone(), decide.id.clone()]
+                && edge.targets == [finalize.id.clone()]
+        })
+        .expect("parsed whole-body exit");
+    assert_eq!(exit.kind, wf::EdgeKind::Data as i32);
 }
 
 /// The bare-verb `chain` combinator lowers byte-identically to its hand-wired

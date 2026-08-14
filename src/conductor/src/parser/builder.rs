@@ -470,9 +470,10 @@ pub async fn parse_workflow_from_json_for_tenant(
     apply_signal_resolution(&mut def)?;
 
     // (5) Predicate-gate dominator check: every `PredicateHolds` gate references
-    //     a routing variable; the producing task must dominate every source of
-    //     the consuming gate's edge so the routing variable is guaranteed
-    //     present when the gate evaluates.
+    //     a routing variable; ordinarily the producing task must dominate every
+    //     source of the consuming edge. The reserved loop-control path instead
+    //     relies on park-fire and SCC teardown for sources in the producer's
+    //     loop body.
     validate_predicate_gate_dominators_proto(&parsed_workflow, &def, &name_to_id)?;
 
     // (6) Loop-terminability check: every loop body (the `kind = loop` SCC) must
@@ -652,15 +653,20 @@ pub(crate) fn validate_single_producer(parsed: &ParsedWorkflow) -> Result<()> {
     ))
 }
 
-/// For every `Gate::PredicateHolds` on the in-memory workflow,
-/// resolve the routing variable to its producing task and verify
-/// the producer dominates every source of the gate's edge. The
-/// rule keeps `PredicateHolds` evaluation deterministic: by the
-/// dominator-check guarantee the routing variable is in
-/// `instance.routing_variables` at the moment any source of the
-/// gate's edge grounds, so the gate either satisfies at dispatch
-/// or stays Dispatched waiting for the producer's TaskUpdate
-/// (which by the dominator check IS upstream of every source).
+/// For every `Gate::PredicateHolds` on the in-memory workflow, resolve the
+/// routing variable to its producing task and ordinarily require the producer
+/// to dominate every source of the gate's edge. That guarantee puts the value
+/// in `instance.routing_variables` before an ordinary grounded source can make
+/// the gate evaluable.
+///
+/// Sources in the same loop SCC as the reserved `loop_control` producer are the
+/// narrow exception. A continuing participant stays ungrounded and advances its
+/// `kind = loop` edge through park-fire, which decodes the completing turn's
+/// control directly. On `done` / `fail`, SCC teardown grounds the producer's
+/// siblings only after that producer's terminal update arrives. Both paths make
+/// the control available without graph dominance, including when the sole
+/// producer is not the loop head. Other routing variables, and sources outside
+/// that producer's loop body, retain the ordinary dominance requirement.
 fn validate_predicate_gate_dominators_proto(
     parsed: &ParsedWorkflow,
     def: &wf::WorkflowDefinition,
@@ -679,6 +685,7 @@ fn validate_predicate_gate_dominators_proto(
     }
 
     let graph = def.task_graph.as_ref().expect("graph present");
+    let loop_bodies = definition_graph::loop_sccs(graph);
     for edge in &graph.edges {
         for gate in &edge.gates {
             let Some(wf::gate::Kind::PredicateHolds(ph)) = &gate.kind else {
@@ -702,7 +709,20 @@ fn validate_predicate_gate_dominators_proto(
                     )
                 })?
                 .to_string();
+
+            let producer_loop_body = (routing_var == "loop_control")
+                .then(|| loop_bodies.iter().find(|body| body.contains(&producer_id)))
+                .flatten();
+
             for src in &edge.sources {
+                // Park-fire advances continuing ring members without grounding;
+                // terminal SCC teardown grounds siblings only after this
+                // producer's done/fail update. The reserved control is therefore
+                // available for every source in the producer's own loop body
+                // even when ordinary graph dominance does not hold.
+                if producer_loop_body.is_some_and(|body| body.contains(src)) {
+                    continue;
+                }
                 if let Err(v) = definition_graph::validate_task_dominates(graph, &producer_id, src)
                 {
                     return Err(anyhow!(
@@ -2023,6 +2043,120 @@ mod tests {
             msg.contains("coverage") && msg.contains("test") && msg.contains("dominate"),
             "error must name routing var, producer, and bypass: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn non_head_loop_control_producer_is_accepted_for_ring_and_body_exit() {
+        let json = r#"{
+            "command": "AddWorkflow", "slug": "non-head-loop-producer",
+            "name": "non_head_loop_producer",
+            "args": [],
+            "outputs": [],
+            "tasks": [
+                {
+                    "command": "AddTaskGroup",
+                    "name": "loop",
+                    "args": [],
+                    "outputs": [],
+                    "tasks": [
+                        { "command": "AddTask", "name": "inspect", "args": [], "outputs": [], "nix_expression_path": "x" },
+                        {
+                            "command": "AddTask", "name": "decide", "args": [], "outputs": [], "nix_expression_path": "x",
+                            "routing_vars": [{ "name": "loop_control", "kind": "routing-var", "type": "string" }]
+                        },
+                        { "command": "AddTask", "name": "finalize", "args": [], "outputs": [], "nix_expression_path": "x" }
+                    ],
+                    "edges": [
+                        { "sources": ["Start"], "targets": ["inspect"] },
+                        {
+                            "sources": ["inspect"], "targets": ["decide"], "kind": "loop",
+                            "gate": { "kind": "predicate-gate", "routing_var": "loop_control", "op": "Eq", "value": "continue" }
+                        },
+                        {
+                            "sources": ["decide"], "targets": ["inspect"], "kind": "loop",
+                            "gate": { "kind": "predicate-gate", "routing_var": "loop_control", "op": "Eq", "value": "continue" }
+                        },
+                        {
+                            "sources": ["inspect", "decide"], "targets": ["finalize"], "kind": "data",
+                            "gate": { "kind": "predicate-gate", "routing_var": "loop_control", "op": "Eq", "value": "done" }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let def = parse_workflow_from_json(json, "default")
+            .await
+            .expect("same-SCC loop_control sources do not require ordinary dominance");
+        let inspect = task_id_by_name(&def, "inspect");
+        let decide = task_id_by_name(&def, "decide");
+        let finalize = task_id_by_name(&def, "finalize");
+        let graph = graph_of(&def);
+        assert_eq!(
+            edge_between(graph, inspect, decide).kind,
+            wf::EdgeKind::Loop as i32
+        );
+        let exit = edge_between(graph, inspect, finalize);
+        assert_eq!(exit.kind, wf::EdgeKind::Data as i32);
+        assert_eq!(
+            exit.sources,
+            [inspect.to_string(), decide.to_string()],
+            "the default whole-body exit remains intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_predicate_on_loop_edge_still_requires_dominance() {
+        let json = r#"{
+            "command": "AddWorkflow", "slug": "ordinary-loop-predicate",
+            "name": "ordinary_loop_predicate",
+            "args": [],
+            "outputs": [],
+            "tasks": [
+                {
+                    "command": "AddTaskGroup",
+                    "name": "loop",
+                    "args": [],
+                    "outputs": [],
+                    "tasks": [
+                        { "command": "AddTask", "name": "inspect", "args": [], "outputs": [], "nix_expression_path": "x" },
+                        {
+                            "command": "AddTask", "name": "decide", "args": [], "outputs": [], "nix_expression_path": "x",
+                            "routing_vars": [
+                                { "name": "loop_control", "kind": "routing-var", "type": "string" },
+                                { "name": "decision", "kind": "routing-var", "type": "string" }
+                            ]
+                        }
+                    ],
+                    "edges": [
+                        { "sources": ["Start"], "targets": ["inspect"] },
+                        {
+                            "sources": ["inspect"], "targets": ["decide"], "kind": "loop",
+                            "gate": { "kind": "predicate-gate", "routing_var": "decision", "op": "Eq", "value": "continue" }
+                        },
+                        {
+                            "sources": ["decide"], "targets": ["inspect"], "kind": "loop",
+                            "gate": { "kind": "predicate-gate", "routing_var": "loop_control", "op": "Eq", "value": "continue" }
+                        },
+                        {
+                            "sources": ["decide"], "targets": ["End"], "kind": "data",
+                            "gate": { "kind": "predicate-gate", "routing_var": "loop_control", "op": "Eq", "value": "done" }
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let err = parse_workflow_from_json(json, "default")
+            .await
+            .expect_err("non-loop routing variables retain ordinary dominance checks");
+        let message = err.to_string();
+        assert!(
+            message.contains("decision")
+                && message.contains("decide")
+                && message.contains("dominate"),
+            "error names the ordinary variable, producer, and dominance rule: {message}"
         );
     }
 
