@@ -360,18 +360,28 @@ impl<'a> KvSpec<'a> {
 async fn ensure_kv(js: &jetstream::Context, expected: KvSpec<'_>) -> Result<()> {
     let store = match js.get_key_value(expected.bucket).await {
         Ok(store) => store,
-        Err(_) => js
-            .create_key_value(kv::Config {
-                bucket: expected.bucket.to_owned(),
-                history: 1,
-                max_value_size: expected.max_value_size,
-                max_age: expected.max_age,
-                storage: stream::StorageType::File,
-                limit_markers: expected.marker_ttl,
-                ..Default::default()
-            })
-            .await
-            .with_context(|| format!("creating exact KV bucket {}", expected.bucket))?,
+        Err(_) => {
+            match js
+                .create_key_value(kv::Config {
+                    bucket: expected.bucket.to_owned(),
+                    history: 1,
+                    max_value_size: expected.max_value_size,
+                    max_age: expected.max_age,
+                    storage: stream::StorageType::File,
+                    limit_markers: expected.marker_ttl,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => js.get_key_value(expected.bucket).await.with_context(|| {
+                    format!(
+                        "opening concurrently-created exact KV bucket {}",
+                        expected.bucket
+                    )
+                })?,
+            }
+        }
     };
     let status = store
         .status()

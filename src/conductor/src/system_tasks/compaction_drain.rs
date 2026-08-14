@@ -726,72 +726,63 @@ async fn drain_one(
     let scope_snapshot = seal_ctx_scope(repositories, scope_reader, projection)
         .await
         .context("seal tickr-ctx scope before final-Log installation")?;
+    let stored_seal =
+        read_staged_json::<CompactionSeal>(&staging_store, &seal_key, "Compaction seal").await?;
     observe_compaction_boundary(CompactionBoundary::BeforeLogSeal);
     let mut task_log_seals = Vec::with_capacity(task_instance_ids.len());
     let mut missing_log_state = Vec::new();
-    for task_instance_id in &task_instance_ids {
-        match seal_task_logs(nats, &workflow_id, &workflow_instance_id, task_instance_id)
-            .await
-            .with_context(|| format!("seal Log staging for task instance {task_instance_id}"))?
-        {
-            Some(seal) => task_log_seals.push(seal),
-            None => missing_log_state.push(*task_instance_id),
-        }
-    }
-    task_log_seals.sort_by_key(|seal| seal.identity().task_instance_id);
-
-    let stored_seal =
-        read_staged_json::<CompactionSeal>(&staging_store, &seal_key, "Compaction seal").await?;
-    let calculated_seal = if missing_log_state.is_empty() {
-        Some(build_compaction_seal(
-            workflow_instance_id,
-            scope_snapshot.digest.clone(),
-            &task_log_seals,
-        )?)
-    } else {
-        None
-    };
-    let compaction_seal = match (stored_seal, calculated_seal) {
-        (Some(stored), Some(calculated)) => {
-            let already_committed = archive_committed_digest
-                .as_deref()
-                .is_some_and(|digest| digest == stored.digest.as_bytes());
-            if stored == calculated || already_committed {
-                stored
-            } else {
-                bail!("immutable Compaction seal identity changed");
+    if archive_committed_digest.is_none() {
+        for task_instance_id in &task_instance_ids {
+            match seal_task_logs(nats, &workflow_id, &workflow_instance_id, task_instance_id)
+                .await
+                .with_context(|| format!("seal Log staging for task instance {task_instance_id}"))?
+            {
+                Some(seal) => task_log_seals.push(seal),
+                None => missing_log_state.push(*task_instance_id),
             }
         }
-        (None, Some(calculated)) if archive_committed_digest.is_none() => {
-            create_staged_json(&staging_store, &seal_key, &calculated, "Compaction seal").await?;
-            calculated
-        }
-        (Some(stored), None)
-            if archive_committed_digest
-                .as_deref()
-                .is_some_and(|digest| digest == stored.digest.as_bytes()) =>
-        {
-            stored
-        }
-        (Some(_), None) => {
-            bail!(
-                "missing Log staging for {:?} before archive commit",
-                missing_log_state
-            )
-        }
-        (None, Some(_)) => bail!("archive commit has no retained immutable Compaction seal"),
-        (None, None) => {
-            bail!(
-                "missing Log staging for {:?} before Compaction seal",
-                missing_log_state
-            )
-        }
-    };
-    if let Some(committed_digest) = archive_committed_digest.as_deref() {
-        if committed_digest != compaction_seal.digest.as_bytes() {
+        task_log_seals.sort_by_key(|seal| seal.identity().task_instance_id);
+    }
+
+    let compaction_seal = if let Some(committed_digest) = archive_committed_digest.as_deref() {
+        let stored = stored_seal
+            .ok_or_else(|| anyhow!("archive commit has no retained immutable Compaction seal"))?;
+        if committed_digest != stored.digest.as_bytes() {
             bail!("archive-commit evidence does not match the immutable Compaction seal");
         }
-    }
+        stored
+    } else {
+        let calculated_seal = if missing_log_state.is_empty() {
+            Some(build_compaction_seal(
+                workflow_instance_id,
+                scope_snapshot.digest.clone(),
+                &task_log_seals,
+            )?)
+        } else {
+            None
+        };
+        match (stored_seal, calculated_seal) {
+            (Some(stored), Some(calculated)) if stored == calculated => stored,
+            (Some(_), Some(_)) => bail!("immutable Compaction seal identity changed"),
+            (None, Some(calculated)) => {
+                create_staged_json(&staging_store, &seal_key, &calculated, "Compaction seal")
+                    .await?;
+                calculated
+            }
+            (Some(_), None) => {
+                bail!(
+                    "missing Log staging for {:?} before archive commit",
+                    missing_log_state
+                )
+            }
+            (None, None) => {
+                bail!(
+                    "missing Log staging for {:?} before Compaction seal",
+                    missing_log_state
+                )
+            }
+        }
+    };
     if compaction_seal.scope_digest != scope_snapshot.digest {
         bail!("tickr-ctx scope digest changed after the immutable Compaction seal");
     }

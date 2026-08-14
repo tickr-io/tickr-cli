@@ -362,11 +362,19 @@ async fn main() -> Result<()> {
         DistributedFormation::AllNats => tickr::formation::FormationSelection::all_nats(),
         DistributedFormation::AllRedis => tickr::formation::FormationSelection::all_redis(),
     };
-    if matches!(
+    let distributed_root = matches!(
         &cli.command,
         Commands::Conductor | Commands::Api | Commands::Executor
-    ) {
+    );
+    if distributed_root {
         tickr::formation::resolve_formation(&selection)?;
+        if cli.distributed_formation == DistributedFormation::AllNats {
+            tickr_conductor::all_nats_formation::connect_and_admit(
+                &tickr_proto::config::nats_url(),
+            )
+            .await
+            .context("admitting all-NATS formation before component startup")?;
+        }
     }
 
     let shutdown = CancellationToken::new();

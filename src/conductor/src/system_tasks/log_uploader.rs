@@ -541,6 +541,7 @@ pub(crate) async fn purge_sealed_task_logs(
         .map(|fence| (fence.stream.clone(), fence.terminal.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut retained_terminals = BTreeMap::new();
+    let mut sequences_to_purge = Vec::new();
     loop {
         let mut fetched = consumer
             .fetch()
@@ -579,9 +580,7 @@ pub(crate) async fn purge_sealed_task_logs(
                 }
                 tickr_proto::coord::log_stream::ReplayedLogRecord::Accepted { .. }
                 | tickr_proto::coord::log_stream::ReplayedLogRecord::PreAcceptanceGap(_) => {
-                    stream.delete_message(sequence).await.with_context(|| {
-                        format!("purge Accepted Log or gap at stream sequence {sequence}")
-                    })?;
+                    sequences_to_purge.push(sequence);
                 }
             }
             count += 1;
@@ -593,6 +592,12 @@ pub(crate) async fn purge_sealed_task_logs(
     if retained_terminals != expected_terminals {
         bail!("retained Log terminal fences do not match immutable seal");
     }
+    for sequence in sequences_to_purge {
+        stream
+            .delete_message(sequence)
+            .await
+            .with_context(|| format!("purge Accepted Log or gap at stream sequence {sequence}"))?;
+    }
     Ok(())
 }
 
@@ -601,6 +606,12 @@ mod tests {
     use super::*;
     use flate2::read::GzDecoder;
     use std::io::Read;
+    #[cfg(not(madsim))]
+    use testcontainers_modules::nats::{Nats, NatsServerCmd};
+    #[cfg(not(madsim))]
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    #[cfg(not(madsim))]
+    use testcontainers_modules::testcontainers::ImageExt;
 
     fn gunzip(bytes: &[u8]) -> Vec<u8> {
         let mut decoder = GzDecoder::new(bytes);
@@ -716,5 +727,126 @@ mod tests {
             log_subject(&wf, &wi, &ti),
             "tickr.all_nats.v2.log_staging.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"
         );
+    }
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn sealed_purge_verifies_terminal_fences_before_deleting_records() -> Result<()> {
+        let cmd = NatsServerCmd::default().with_jetstream();
+        let container = match Nats::default().with_cmd(&cmd).start().await {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("skipping: NATS testcontainer unavailable: {error}");
+                return Ok(());
+            }
+        };
+        let port = container
+            .get_host_port_ipv4(4222)
+            .await
+            .context("read isolated NATS port")?;
+        let url = format!("nats://127.0.0.1:{port}");
+        let mut connected = None;
+        for _ in 0..50 {
+            match async_nats::connect(&url).await {
+                Ok(client) => {
+                    connected = Some(client);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let nats = connected.context("isolated NATS did not accept connections")?;
+        let js = jetstream::new(nats.clone());
+        js.get_or_create_stream(jetstream::stream::Config {
+            name: LOG_STREAM_NAME.to_owned(),
+            subjects: vec![all_nats::LOG_STREAM_SUBJECTS.to_owned()],
+            ..Default::default()
+        })
+        .await
+        .context("create isolated Log staging stream")?;
+
+        let workflow_id = Uuid::new_v4();
+        let workflow_instance_id = Uuid::new_v4();
+        let task_instance_id = Uuid::new_v4();
+        let subject = log_subject(&workflow_id, &workflow_instance_id, &task_instance_id);
+        let bytes = b"accepted record".to_vec();
+        let content_digest = tickr_proto::coord::log_stream::content_digest(&bytes);
+        let mut accepted_headers = async_nats::HeaderMap::new();
+        accepted_headers.insert(all_nats::LOG_PROTOCOL_HEADER, all_nats::LOG_PROTOCOL);
+        accepted_headers.insert(all_nats::LOG_KIND_HEADER, all_nats::LOG_KIND_ACCEPTED);
+        accepted_headers.insert(
+            all_nats::LOG_TASK_INSTANCE_HEADER,
+            task_instance_id.to_string().as_str(),
+        );
+        accepted_headers.insert(all_nats::LOG_PICKUP_GENERATION_HEADER, "1");
+        accepted_headers.insert(all_nats::LOG_SEQUENCE_HEADER, "0");
+        accepted_headers.insert(all_nats::LOG_COMMITTED_FRONTIER_HEADER, "0");
+        accepted_headers.insert(all_nats::LOG_CONTENT_DIGEST_HEADER, content_digest.as_str());
+        accepted_headers.insert(
+            "Nats-Msg-Id",
+            format!("log:{task_instance_id}:1:record:0").as_str(),
+        );
+        js.publish_with_headers(subject.clone(), accepted_headers, bytes.into())
+            .await?
+            .await?;
+
+        let mut terminal_headers = async_nats::HeaderMap::new();
+        terminal_headers.insert(all_nats::LOG_PROTOCOL_HEADER, all_nats::LOG_PROTOCOL);
+        terminal_headers.insert(all_nats::LOG_KIND_HEADER, all_nats::LOG_KIND_END);
+        terminal_headers.insert(
+            all_nats::LOG_TASK_INSTANCE_HEADER,
+            task_instance_id.to_string().as_str(),
+        );
+        terminal_headers.insert(all_nats::LOG_PICKUP_GENERATION_HEADER, "1");
+        terminal_headers.insert(all_nats::LOG_COMMITTED_FRONTIER_HEADER, "0");
+        terminal_headers.insert(all_nats::LOG_EXIT_KIND_HEADER, "status");
+        terminal_headers.insert(all_nats::LOG_EXIT_STATUS_HEADER, "1");
+        terminal_headers.insert(
+            "Nats-Msg-Id",
+            format!("log:{task_instance_id}:1:terminal").as_str(),
+        );
+        js.publish_with_headers(subject.clone(), terminal_headers, Default::default())
+            .await?
+            .await?;
+
+        let actual = seal_task_logs(
+            &nats,
+            &workflow_id,
+            &workflow_instance_id,
+            &task_instance_id,
+        )
+        .await?
+        .context("sealed Log staging is present")?
+        .identity();
+        let mut mismatched = actual.clone();
+        mismatched.terminal_fences[0].terminal = LogTerminal::EndOfStream {
+            exit: tickr_proto::coord::log_stream::LogExit::Status(2),
+        };
+
+        let error = purge_sealed_task_logs(&nats, &workflow_id, &workflow_instance_id, &mismatched)
+            .await
+            .expect_err("mismatched terminal fence must fail closed");
+        assert!(error
+            .to_string()
+            .contains("terminal fences do not match immutable seal"));
+        let mut stream = js.get_stream(LOG_STREAM_NAME).await?;
+        assert_eq!(
+            stream.info().await?.state.messages,
+            2,
+            "fence verification must precede every destructive delete"
+        );
+
+        purge_sealed_task_logs(&nats, &workflow_id, &workflow_instance_id, &actual).await?;
+        assert_eq!(
+            stream.info().await?.state.messages,
+            1,
+            "verified purge retains only the immutable terminal fence"
+        );
+        purge_sealed_task_logs(&nats, &workflow_id, &workflow_instance_id, &actual).await?;
+        assert_eq!(
+            stream.info().await?.state.messages,
+            1,
+            "retry after a partial or completed purge is idempotent"
+        );
+        Ok(())
     }
 }

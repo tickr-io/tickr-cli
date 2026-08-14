@@ -171,6 +171,23 @@ async fn disposable_fixture_provisions_only_the_hardened_resource_set() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_component_admission_converges_on_one_resource_set() {
+    let Some(fixture) = FreshAllNats::start().await else {
+        return;
+    };
+
+    let first = tickr_conductor::all_nats_formation::admit_and_provision(&fixture.client);
+    let second = tickr_conductor::all_nats_formation::admit_and_provision(&fixture.client);
+    let third = tickr_conductor::all_nats_formation::admit_and_provision(&fixture.client);
+    let (first, second, third) = tokio::join!(first, second, third);
+
+    first.expect("first component admission");
+    second.expect("second component admission");
+    third.expect("third component admission");
+    assert_only_hardened_resources(&fixture.client).await;
+}
+
 #[tokio::test]
 async fn nonempty_fresh_state_without_identity_fails_closed() {
     let Some(fixture) = FreshAllNats::start().await else {
