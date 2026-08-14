@@ -30,6 +30,26 @@ EXCEPTIONS = {
             "Router 8.3.0 is the declared fix but is not published to npm."
         ),
     ),
+    "https://github.com/advisories/GHSA-5p2g-fcmc-qvqq": ExceptionPolicy(
+        package="image-size",
+        expires=date(2026, 8, 28),
+        reason=(
+            "The affected parser runs only during repository-controlled "
+            "Docusaurus builds; the published site serves static output and "
+            "has no runtime image parsing path. No patched image-size or "
+            "Docusaurus mdx-loader release exists as of 2026-08-14."
+        ),
+    ),
+    "https://github.com/advisories/GHSA-w3rx-r6r6-pgpr": ExceptionPolicy(
+        package="image-size",
+        expires=date(2026, 8, 28),
+        reason=(
+            "The affected parser runs only during repository-controlled "
+            "Docusaurus builds; the published site serves static output and "
+            "has no runtime image parsing path. No patched image-size or "
+            "Docusaurus mdx-loader release exists as of 2026-08-14."
+        ),
+    ),
 }
 
 
@@ -73,18 +93,31 @@ def findings(report: dict, today: date):
 
 
 class Tests(unittest.TestCase):
-    def report(self, url="https://github.com/advisories/GHSA-qwww-vcr4-c8h2"):
+    def report(
+        self,
+        url="https://github.com/advisories/GHSA-qwww-vcr4-c8h2",
+        package="react-router",
+    ):
         return {
             "vulnerabilities": {
-                "react-router": {
-                    "via": [{"name": "react-router", "url": url}],
+                package: {
+                    "via": [{"name": package, "url": url}],
                 },
-                "react-router-dom": {"via": ["react-router"]},
             }
         }
 
     def test_current_scoped_exception_passes(self):
         self.assertEqual(findings(self.report(), date(2026, 8, 4)), [])
+    def test_image_size_exceptions_are_scoped_and_current(self):
+        for url in (
+            "https://github.com/advisories/GHSA-5p2g-fcmc-qvqq",
+            "https://github.com/advisories/GHSA-w3rx-r6r6-pgpr",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    findings(self.report(url, package="image-size"), date(2026, 8, 14)),
+                    [],
+                )
 
     def test_unknown_advisory_fails(self):
         result = findings(
