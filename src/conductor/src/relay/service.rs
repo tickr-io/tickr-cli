@@ -97,7 +97,7 @@ async fn stage_compaction_through_role_and_send_ack(
     Ok((workflow_instance_id, state))
 }
 
-/// Register a protobuf workflow definition through the coordinator relay.
+/// Register a protobuf workflow definition through the Conductor relay.
 pub async fn send_workflow_registration(definition: wf::WorkflowDefinition) -> Result<()> {
     let tx_guard = RELAY_TX.lock().await;
 
@@ -1465,7 +1465,7 @@ pub async fn drain_attempt_outcomes_with_writer(
 /// Sends a workflow build update through the relay system
 
 /// Self-healing wrapper around the relay stream. Retries the connect+stream
-/// loop on any error so that startup ordering against the coordinator gRPC server
+/// loop on any error so that startup ordering against the Control-plane Conductor relay
 /// (and transient mid-flight drops) doesn't leave the conductor wedged.
 #[derive(Clone)]
 enum TaskEventRoles {
@@ -1685,8 +1685,8 @@ async fn try_run_streaming(
         .await
         .map_err(anyhow::Error::msg)?;
 
-    // Connect to the configured coordinator's public relay endpoint.
-    let channel = Channel::from_shared(tickr_proto::config::coordinator_relay_url())?
+    // Connect to the configured Control-plane Conductor relay endpoint.
+    let channel = Channel::from_shared(tickr_proto::config::ctrl_relay_url())?
         .connect()
         .await?;
     let mut client = ConductorRelayServiceClient::new(channel);
@@ -1754,7 +1754,7 @@ async fn try_run_streaming(
         let mut rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
         // Initial message to establish the connection. It self-asserts this
-        // conductor's tenant on the coordinator channel at handshake — the coordinator
+        // conductor's tenant on the Control-plane relay channel at handshake — the Frontend
         // captures it into connection state and stamps every forwarded envelope
         // from that state, so the tenant rides addressing metadata, never a
         // decoded payload id. Derived from the operator-set slug: every
@@ -2140,7 +2140,7 @@ pub async fn run_streaming_lite(
         shutdown_token,
         definition_repository,
         roles,
-        tickr_proto::config::coordinator_relay_url(),
+        tickr_proto::config::ctrl_relay_url(),
         TenantId::from_env().to_string(),
     )
     .await
@@ -2351,8 +2351,10 @@ mod lite_relay_tests {
     };
     use futures::Stream;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::ffi::OsString;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::TempDir;
     use tickr_migrations::backend::{RepositoryFactory, WriterRepositoryBundle};
@@ -2361,6 +2363,39 @@ mod lite_relay_tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status, Streaming};
 
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RelayEnvironment {
+        previous: [(&'static str, Option<OsString>); 2],
+    }
+
+    impl RelayEnvironment {
+        fn set(relay_url: &str, tenant_slug: &str) -> Self {
+            let environment = Self {
+                previous: [
+                    (
+                        "TICKR_CTRL_RELAY_URL",
+                        std::env::var_os("TICKR_CTRL_RELAY_URL"),
+                    ),
+                    ("TICKR_TENANT_SLUG", std::env::var_os("TICKR_TENANT_SLUG")),
+                ],
+            };
+            std::env::set_var("TICKR_CTRL_RELAY_URL", relay_url);
+            std::env::set_var("TICKR_TENANT_SLUG", tenant_slug);
+            environment
+        }
+    }
+
+    impl Drop for RelayEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
     type RelayStream =
         Pin<Box<dyn Stream<Item = Result<ConductorRelayMessage, Status>> + Send + 'static>>;
 
@@ -2468,6 +2503,38 @@ mod lite_relay_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lite_relay_uses_configured_control_plane_relay_url() {
+        let _lock = ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server = start_relay(
+            address,
+            Arc::clone(&connections),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+        let _environment =
+            RelayEnvironment::set(&format!("http://{address}"), "configured-relay-tenant");
+        let (_directory, repository) = definition_repository().await;
+        let shutdown = CancellationToken::new();
+        let relay = tokio::spawn(run_streaming_lite(
+            shutdown.clone(),
+            repository,
+            Arc::new(NoopRoles),
+        ));
+
+        await_connections(&connections, 1).await;
+        shutdown.cancel();
+        relay.await.unwrap().unwrap();
+        server.abort();
     }
 
     #[tokio::test]

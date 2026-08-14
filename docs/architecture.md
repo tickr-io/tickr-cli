@@ -1,8 +1,8 @@
 # Architecture
 
-Tickr CLI is the tenant-side workflow runtime. It provides the `tickr` command,
-three runtime processes, the Console, and the public contracts used to connect a
-Tickr coordinator.
+Tickr CLI is the tenant-side Data plane. It provides the `tickr` command,
+three runtime processes, the Console, and the public contracts used to connect
+to the Tickr Control plane.
 
 ## Components
 
@@ -10,8 +10,8 @@ Tickr coordinator.
   task specifications, maintains tenant coordination state in NATS, and archives
   terminal runs in PostgreSQL.
 - **API** exposes the HTTP and OpenAPI surface used by operators and the Console.
-  Archived reads come from PostgreSQL; live reads are merged from the configured
-  coordinator when it is available.
+  archived reads come from PostgreSQL; live reads are merged from the Control
+  plane's HTTP subquery channel when it is available.
 - **Executor** pulls runnable tasks, executes them, publishes lifecycle events,
   and ships task logs.
 - **Console** is the browser interface served by Vite during local development.
@@ -19,21 +19,23 @@ Tickr coordinator.
   object storage. The repository-local Compose file provides development-only
   instances of these services.
 
-## Coordinator interface
+## Control-plane connection
 
 The local formation is useful on its own for development, contract validation,
-archived-data APIs, and Console/API work. End-to-end scheduling and live cluster
-views require a compatible Tickr coordinator.
+archived-data APIs, and Console/API work. End-to-end scheduling and live views
+require a compatible Tickr Control plane.
 
-Two role-based endpoints configure that integration:
+Two role-based endpoints configure that connection:
 
-- `TICKR_COORDINATOR_HTTP_URL` supplies live-query and coordinator-health reads.
-- `TICKR_COORDINATOR_RELAY_URL` supplies the bidirectional conductor relay.
+- `TICKR_CTRL_HTTP_URL` supplies the HTTP subquery channel for live queries and
+  Control-plane health reads.
+- `TICKR_CTRL_RELAY_URL` supplies the bidirectional Conductor relay.
 
 The relay's public wire contract is
 [`proto/conductor-relay.proto`](../proto/conductor-relay.proto). When the
-coordinator is absent, API readiness and `just verify` can still pass, while
-coordinator-backed health and live-data views report unavailable or degraded.
+Control plane is absent, API readiness and `just verify` can still pass, while
+Control-plane health and HTTP-subquery live-data views report unavailable or
+degraded.
 
 ## Data ownership
 

@@ -3,7 +3,7 @@ syntax = "proto3";
 // The published task-coordination contract used to dispatch tasks, report
 // lifecycle events, evaluate hyperedge preconditions, and cancel live attempts.
 // The conductor republishes dispatches onto NATS for executors, while the
-// coordinator consumes lifecycle events and cancellation acknowledgements.
+// Control plane consumes lifecycle events and cancellation acknowledgements.
 //
 // Data-plane-visible by construction: every field here is required to execute
 // or coordinate a task. The task-dispatch message contains only the published
@@ -20,7 +20,7 @@ import "workflow-definition.proto";
 // The internal, non-tenant-visible task lifecycle event the executor and
 // conductor report on. `Delivered`/`Unhealthy` are conductor-produced; the rest
 // are the executor's honest exit observation (`Completed` = process exit 0,
-// `Failed` = exit != 0). It is never a lifecycle verdict; the coordinator owns
+// `Failed` = exit != 0). It is never a lifecycle verdict; the Control plane owns
 // the workflow lifecycle.
 message TaskEvent {
   string task_instance_id = 1;

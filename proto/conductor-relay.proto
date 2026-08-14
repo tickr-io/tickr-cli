@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package tickr;
 
-// Public conductor-to-coordinator relay envelope. Payloads are encoded using
+// Public Conductor-relay envelope. Payloads are encoded using
 // their separately published proto families; this message only carries the
 // stable discriminator and addressing metadata.
 message ConductorRelayMessage {
@@ -35,7 +35,7 @@ enum EntityType {
   CANCEL_TASK_ACK = 17;
 }
 
-// The public bidirectional conductor/coordinator stream. Its package,
+// The public bidirectional Conductor-relay stream. Its package,
 // service, and method names are wire-routing compatibility constraints.
 service ConductorRelayService {
   rpc StreamConductorRelay(stream ConductorRelayMessage) returns (stream ConductorRelayMessage);

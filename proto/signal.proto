@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 // The published Signal-family contract for conductor-authored live-run control.
-// A `Signal` is the envelope sent to a coordinator to affect live runs:
+// A `Signal` is the envelope sent to the Control plane to affect live runs:
 // `Cancel` halts a running instance or node, `Trigger` schedules a one-off
 // instance, `Wakeup` carries an external event toward live gates, and `Resume`
 // lifts a stalled replay. `GateOutcome` carries a gate-predicate result;

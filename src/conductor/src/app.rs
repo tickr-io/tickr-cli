@@ -320,7 +320,7 @@ async fn run_conductor_composed(
     // An unavailable coordinator degrades to an empty index; relay updates
     // repopulate it after connectivity returns.
     let dispatched_count = crate::gate_index_lifecycle::rebuild_from_server(
-        &tickr_proto::config::coordinator_http_url(),
+        &tickr_proto::config::ctrl_http_url(),
         tickr_proto::TenantId::from_env(),
     )
     .await;
@@ -474,7 +474,7 @@ async fn run_conductor_composed(
     let events_pull_repositories = Arc::clone(&definition_repository);
     let events_pull_handle = tokio::spawn(system_tasks::run_events_pull(
         events_pull_repositories,
-        tickr_proto::config::coordinator_http_url(),
+        tickr_proto::config::ctrl_http_url(),
         // Pull only this conductor's own tenant slice from the shared archive.
         tickr_proto::TenantId::from_env().as_uuid(),
         events_pull_shutdown,

@@ -16,8 +16,8 @@ on loopback by default.
 Obtain these values from the operator of the Control plane:
 
 - the tenant slug;
-- the Coordinator HTTP URL;
-- the Coordinator relay URL.
+- the Control-plane HTTP subquery channel URL;
+- the Control-plane Conductor relay URL.
 
 Install these host tools:
 
@@ -117,8 +117,8 @@ cat > tickr-lite.env <<EOF
 export TICKR_HOME="$TICKR_HOME"
 export TICKR_STATE_DIR="$HOME/.local/share/tickr-lite"
 export TICKR_TENANT_SLUG="REPLACE_ME"
-export TICKR_COORDINATOR_HTTP_URL="REPLACE_ME"
-export TICKR_COORDINATOR_RELAY_URL="REPLACE_ME"
+export TICKR_CTRL_HTTP_URL="REPLACE_ME"
+export TICKR_CTRL_RELAY_URL="REPLACE_ME"
 export TICKR_SQL_BACKEND="sqlite"
 export TICKR_SQL_TOPOLOGY="single-node"
 export TICKR_CONDUCTOR_SQLITE_URL="sqlite://$HOME/.local/share/tickr-lite/tickr.db"
@@ -134,12 +134,15 @@ Reject blank values before continuing:
 
 ```sh
 . ./tickr-lite.env
-case "$TICKR_TENANT_SLUG:$TICKR_COORDINATOR_HTTP_URL:$TICKR_COORDINATOR_RELAY_URL" in
+case "$TICKR_TENANT_SLUG:$TICKR_CTRL_HTTP_URL:$TICKR_CTRL_RELAY_URL" in
   *REPLACE_ME*|::*|:*:|:*) echo "Complete tickr-lite.env first" >&2; exit 2 ;;
 esac
 mkdir -p "$TICKR_STATE_DIR"
 chmod 700 "$TICKR_STATE_DIR"
 ```
+The obsolete `TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL`
+variables are unsupported and ignored. When either new variable is absent, Tickr
+uses its existing loopback default.
 
 Every terminal or agent process operating this installation must first run:
 

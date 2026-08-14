@@ -23,7 +23,7 @@ Check:
 - the state directory owner and mode are correct;
 - SQLite migration and formation metadata match this binary;
 - the API bind address is available;
-- Coordinator URLs are present and valid;
+- `TICKR_CTRL_HTTP_URL` and `TICKR_CTRL_RELAY_URL` are present and valid;
 - every critical child started.
 
 `/api/health` remains available while work-producing routes are closed.

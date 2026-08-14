@@ -3,7 +3,7 @@
 //! unchanged.
 
 pub mod calendar;
-pub mod coordinator_client;
+pub mod control_plane_client;
 pub mod ctx_reader;
 pub mod dto;
 pub mod health;

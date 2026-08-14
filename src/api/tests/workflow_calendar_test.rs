@@ -177,7 +177,7 @@ async fn start_nats() -> Option<(
     Some((container, client))
 }
 
-async fn spawn_fake_coordinator(rows: Vec<WorkflowInstanceResponse>) -> String {
+async fn spawn_fake_control_plane(rows: Vec<WorkflowInstanceResponse>) -> String {
     let app = axum::Router::new().route(
         "/api/workflows/{workflow_id}/instances",
         axum::routing::get(move || {
@@ -195,10 +195,12 @@ async fn spawn_fake_coordinator(rows: Vec<WorkflowInstanceResponse>) -> String {
     format!("http://{address}")
 }
 
-async fn spawn_api(nats: NatsClient, harness: &BackendHarness, coordinator_url: &str) -> String {
-    let coordinator = Arc::new(tickr_api::http::coordinator_client::CoordinatorClient::new(
-        coordinator_url.to_string(),
-    ));
+async fn spawn_api(nats: NatsClient, harness: &BackendHarness, control_plane_url: &str) -> String {
+    let control_plane = Arc::new(
+        tickr_api::http::control_plane_client::ControlPlaneClient::new(
+            control_plane_url.to_string(),
+        ),
+    );
     let s3 = opendal::services::S3::default()
         .bucket("ignored")
         .endpoint("http://127.0.0.1:1")
@@ -216,7 +218,7 @@ async fn spawn_api(nats: NatsClient, harness: &BackendHarness, coordinator_url: 
     let state = tickr_api::http::routes::build_app_state(
         Arc::new(nats),
         Arc::clone(&harness.reader),
-        coordinator,
+        control_plane,
         logs,
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -335,9 +337,9 @@ async fn postgres_and_sqlite_calendar_api_laws_match() {
             "2027-01-01T00:00:00Z",
         ),
     ];
-    let coordinator = spawn_fake_coordinator(live_rows).await;
-    let postgres_api = spawn_api(nats.clone(), &postgres, &coordinator).await;
-    let sqlite_api = spawn_api(nats, &sqlite, &coordinator).await;
+    let control_plane = spawn_fake_control_plane(live_rows).await;
+    let postgres_api = spawn_api(nats.clone(), &postgres, &control_plane).await;
+    let sqlite_api = spawn_api(nats, &sqlite, &control_plane).await;
     let client = reqwest::Client::new();
 
     let postgres_calendar =

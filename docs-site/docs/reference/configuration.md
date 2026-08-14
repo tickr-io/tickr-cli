@@ -13,12 +13,19 @@ These variables configure released runtime behavior. Test helpers and variables 
 | Variable | Applies to | Meaning |
 | --- | --- | --- |
 | `TICKR_TENANT_SLUG` | All | Tenant identity |
-| `TICKR_COORDINATOR_HTTP_URL` | All | Coordinator query and health URL |
-| `TICKR_COORDINATOR_RELAY_URL` | All | Coordinator relay URL |
+| `TICKR_CTRL_HTTP_URL` | All | Control-plane HTTP subquery channel URL |
+| `TICKR_CTRL_RELAY_URL` | All | Control-plane Conductor relay URL |
 | `TICKR_API_BIND_ADDR` | API/Lite | HTTP bind address |
 | `TICKR_DSL_PATHS` | Conductor/Lite | Core DSL import paths |
 | `TICKR_EXECUTOR_CONCURRENCY` | Executor/Lite | Concurrent Task process slots |
 | `TICKR_LIVENESS_TIMEOUT_SECS` | Executor | Task liveness timeout |
+
+### Pre-GA migration
+
+`TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL` are obsolete,
+unsupported, and ignored. Set the `TICKR_CTRL_*` replacements explicitly for a
+remote Control plane. If either replacement is absent, Tickr retains its existing
+loopback default for that channel.
 
 ## SQL
 

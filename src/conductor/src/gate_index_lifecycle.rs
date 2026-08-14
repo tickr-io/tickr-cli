@@ -6,7 +6,7 @@
 //! The index is in-memory only; the authoritative source is the
 //! published live-state snapshot. On every relay reconnect the
 //! conductor calls `GET_DISPATCHED_GATES` against the server (via
-//! the coordinator's cluster-query passthrough), then `replace_all`s
+//! the Frontend's HTTP subquery channel), then `replace_all`s
 //! this index so concurrent readers don't observe a partial state.
 
 use once_cell::sync::Lazy;
@@ -31,23 +31,23 @@ pub fn gate_index() -> GateIndex {
 /// single `replace_all` call so concurrent readers don't observe a
 /// partial index.
 ///
-/// Coordinator-side failures (timeout / unreachable / non-2xx) degrade
+/// Control-plane HTTP-channel failures (timeout / unreachable / non-2xx) degrade
 /// to an empty rebuild — the next inbound `DispatchPrecondition`
 /// from the server will restock the index. This matches the
 /// graceful-degradation behaviour the conductor uses for every other
 /// cluster-query subquery.
-pub async fn rebuild_from_server(coordinator_url: &str, tenant: TenantId) -> usize {
-    let dispatched = match list_dispatched_gates(coordinator_url, tenant).await {
+pub async fn rebuild_from_server(control_plane_http_url: &str, tenant: TenantId) -> usize {
+    let dispatched = match list_dispatched_gates(control_plane_http_url, tenant).await {
         Ok(d) => d,
         Err(DispatchGatesError::Timeout) | Err(DispatchGatesError::Unreachable(_)) => {
             eprintln!(
-                "gate_index rebuild: coordinator unreachable; rebuilding to empty (next DispatchPrecondition restocks)"
+                "gate_index rebuild: Control-plane HTTP channel unreachable; rebuilding to empty (next DispatchPrecondition restocks)"
             );
             Vec::new()
         }
         Err(e) => {
             eprintln!(
-                "gate_index rebuild: coordinator returned error; rebuilding to empty: {}",
+                "gate_index rebuild: Control-plane HTTP channel returned error; rebuilding to empty: {}",
                 e
             );
             Vec::new()

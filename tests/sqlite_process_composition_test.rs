@@ -104,8 +104,8 @@ fn configure_common_process(command: &mut Command, nats_url: &str, object_storag
             "TICKR_DSL_PATHS",
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dsl"),
         )
-        .env("TICKR_COORDINATOR_HTTP_URL", "http://127.0.0.1:1")
-        .env("TICKR_COORDINATOR_RELAY_URL", "http://127.0.0.1:1")
+        .env("TICKR_CTRL_HTTP_URL", "http://127.0.0.1:1")
+        .env("TICKR_CTRL_RELAY_URL", "http://127.0.0.1:1")
         .env("TICKR_LOG_STORAGE_ENDPOINT", object_storage_url)
         .env("TICKR_LOG_STORAGE_BUCKET", "tickr-logs")
         .env("TICKR_LOG_STORAGE_ACCESS_KEY_ID", "minioadmin")
@@ -844,8 +844,8 @@ async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() 
         .env("TICKR_CONDUCTOR_SQLITE_URL", &sqlite_url)
         .env("TICKR_TENANT_SLUG", "lite-startup-probe")
         .env("TICKR_API_BIND_ADDR", &address)
-        .env("TICKR_COORDINATOR_HTTP_URL", "http://127.0.0.1:1")
-        .env("TICKR_COORDINATOR_RELAY_URL", "http://127.0.0.1:1")
+        .env("TICKR_CTRL_HTTP_URL", "http://127.0.0.1:1")
+        .env("TICKR_CTRL_RELAY_URL", "http://127.0.0.1:1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut lite = ManagedChild {

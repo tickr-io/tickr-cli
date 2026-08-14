@@ -13,11 +13,15 @@ Configuration is part of formation admission. A value that changes topology, dur
 | Variable | Purpose |
 | --- | --- |
 | `TICKR_TENANT_SLUG` | Tenant identity for this Data plane |
-| `TICKR_COORDINATOR_HTTP_URL` | Coordinator live-query and health endpoint |
-| `TICKR_COORDINATOR_RELAY_URL` | Bidirectional Conductor relay endpoint |
+| `TICKR_CTRL_HTTP_URL` | Control-plane HTTP subquery channel for live queries and health reads |
+| `TICKR_CTRL_RELAY_URL` | Bidirectional Control-plane Conductor relay endpoint |
 | `TICKR_API_BIND_ADDR` | API and embedded Console bind address |
 | `TICKR_DSL_PATHS` | Release-matched Core DSL import paths |
 | `TICKR_EXECUTOR_CONCURRENCY` | Executor process-slot limit |
+
+The obsolete `TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL`
+variables are unsupported and ignored. When either new variable is absent, Tickr
+uses its existing loopback default.
 
 Bind loopback by default. A non-loopback API requires an explicit authenticated TLS ingress design.
 
