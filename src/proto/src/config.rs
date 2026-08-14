@@ -179,14 +179,115 @@ mod data_plane_sql_tests {
     }
 }
 
-/// Base URL of the configured Tickr coordinator's HTTP API.
-pub fn coordinator_http_url() -> String {
-    std::env::var("TICKR_COORDINATOR_HTTP_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+/// Base URL of the configured Control plane's HTTP subquery channel.
+pub fn ctrl_http_url() -> String {
+    std::env::var("TICKR_CTRL_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
 }
 
-/// URL of the coordinator's public conductor-relay gRPC endpoint.
-pub fn coordinator_relay_url() -> String {
-    std::env::var("TICKR_COORDINATOR_RELAY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:9095".to_string())
+/// URL of the configured Control plane's Conductor relay endpoint.
+pub fn ctrl_relay_url() -> String {
+    std::env::var("TICKR_CTRL_RELAY_URL").unwrap_or_else(|_| "http://127.0.0.1:9095".to_string())
+}
+
+#[cfg(test)]
+mod control_plane_url_tests {
+    use std::sync::Mutex;
+
+    use super::{ctrl_http_url, ctrl_relay_url};
+
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn reads_control_plane_urls_from_the_renamed_variables() {
+        let _lock = ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let environment = ControlPlaneUrlEnvironment::set(
+            Some("http://control-plane.test:8000"),
+            Some("http://control-plane.test:9095"),
+            None,
+            None,
+        );
+
+        assert_eq!(ctrl_http_url(), "http://control-plane.test:8000");
+        assert_eq!(ctrl_relay_url(), "http://control-plane.test:9095");
+
+        drop(environment);
+    }
+
+    #[test]
+    fn defaults_when_renamed_variables_are_absent_even_with_legacy_variables() {
+        let _lock = ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let environment = ControlPlaneUrlEnvironment::set(
+            None,
+            None,
+            Some("http://legacy.test:8000"),
+            Some("http://legacy.test:9095"),
+        );
+
+        assert_eq!(ctrl_http_url(), "http://127.0.0.1:8000");
+        assert_eq!(ctrl_relay_url(), "http://127.0.0.1:9095");
+
+        drop(environment);
+    }
+
+    struct ControlPlaneUrlEnvironment {
+        previous: [(&'static str, Option<std::ffi::OsString>); 4],
+    }
+
+    impl ControlPlaneUrlEnvironment {
+        fn set(
+            http_url: Option<&str>,
+            relay_url: Option<&str>,
+            legacy_http_url: Option<&str>,
+            legacy_relay_url: Option<&str>,
+        ) -> Self {
+            let mut environment = Self {
+                previous: [
+                    (
+                        "TICKR_CTRL_HTTP_URL",
+                        std::env::var_os("TICKR_CTRL_HTTP_URL"),
+                    ),
+                    (
+                        "TICKR_CTRL_RELAY_URL",
+                        std::env::var_os("TICKR_CTRL_RELAY_URL"),
+                    ),
+                    (
+                        "TICKR_COORDINATOR_HTTP_URL",
+                        std::env::var_os("TICKR_COORDINATOR_HTTP_URL"),
+                    ),
+                    (
+                        "TICKR_COORDINATOR_RELAY_URL",
+                        std::env::var_os("TICKR_COORDINATOR_RELAY_URL"),
+                    ),
+                ],
+            };
+
+            environment.set_value("TICKR_CTRL_HTTP_URL", http_url);
+            environment.set_value("TICKR_CTRL_RELAY_URL", relay_url);
+            environment.set_value("TICKR_COORDINATOR_HTTP_URL", legacy_http_url);
+            environment.set_value("TICKR_COORDINATOR_RELAY_URL", legacy_relay_url);
+            environment
+        }
+
+        fn set_value(&mut self, name: &str, value: Option<&str>) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    impl Drop for ControlPlaneUrlEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }

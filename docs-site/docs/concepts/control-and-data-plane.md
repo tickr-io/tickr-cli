@@ -10,7 +10,7 @@ Tickr divides tenant-wide coordination from the runtime that authors and execute
 
 ## Control plane
 
-The external Control plane provides the Coordinator endpoints used for live queries and the bidirectional Conductor relay. Your operator provisions access and gives the Data plane its tenant slug and Coordinator URLs.
+The Control plane exposes an HTTP subquery channel for live queries and a bidirectional Conductor relay. Your operator provisions access and gives the Data plane its tenant slug and Control-plane endpoint URLs.
 
 Tickr Lite does not embed, create, or administer a Control plane.
 
@@ -31,7 +31,7 @@ A **formation** is one complete admitted Data-plane profile. Tickr supports `lit
 
 ```mermaid
 flowchart LR
-  O[Tickr operator] -->|tenant + Coordinator values| D
+  O[Tickr operator] -->|tenant + Control-plane values| D
   C[Control plane] <-->|HTTP queries + relay| D[Data-plane formation]
   U[Workflow author] -->|Nickel + HTTP Commands| D
   D --> E[Executor]

@@ -164,9 +164,11 @@ async fn spawn_subscriber(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> Cancella
 
 /// Spawn the API HTTP router on an ephemeral port and return its base URL.
 async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
-    let coordinator = Arc::new(tickr_api::http::coordinator_client::CoordinatorClient::new(
-        "http://127.0.0.1:1".to_string(),
-    ));
+    let control_plane = Arc::new(
+        tickr_api::http::control_plane_client::ControlPlaneClient::new(
+            "http://127.0.0.1:1".to_string(),
+        ),
+    );
     let s3 = opendal::services::S3::default()
         .bucket("ignored")
         .endpoint("http://127.0.0.1:1")
@@ -189,7 +191,7 @@ async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
                 pool.as_ref().clone(),
             ),
         ),
-        coordinator,
+        control_plane,
         logs,
     );
     let app = tickr_api::http::routes::build_router(state);

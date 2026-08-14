@@ -13,8 +13,8 @@ A Tickr operator must give you the connection identity for the tenant you are jo
 | Value | Environment variable | Purpose |
 | --- | --- | --- |
 | Tenant slug | `TICKR_TENANT_SLUG` | Selects the tenant identity carried by this Data plane. |
-| Coordinator HTTP URL | `TICKR_COORDINATOR_HTTP_URL` | Supplies live queries and Control-plane health reads. |
-| Coordinator relay URL | `TICKR_COORDINATOR_RELAY_URL` | Carries the bidirectional Conductor relay. |
+| Control-plane HTTP subquery channel URL | `TICKR_CTRL_HTTP_URL` | Supplies live queries and Control-plane health reads. |
+| Control-plane Conductor relay URL | `TICKR_CTRL_RELAY_URL` | Carries the bidirectional Conductor relay. |
 
 Ask the operator which Tickr release line is supported. Use a Tickr Lite archive and documentation version from that line.
 
@@ -40,6 +40,6 @@ Nix builds and runs workflow Tasks. Nickel evaluates workflow and runtime-Patch 
 
 ## Network expectations
 
-By default, Tickr Lite binds the local API and embedded Console to `127.0.0.1`. Your machine must be able to reach both operator-supplied Coordinator URLs. The Control plane does not become part of the local formation.
+By default, Tickr Lite binds the local API and embedded Console to `127.0.0.1`. Your machine must be able to reach both operator-supplied Control-plane endpoints. The Control plane does not become part of the local formation.
 
 Continue to [Install Tickr Lite](./install-lite.md).

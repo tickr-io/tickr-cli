@@ -23,15 +23,15 @@ use uuid::Uuid;
 /// (sweep 5s + watermark 2s + pull 5s + UI poll 5s ≈ 17s worst case).
 pub const PULL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Hard client budget for the coordinator call.
-const COORDINATOR_TIMEOUT: Duration = Duration::from_secs(3);
+/// Hard client budget for the Control-plane HTTP call.
+const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Batch cap requested per pull. The serve side caps at 1000; its default keeps
 /// one transactionally inserted page bounded.
 const PULL_BATCH_LIMIT: u32 = 500;
 
-/// One served event row as the coordinator's JSON encodes it. Field names
-/// match the coordinator's `EventResponse` / the archive's column names.
+/// One served event row as the Control plane's JSON encodes it. Field names
+/// match the Control plane's `EventResponse` / the archive's column names.
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct PulledEvent {
     pub id: Uuid,
@@ -53,7 +53,7 @@ pub struct PullOutcome {
 /// effective cadence across the fleet — harmless (smaller batches).
 pub async fn run_events_pull(
     repositories: Arc<WriterRepositoryBundle>,
-    coordinator_url: String,
+    control_plane_http_url: String,
     tenant: Uuid,
     shutdown: CancellationToken,
 ) {
@@ -65,7 +65,7 @@ pub async fn run_events_pull(
                 return;
             }
             _ = tokio::time::sleep(PULL_INTERVAL) => {
-                match pull_once(&repositories, &client, &coordinator_url, tenant).await {
+                match pull_once(&repositories, &client, &control_plane_http_url, tenant).await {
                     Ok(PullOutcome { fetched, inserted }) => {
                         if fetched > 0 {
                             tracing::debug!(
@@ -90,14 +90,14 @@ pub async fn run_events_pull(
 pub async fn pull_once(
     repositories: &WriterRepositoryBundle,
     client: &reqwest::Client,
-    coordinator_url: &str,
+    control_plane_http_url: &str,
     tenant: Uuid,
 ) -> anyhow::Result<PullOutcome> {
     let cursor = repositories
         .event_archive_cursor()
         .await?
         .map(|cursor| (cursor.archived_at, cursor.id));
-    let batch = fetch_batch(client, coordinator_url, tenant, cursor).await?;
+    let batch = fetch_batch(client, control_plane_http_url, tenant, cursor).await?;
     let fetched = batch.len();
     let page = batch
         .into_iter()
@@ -113,22 +113,22 @@ pub async fn pull_once(
     Ok(PullOutcome { fetched, inserted })
 }
 
-/// `GET {coordinator_url}/api/internal/events` with the keyset cursor (absent
+/// `GET {control_plane_http_url}/api/internal/events` with the keyset cursor (absent
 /// on first pull / after a rebuild). Non-2xx is an error, never an empty
 /// batch — "no new events" and "serve path down" must stay distinguishable.
 async fn fetch_batch(
     client: &reqwest::Client,
-    coordinator_url: &str,
+    control_plane_http_url: &str,
     tenant: Uuid,
     cursor: Option<(DateTime<Utc>, Uuid)>,
 ) -> anyhow::Result<Vec<PulledEvent>> {
     let url = format!(
         "{}/api/internal/events",
-        coordinator_url.trim_end_matches('/')
+        control_plane_http_url.trim_end_matches('/')
     );
     // Scope the pull to this conductor's own tenant — the archive is a shared
     // multi-tenant table, so the projection must receive only its tenant's slice.
-    let mut request = client.get(&url).timeout(COORDINATOR_TIMEOUT).query(&[
+    let mut request = client.get(&url).timeout(CONTROL_PLANE_TIMEOUT).query(&[
         ("tenant", tenant.to_string()),
         ("limit", PULL_BATCH_LIMIT.to_string()),
     ]);

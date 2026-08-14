@@ -4,12 +4,12 @@
 //!   - the selected archive repository returns archived runs windowed by
 //!     `scheduled_at`, carrying the instance id, snapshotted Workflow name,
 //!     and verbatim state.
-//!   - `coordinator_client::dashboard_clock` — the live half (per-instance rows).
+//!   - `control_plane_client::dashboard_clock` — the live half (per-instance rows).
 //!   - `merge_clock_instances` — dedup-by-id with archive-wins on the
 //!     compaction-window collision.
 //!
 //! The archive half requires Docker (testcontainers Postgres); the
-//! fake-coordinator half runs purely in-process.
+//! The fake Control plane runs purely in-process.
 
 #![cfg(not(madsim))]
 
@@ -18,7 +18,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::coordinator_client::CoordinatorClient;
+use tickr_api::http::control_plane_client::ControlPlaneClient;
 use tickr_api::http::dto::ClockInstance;
 use tickr_api::http::live_archive_merge::merge_clock_instances;
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
@@ -69,8 +69,8 @@ async fn archive_rows_carry_id_name_and_verbatim_state() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Fake coordinator serving the live clock route with one row.
-async fn spawn_fake_coordinator(live: Vec<serde_json::Value>) -> String {
+/// Fake Control plane serving the live clock route with one row.
+async fn spawn_fake_control_plane(live: Vec<serde_json::Value>) -> String {
     let app = Router::new().route(
         "/api/dashboard/clock",
         get(move || {
@@ -80,7 +80,7 @@ async fn spawn_fake_coordinator(live: Vec<serde_json::Value>) -> String {
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind fake coordinator");
+        .expect("bind fake Control plane");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap_or(()) });
     format!("http://{}", addr)
@@ -91,7 +91,7 @@ async fn live_decodes_and_merge_resolves_collision_to_archive(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shared = Uuid::new_v4().to_string();
     // Live half claims the shared id is still InProgress; a disjoint live-only row too.
-    let base = spawn_fake_coordinator(vec![
+    let base = spawn_fake_control_plane(vec![
         serde_json::json!({
             "id": shared,
             "workflow_id": "00000000-0000-0000-0000-000000000000",
@@ -108,7 +108,7 @@ async fn live_decodes_and_merge_resolves_collision_to_archive(
         }),
     ])
     .await;
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let live = client.dashboard_clock(None, None).await?;
     assert_eq!(live.len(), 2, "live rows decode");
 
@@ -132,7 +132,7 @@ async fn live_decodes_and_merge_resolves_collision_to_archive(
 async fn unreachable_coordinator_errors_so_handler_degrades() {
     // An unroutable address: the client surfaces an error, which the handler
     // maps to an empty live half + `live_data_available = false`.
-    let client = CoordinatorClient::new("http://127.0.0.1:1".to_string());
+    let client = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
     let res = client.dashboard_clock(None, None).await;
     assert!(
         res.is_err(),

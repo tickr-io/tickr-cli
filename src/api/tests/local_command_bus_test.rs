@@ -114,9 +114,11 @@ async fn spawn_api(
     command_bus: CommandBus,
     repositories: ReadOnlyRepositoryBundle,
 ) -> String {
-    let coordinator = Arc::new(tickr_api::http::coordinator_client::CoordinatorClient::new(
-        "http://127.0.0.1:1".to_string(),
-    ));
+    let control_plane = Arc::new(
+        tickr_api::http::control_plane_client::ControlPlaneClient::new(
+            "http://127.0.0.1:1".to_string(),
+        ),
+    );
     let storage = opendal::services::S3::default()
         .bucket("ignored")
         .endpoint("http://127.0.0.1:1")
@@ -134,7 +136,7 @@ async fn spawn_api(
         Arc::new(nats),
         command_bus,
         Arc::new(repositories),
-        coordinator,
+        control_plane,
         logs,
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

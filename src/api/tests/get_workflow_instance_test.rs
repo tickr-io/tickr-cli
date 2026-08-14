@@ -1,9 +1,9 @@
 //! Integration tests for the API component's selected archive-detail read and
-//! live coordinator fallback. Archive assertions cover present/absent terminal
+//! live Control-plane fallback. Archive assertions cover present/absent terminal
 //! rows, projection reconstruction, history, and data-plane field isolation.
-//! Coordinator assertions cover success, 404, 503, and timeout behavior.
+//! Control-plane assertions cover success, 404, 503, and timeout behavior.
 //!
-//! PostgreSQL tests require Docker; fake coordinator tests run in-process.
+//! PostgreSQL tests require Docker; fake Control-plane tests run in-process.
 
 #![cfg(not(madsim))]
 
@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::coordinator_client::{CoordinatorClient, CoordinatorClientError};
+use tickr_api::http::control_plane_client::{ControlPlaneClient, ControlPlaneClientError};
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use tickr_proto::instance as ip;
 use uuid::Uuid;
@@ -82,9 +82,9 @@ async fn archive_query_returns_none_when_row_absent() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// Spawns a fake coordinator on a random port. The handler closure decides the
-/// response. Returns the bound base URL.
-async fn spawn_fake_coordinator<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
+/// Spawns a fake Control plane on a random port. The handler closure decides
+/// the response. Returns the bound base URL.
+async fn spawn_fake_control_plane<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
@@ -100,7 +100,7 @@ where
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind fake coordinator");
+        .expect("bind fake Control plane");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap_or(());
@@ -181,7 +181,7 @@ async fn archived_jsonb_rehydrates_through_projection_with_history_and_no_intern
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_decodes_live_response() -> Result<(), Box<dyn std::error::Error>> {
+async fn control_plane_client_decodes_live_response() -> Result<(), Box<dyn std::error::Error>> {
     let live_id = Uuid::new_v4();
     // The live half serves the published proto snapshot directly. Build one with
     // the fields under assertion; the client decodes it into the same type.
@@ -194,13 +194,13 @@ async fn coordinator_client_decodes_live_response() -> Result<(), Box<dyn std::e
         ..Default::default()
     };
     let body = serde_json::to_value(&snapshot)?;
-    let (base, _server) = spawn_fake_coordinator(move |_id| {
+    let (base, _server) = spawn_fake_control_plane(move |_id| {
         let body = body.clone();
         async move { Json(body).into_response() }
     })
     .await;
 
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let response = client.get_workflow_instance(live_id).await?;
     assert_eq!(response.id, live_id.to_string());
     assert_eq!(response.state, "InProgress");
@@ -211,20 +211,20 @@ async fn coordinator_client_decodes_live_response() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_surfaces_503_as_server_error() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (base, _server) = spawn_fake_coordinator(|_id| async move {
+async fn control_plane_client_surfaces_503_as_server_error(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = spawn_fake_control_plane(|_id| async move {
         (StatusCode::SERVICE_UNAVAILABLE, "live store unreachable").into_response()
     })
     .await;
 
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await
         .expect_err("expected Server error");
     assert!(
-        matches!(err, CoordinatorClientError::Server { status: 503, .. }),
+        matches!(err, ControlPlaneClientError::Server { status: 503, .. }),
         "got {:?}",
         err
     );
@@ -232,20 +232,19 @@ async fn coordinator_client_surfaces_503_as_server_error() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_maps_404_to_not_found() -> Result<(), Box<dyn std::error::Error>> {
-    let (base, _server) =
-        spawn_fake_coordinator(
-            |_id| async move { (StatusCode::NOT_FOUND, "missing").into_response() },
-        )
-        .await;
+async fn control_plane_client_maps_404_to_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = spawn_fake_control_plane(|_id| async move {
+        (StatusCode::NOT_FOUND, "missing").into_response()
+    })
+    .await;
 
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await
         .expect_err("expected NotFound");
     assert!(
-        matches!(err, CoordinatorClientError::NotFound(_)),
+        matches!(err, ControlPlaneClientError::NotFound(_)),
         "got {:?}",
         err
     );
@@ -253,21 +252,21 @@ async fn coordinator_client_maps_404_to_not_found() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_times_out_on_slow_coordinator() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (base, _server) = spawn_fake_coordinator(|_id| async move {
+async fn control_plane_client_times_out_on_slow_control_plane(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = spawn_fake_control_plane(|_id| async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         (StatusCode::OK, "late").into_response()
     })
     .await;
 
-    let client = CoordinatorClient::with_timeout(base, Duration::from_millis(100));
+    let client = ControlPlaneClient::with_timeout(base, Duration::from_millis(100));
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await
         .expect_err("expected Timeout");
     assert!(
-        matches!(err, CoordinatorClientError::Timeout),
+        matches!(err, ControlPlaneClientError::Timeout),
         "got {:?}",
         err
     );

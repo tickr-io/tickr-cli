@@ -31,7 +31,7 @@ use tickr_proto::coord::{
 use utoipa::ToSchema;
 
 use crate::commands::client::{ping_command_bus, CommandBus};
-use crate::http::coordinator_client::CoordinatorClient;
+use crate::http::control_plane_client::ControlPlaneClient;
 
 /// The KV bucket the health surface probes for JetStream reachability. Later
 /// slices populate it with executor component-liveness keys; here it is read-only
@@ -541,28 +541,28 @@ pub async fn check_conductor(nats: &Client, deadline: Duration) -> ComponentHeal
     check_command_bus(&CommandBus::nats(nats.clone()), deadline).await
 }
 
-/// The Control plane row — one HTTP hop to the coordinator's `/api/internal/health`
-/// route, whose body is the control-plane rollup (this coordinator + the
-/// control plane it fronts). The UI reaches control plane **only** through the
-/// coordinator, so the control plane is reported as a single rollup row, never
-/// split per-component. The coordinator route reuses its existing live-store read
+/// The Control plane row — one HTTP hop to the Frontend's `/api/internal/health`
+/// route, whose body is the Control-plane rollup (the Frontend plus the Control
+/// plane it fronts). The UI reaches the Control plane **only** through the
+/// Frontend, so the Control plane is reported as a single rollup row, never
+/// split per-component. The Frontend route reuses its existing live-store read
 /// rather than adding a probe path, so this row mirrors that read's degrade
-/// path: a reachable coordinator whose rollup is `healthy` ⇒ `healthy`; a coordinator
-/// that is unreachable (transport error/timeout) ⇒ `unhealthy` — the same
-/// posture as the coordinator's own "live store unreachable" degrade path.
+/// path: a reachable Frontend whose rollup is `healthy` ⇒ `healthy`; an
+/// unreachable Frontend (transport error/timeout) ⇒ `unhealthy` — the same
+/// posture as the Frontend's own "live store unreachable" degrade path.
 ///
 /// Instantaneous like the other HTTP/command probes: a red row recovers on the
 /// very next request, so its detection window is the request itself.
-pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHealth {
-    match coordinator.internal_health().await {
+pub async fn check_control_plane(control_plane: &ControlPlaneClient) -> ComponentHealth {
+    match control_plane.internal_health().await {
         Ok(rollup) => match rollup.status.as_str() {
             "healthy" => ComponentHealth::instant(
                 ComponentStatus::Healthy,
-                "control plane up (coordinator + control plane)",
+                "Control plane up (Frontend + live store)",
             ),
             "degraded" => ComponentHealth::instant(
                 ComponentStatus::Degraded,
-                "control plane degraded (coordinator up, live store degraded)",
+                "Control plane degraded (Frontend up, live store degraded)",
             ),
             other => ComponentHealth::instant(
                 ComponentStatus::Unhealthy,
@@ -571,7 +571,7 @@ pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHe
         },
         Err(e) => ComponentHealth::instant(
             ComponentStatus::Unhealthy,
-            format!("control plane unreachable via coordinator: {e}"),
+            format!("Control plane unreachable via Frontend: {e}"),
         ),
     }
 }
@@ -580,14 +580,14 @@ pub async fn check_control_plane(coordinator: &CoordinatorClient) -> ComponentHe
 pub async fn build_health_report(
     repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     ping_deadline: Duration,
 ) -> HealthResponse {
     build_health_report_with_command_bus(
         repositories,
         nats,
         &CommandBus::nats(nats.clone()),
-        coordinator,
+        control_plane,
         ping_deadline,
     )
     .await
@@ -598,7 +598,7 @@ pub async fn build_health_report_with_command_bus(
     repositories: &ReadOnlyRepositoryBundle,
     nats: &Client,
     command_bus: &CommandBus,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     ping_deadline: Duration,
 ) -> HealthResponse {
     let fleet_status = NatsExecutorFleetStatus::new(nats.clone(), liveness_timeout());
@@ -606,7 +606,7 @@ pub async fn build_health_report_with_command_bus(
         repositories,
         Some(nats),
         command_bus,
-        coordinator,
+        control_plane,
         &fleet_status,
         ping_deadline,
         None,
@@ -619,7 +619,7 @@ pub async fn build_health_report_with_fleet_status(
     repositories: &ReadOnlyRepositoryBundle,
     nats: Option<&Client>,
     command_bus: &CommandBus,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     executor_fleet: &dyn ExecutorFleetStatus,
     ping_deadline: Duration,
     redis_capability: Option<serde_json::Value>,
@@ -638,7 +638,7 @@ pub async fn build_health_report_with_fleet_status(
         nats_kv,
         executors: check_executor_fleet(executor_fleet).await,
         conductor: check_command_bus(command_bus, ping_deadline).await,
-        control_plane: check_control_plane(coordinator).await,
+        control_plane: check_control_plane(control_plane).await,
         formation: None,
         readiness: None,
         local_coordination: None,
@@ -653,7 +653,7 @@ pub async fn build_health_report_with_fleet_status(
 pub async fn build_lite_health_report(
     repositories: &ReadOnlyRepositoryBundle,
     command_bus: &CommandBus,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     executor_fleet: &dyn ExecutorFleetStatus,
     formation: &ResolvedFormationHealth,
     ready: bool,
@@ -661,7 +661,7 @@ pub async fn build_lite_health_report(
 ) -> HealthResponse {
     let data_plane_sql = check_data_plane_sql(repositories).await;
     let conductor = check_command_bus(command_bus, ping_deadline).await;
-    let control_plane = check_control_plane(coordinator).await;
+    let control_plane = check_control_plane(control_plane).await;
     let snapshot = executor_fleet.fleet_snapshot().await.unwrap_or_else(|_| {
         tickr_executor::local_pickup::ExecutorFleetSnapshot {
             server_time_millis: 0,

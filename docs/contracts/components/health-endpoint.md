@@ -46,7 +46,7 @@ Local coordination is healthy only when `LiteSupervisor` is ready, the selected 
 
 The Command path uses a side-effect-free protobuf Ping over the selected Command bus. An answered Ping is healthy. Unavailable, timeout, oversized, cancelled, or malformed reply outcomes are unhealthy and preserve the existing public error classification.
 
-Control-plane Health preserves the existing coordinator rollup meaning. A healthy rollup is healthy, a degraded rollup is degraded, and an unreachable or unhealthy rollup is unhealthy. Post-start Control-plane loss does not clear Tickr Lite readiness and does not alter or discard local durable state; the next successful request reports reconnection immediately.
+Control-plane Health preserves the existing Frontend rollup meaning. A healthy rollup is healthy, a degraded rollup is degraded, and an unreachable or unhealthy rollup is unhealthy. Post-start Control-plane loss does not clear Tickr Lite readiness and does not alter or discard local durable state; the next successful request reports reconnection immediately.
 
 ## Verification scenarios
 

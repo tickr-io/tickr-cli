@@ -15,6 +15,7 @@ check:
     python3 scripts/dependency_policy_gate.py
     python3 scripts/public_contract_gate.py
     python3 scripts/repository_hygiene_gate.py
+    python3 scripts/control_plane_terminology_gate.py
     python3 scripts/security_source_gate.py
     python3 scripts/license_gate.py --check
 
@@ -26,6 +27,8 @@ security-static:
     python3 scripts/public_contract_gate.py
     python3 scripts/repository_hygiene_gate.py --self-test
     python3 scripts/repository_hygiene_gate.py
+    python3 scripts/control_plane_terminology_gate.py --self-test
+    python3 scripts/control_plane_terminology_gate.py
     python3 scripts/security_source_gate.py --self-test
     python3 scripts/security_source_gate.py
     python3 scripts/license_gate.py --self-test

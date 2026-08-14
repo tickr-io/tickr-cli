@@ -2,13 +2,13 @@
 //!
 //!   - the selected archive repository returns Workflow-instance rows newest
 //!     first with stable tie-breaks.
-//!   - `coordinator_client::list_workflow_instances` decodes a coordinator live
-//!     response into the same DTO the API serves.
-//!   - The merge resolves collisions to the archive row and combines live +
-//!     archive disjointly.
+//! - `control_plane_client::list_workflow_instances` decodes the Control
+//!   plane's live response into the same DTO the API serves.
+//! - The merge resolves collisions with the archive row winning and combines
+//!   live and archive rows disjointly.
 //!
-//! Requires Docker (testcontainers Postgres) for the archive half. The
-//! fake-coordinator half runs purely in-process.
+//! Requires Docker (testcontainers Postgres) for the archive half. The fake
+//! Control plane runs purely in-process.
 
 #![cfg(not(madsim))]
 
@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::coordinator_client::CoordinatorClient;
+use tickr_api::http::control_plane_client::ControlPlaneClient;
 use tickr_api::http::dto::WorkflowInstanceResponse;
 use tickr_api::http::live_archive_merge::merge_instances;
 use tickr_migrations::archive_repository::ArchivePage;
@@ -68,8 +68,8 @@ async fn archive_query_returns_rows_for_workflow_newest_first(
     Ok(())
 }
 
-/// Spawn an Axum router with the given handler at the live-instances route.
-async fn spawn_fake_coordinator<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
+/// Spawn an Axum router with the given handler at the Control-plane live-instances route.
+async fn spawn_fake_control_plane<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
@@ -85,16 +85,17 @@ where
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind fake coordinator");
+        .expect("bind fake Control plane");
     let addr = listener.local_addr().expect("addr");
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap_or(()) });
     (format!("http://{}", addr), handle)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_decodes_list_of_instances() -> Result<(), Box<dyn std::error::Error>> {
+async fn control_plane_client_decodes_list_of_instances() -> Result<(), Box<dyn std::error::Error>>
+{
     let wf = Uuid::new_v4();
-    let (base, _server) = spawn_fake_coordinator(move |_id| async move {
+    let (base, _server) = spawn_fake_control_plane(move |_id| async move {
         Json(vec![
             WorkflowInstanceResponse {
                 id: Uuid::new_v4().to_string(),
@@ -121,24 +122,24 @@ async fn coordinator_client_decodes_list_of_instances() -> Result<(), Box<dyn st
     })
     .await;
 
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let live = client.list_workflow_instances(wf).await?;
     assert_eq!(live.len(), 2);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_timeout_surfaces_as_typed_error() -> Result<(), Box<dyn std::error::Error>> {
-    let (base, _server) = spawn_fake_coordinator(|_id| async move {
+async fn control_plane_timeout_surfaces_as_typed_error() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = spawn_fake_control_plane(|_id| async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         (StatusCode::OK, "late").into_response()
     })
     .await;
 
-    // The handler degrades to archive-only on any coordinator error; this asserts
+    // The handler degrades to archive-only on any Control-plane HTTP error; this asserts
     // the client surfaces the timeout the handler keys its `live_data_available:
     // false` branch off of.
-    let client = CoordinatorClient::with_timeout(base, Duration::from_millis(100));
+    let client = ControlPlaneClient::with_timeout(base, Duration::from_millis(100));
     let err = client
         .list_workflow_instances(Uuid::new_v4())
         .await
@@ -146,7 +147,7 @@ async fn coordinator_timeout_surfaces_as_typed_error() -> Result<(), Box<dyn std
     assert!(
         matches!(
             err,
-            tickr_api::http::coordinator_client::CoordinatorClientError::Timeout
+            tickr_api::http::control_plane_client::ControlPlaneClientError::Timeout
         ),
         "got {:?}",
         err

@@ -16,7 +16,7 @@ Use a distributed formation when you require a distributed Executor fleet, exter
 
 ## Operator responsibilities
 
-- Supply tenant and Coordinator connection values.
+- Supply tenant and Control-plane connection values.
 - Keep binary, Core DSL, migrations, and documentation release-compatible.
 - Protect local or distributed storage.
 - Admit only the complete named profile.

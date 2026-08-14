@@ -33,7 +33,7 @@ use testcontainers_modules::testcontainers::ImageExt;
 use tickr_api::commands::client::send_command;
 use tickr_api::commands::client::CommandBus;
 use tickr_api::commands::local::LocalCommandBusConfig;
-use tickr_api::http::coordinator_client::CoordinatorClient;
+use tickr_api::http::control_plane_client::ControlPlaneClient;
 use tickr_api::http::health::{
     api_self, build_health_report, build_health_report_with_fleet_status, check_conductor,
     check_control_plane, check_data_plane_sql, check_executor_fleet_observations, check_executors,
@@ -210,10 +210,10 @@ async fn conductor_row_unhealthy_when_broker_unreachable() {
     );
 }
 
-/// A fake coordinator serving `/api/internal/health` with a fixed rollup body —
-/// stands in for the real coordinator so the Control-plane hop is exercised with no
-/// control plane behind it. Mirrors the fake-coordinator helpers the other api tests
-/// use (e.g. `dashboard_clock_test::spawn_fake_coordinator`).
+/// A fake Frontend serving `/api/internal/health` with a fixed rollup body —
+/// stands in for the real Frontend so the Control-plane hop is exercised with no
+/// Control plane behind it. Mirrors the fake-Control-plane helpers the other API
+/// tests use.
 async fn spawn_fake_control_plane(status: &'static str) -> String {
     let app = axum::Router::new().route(
         "/api/internal/health",
@@ -223,37 +223,36 @@ async fn spawn_fake_control_plane(status: &'static str) -> String {
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind fake coordinator");
+        .expect("bind fake Control plane");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap_or(()) });
     format!("http://{}", addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn control_plane_unreachable_coordinator_row_is_unhealthy() {
-    // The coordinator is the only path the UI reaches control plane through, so the
-    // control plane is one rollup reached via one HTTP hop — and an unreachable
-    // coordinator ⇒ the row is unhealthy, mirroring the coordinator's own
-    // live-store-unreachable degrade path. (Prior art: the coordinator-unreachable
-    // degrade tests, e.g. dashboard_clock_test::unreachable_coordinator_errors...)
-    let coordinator = CoordinatorClient::new("http://127.0.0.1:1".to_string());
-    let row = check_control_plane(&coordinator).await;
+async fn control_plane_unreachable_frontend_row_is_unhealthy() {
+    // The Frontend is the only path the UI reaches the Control plane through, so the
+    // Control plane is one rollup reached via one HTTP hop — and an unreachable
+    // Frontend makes the row unhealthy, mirroring the Frontend's own
+    // live-store-unreachable degrade path.
+    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
+    let row = check_control_plane(&control_plane).await;
     assert_eq!(
         row.status,
         ComponentStatus::Unhealthy,
-        "unreachable coordinator ⇒ control-plane row unhealthy, got detail: {}",
+        "unreachable Frontend ⇒ Control-plane row unhealthy, got detail: {}",
         row.detail
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn control_plane_healthy_when_coordinator_rollup_healthy() {
-    // A reachable coordinator returning a healthy rollup ⇒ the Control-plane row is
+async fn control_plane_healthy_when_frontend_rollup_healthy() {
+    // A reachable Frontend returning a healthy rollup makes the Control-plane row
     // healthy. Exactly one HTTP hop to /api/internal/health; the rollup is
     // reported as one row, never split per-component.
     let base = spawn_fake_control_plane("healthy").await;
-    let coordinator = CoordinatorClient::new(base);
-    let row = check_control_plane(&coordinator).await;
+    let control_plane = ControlPlaneClient::new(base);
+    let row = check_control_plane(&control_plane).await;
     assert_eq!(
         row.status,
         ComponentStatus::Healthy,
@@ -279,12 +278,17 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
         .expect("client builds");
     // Dead-address coordinator: the control-plane hop fails, so that row is
     // unhealthy — still present with a stable shape, which is all this asserts.
-    let coordinator = CoordinatorClient::new("http://127.0.0.1:1".to_string());
+    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
 
     let repositories =
         tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
-    let report =
-        build_health_report(&repositories, &client, &coordinator, Duration::from_secs(1)).await;
+    let report = build_health_report(
+        &repositories,
+        &client,
+        &control_plane,
+        Duration::from_secs(1),
+    )
+    .await;
     let json = serde_json::to_value(&report).expect("serializes");
 
     assert!(
@@ -339,7 +343,7 @@ async fn all_redis_capability_projection_is_exposed_verbatim_and_secret_free() {
     let repositories =
         tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
     let (command_bus, _writer) = CommandBus::local(LocalCommandBusConfig::default());
-    let coordinator = CoordinatorClient::new("http://127.0.0.1:1".to_owned());
+    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_owned());
     let fleet =
         LocalExecutorCapacity::new(Uuid::new_v4(), NonZeroUsize::new(1).unwrap()).observation();
     let projection = serde_json::json!({
@@ -362,7 +366,7 @@ async fn all_redis_capability_projection_is_exposed_verbatim_and_secret_free() {
         &repositories,
         None,
         &command_bus,
-        &coordinator,
+        &control_plane,
         &fleet,
         Duration::from_millis(10),
         Some(projection.clone()),
@@ -515,9 +519,11 @@ async fn nats_kv_reachable_row_is_healthy() {
 /// at dead addresses — the health handler only touches the pool and NATS client,
 /// so they are never called.
 async fn spawn_api(nats: async_nats::Client, pool: Arc<sqlx::PgPool>) -> String {
-    let coordinator = Arc::new(tickr_api::http::coordinator_client::CoordinatorClient::new(
-        "http://127.0.0.1:1".to_string(),
-    ));
+    let control_plane = Arc::new(
+        tickr_api::http::control_plane_client::ControlPlaneClient::new(
+            "http://127.0.0.1:1".to_string(),
+        ),
+    );
     let s3 = opendal::services::S3::default()
         .bucket("ignored")
         .endpoint("http://127.0.0.1:1")
@@ -539,7 +545,7 @@ async fn spawn_api(nats: async_nats::Client, pool: Arc<sqlx::PgPool>) -> String 
                 pool.as_ref().clone(),
             ),
         ),
-        coordinator,
+        control_plane,
         logs,
     );
     let app = tickr_api::http::routes::build_router(state);
@@ -1153,8 +1159,8 @@ fn test_console_asset(path: &str) -> Option<ConsoleAsset> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_states() {
     let (directory, _url, repositories) = migrated_sqlite_repository().await;
-    let (coordinator_url, control_plane_state) = spawn_mutable_control_plane().await;
-    let coordinator = Arc::new(CoordinatorClient::new(coordinator_url));
+    let (control_plane_url, control_plane_state) = spawn_mutable_control_plane().await;
+    let control_plane = Arc::new(ControlPlaneClient::new(control_plane_url));
     let (command_bus, command_writer) = CommandBus::local(LocalCommandBusConfig::default());
     let command_cancel = CancellationToken::new();
     let command_task = tokio::spawn(command_writer.run(
@@ -1183,7 +1189,7 @@ async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_s
     let state = tickr_api::http::routes::build_lite_app_state(
         command_bus,
         Arc::new(repositories),
-        coordinator,
+        control_plane,
         Arc::new(LogsResolver::local(Arc::new(UnusedLocalLogs))),
         ready.clone(),
         test_console_asset,

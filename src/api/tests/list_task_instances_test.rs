@@ -2,13 +2,13 @@
 //!
 //!   - The selected read-only repository rehydrates archived Task projections
 //!     in stable completion/UUID order.
-//!   - `coordinator_client::list_task_instances` decodes a coordinator live response
-//!     into the same DTO the API serves.
-//!   - `merge_tasks` combines live + archive with archive-wins-on-collision.
-//!   - The coordinator client's default timeout is the conductor's 1.5s value.
+//! - `control_plane_client::list_task_instances` decodes the Control plane's
+//!   live response into the same DTO the API serves.
+//! - `merge_tasks` combines live + archive with archive-wins-on-collision.
+//! - The Control-plane client's default timeout is the Conductor's 1.5s value.
 //!
-//! Requires Docker (testcontainers Postgres) for the archive half. The
-//! fake-coordinator half runs purely in-process.
+//! Requires Docker (testcontainers Postgres) for the archive half. The fake
+//! Control plane runs purely in-process.
 
 #![cfg(not(madsim))]
 
@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::coordinator_client::{CoordinatorClient, DEFAULT_TIMEOUT};
+use tickr_api::http::control_plane_client::{ControlPlaneClient, DEFAULT_TIMEOUT};
 use tickr_api::http::dto::TaskInstanceResponse;
 use tickr_api::http::live_archive_merge::merge_tasks;
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
@@ -113,8 +113,8 @@ async fn insert_archived_task(
     .expect("insert archived task");
 }
 
-/// Spawn a fake coordinator serving the live task-list route.
-async fn spawn_fake_coordinator<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
+/// Spawn a fake Control plane serving the live task-list route.
+async fn spawn_fake_control_plane<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
 where
     F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
@@ -130,7 +130,7 @@ where
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
-        .expect("bind fake coordinator");
+        .expect("bind fake Control plane");
     let addr = listener.local_addr().expect("addr");
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap_or(()) });
     (format!("http://{}", addr), handle)
@@ -151,8 +151,8 @@ fn task_response(id: &str, state: &str, attempt: u32) -> TaskInstanceResponse {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coordinator_client_decodes_live_task_list() -> Result<(), Box<dyn std::error::Error>> {
-    let (base, _server) = spawn_fake_coordinator(|_id| async move {
+async fn control_plane_client_decodes_live_task_list() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = spawn_fake_control_plane(|_id| async move {
         Json(vec![
             task_response(&Uuid::new_v4().to_string(), "Running", 0),
             task_response(&Uuid::new_v4().to_string(), "Queued", 0),
@@ -161,7 +161,7 @@ async fn coordinator_client_decodes_live_task_list() -> Result<(), Box<dyn std::
     })
     .await;
 
-    let client = CoordinatorClient::new(base);
+    let client = ControlPlaneClient::new(base);
     let live = client.list_task_instances(Uuid::new_v4()).await?;
     assert_eq!(live.len(), 2);
     Ok(())
@@ -180,7 +180,7 @@ async fn merge_tasks_resolves_collision_to_archive() {
 }
 
 #[test]
-fn coordinator_client_default_timeout_is_1500ms() {
+fn control_plane_client_default_timeout_is_1500ms() {
     assert_eq!(
         DEFAULT_TIMEOUT,
         Duration::from_millis(1_500),

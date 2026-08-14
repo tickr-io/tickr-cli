@@ -71,7 +71,7 @@ export const HEALTH_SECTIONS: readonly {
   {
     section: 'control',
     title: 'Control plane',
-    caption: 'one rollup — API → coordinator health check (coordinator)',
+    caption: 'one rollup — API → Frontend HTTP health check (Control plane)',
   },
 ];
 

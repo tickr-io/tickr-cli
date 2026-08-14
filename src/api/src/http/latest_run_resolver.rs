@@ -6,10 +6,10 @@
 //! belong on the "Up next" surface, not on "latest run").
 //!
 //! The value is composed from two sources, exactly as `/api/dashboard/clock`
-//! and `/api/workflows/{id}/instances` do: the conductor's PG archive (latest
-//! terminal instance per workflow) and a single live cluster subquery against
-//! the coordinator (`GET /api/workflows/instances`, every live instance). The
-//! pure [`resolve`] function does the merge; the orchestration wrapper does the
+//! and `/api/workflows/{id}/instances` do: the Conductor's PG archive (latest
+//! terminal instance per workflow) and a single live cluster subquery through
+//! the Control plane's HTTP subquery channel (`GET /api/workflows/instances`,
+//! every live instance). The pure [`resolve`] function does the merge; the
 //! two reads. Splitting the two keeps the merge unit-testable with plain
 //! vectors — no mock PG or HTTP needed.
 
@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
 
-use super::coordinator_client::CoordinatorClient;
+use super::control_plane_client::ControlPlaneClient;
 use super::dto::WorkflowInstanceResponse;
 
 /// One candidate fired instance, normalised from either the archive or the live
@@ -131,7 +131,7 @@ async fn fetch_archive_candidates(
         .collect())
 }
 
-/// Convert a live coordinator instance projection into a [`RunCandidate`].
+/// Convert a live Control-plane instance projection into a [`RunCandidate`].
 fn candidate_from_live(inst: WorkflowInstanceResponse) -> Option<RunCandidate> {
     let workflow_id = Uuid::parse_str(&inst.workflow_id).ok()?;
     let scheduled_at = inst
@@ -146,13 +146,12 @@ fn candidate_from_live(inst: WorkflowInstanceResponse) -> Option<RunCandidate> {
     })
 }
 
-/// Resolve the latest fired-instance *candidate* for a batch of workflows in one
 /// selected-repository read plus one live cluster subquery. The live read is
-/// best-effort: if the coordinator is unreachable the resolver degrades to
+/// best-effort: if the Control plane is unreachable the resolver degrades to
 /// archive-only rather than failing.
 pub async fn resolve_latest_runs(
     repositories: &ReadOnlyRepositoryBundle,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     workflow_ids: &[Uuid],
 ) -> HashMap<Uuid, Option<RunCandidate>> {
     let archive = fetch_archive_candidates(repositories)
@@ -162,7 +161,7 @@ pub async fn resolve_latest_runs(
             Vec::new()
         });
 
-    let live = match coordinator.list_all_workflow_instances().await {
+    let live = match control_plane.list_all_workflow_instances().await {
         Ok(instances) => instances
             .into_iter()
             .filter_map(candidate_from_live)
@@ -180,10 +179,10 @@ pub async fn resolve_latest_runs(
 /// which needs the latest run state but not its timestamp.
 pub async fn resolve_latest_run_states(
     repositories: &ReadOnlyRepositoryBundle,
-    coordinator: &CoordinatorClient,
+    control_plane: &ControlPlaneClient,
     workflow_ids: &[Uuid],
 ) -> HashMap<Uuid, Option<String>> {
-    resolve_latest_runs(repositories, coordinator, workflow_ids)
+    resolve_latest_runs(repositories, control_plane, workflow_ids)
         .await
         .into_iter()
         .map(|(id, c)| (id, c.map(|c| c.state)))

@@ -1,7 +1,7 @@
 //! Integration test for the latest-run-state resolver's selected archive
-//! repository against real ephemeral Postgres. The live cluster-query side is
-//! exercised by pointing the `CoordinatorClient` at an unreachable address, so
-//! the result reflects the archive candidate operation alone.
+//! repository against real ephemeral Postgres. The live Control-plane query is
+//! exercised by pointing `ControlPlaneClient` at an unreachable address, so the
+//! result reflects the archive candidate operation alone.
 //!
 //! Requires Docker. Skipped automatically when Docker isn't available.
 
@@ -12,7 +12,7 @@ use std::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tickr_api::http::coordinator_client::CoordinatorClient;
+use tickr_api::http::control_plane_client::ControlPlaneClient;
 use tickr_api::http::latest_run_resolver::resolve_latest_run_states;
 use tickr_migrations::backend::ReadOnlyRepositoryBundle;
 use uuid::Uuid;
@@ -89,12 +89,12 @@ async fn resolves_latest_terminal_per_workflow_from_archive(
     .await;
 
     // Unreachable coordinator → archive-only selected-repository result.
-    let coordinator =
-        CoordinatorClient::with_timeout("http://127.0.0.1:1", Duration::from_millis(150));
+    let control_plane =
+        ControlPlaneClient::with_timeout("http://127.0.0.1:1", Duration::from_millis(150));
     let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
 
     let wf_never = Uuid::new_v4();
-    let out = resolve_latest_run_states(&repository, &coordinator, &[wf_a, wf_b, wf_never]).await;
+    let out = resolve_latest_run_states(&repository, &control_plane, &[wf_a, wf_b, wf_never]).await;
 
     assert_eq!(
         out.get(&wf_a),

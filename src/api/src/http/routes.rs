@@ -95,9 +95,10 @@ pub struct AppState {
     nats: Option<Arc<Client>>,
     command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    // HTTP client to the coordinator for live-state subqueries. Separate from
-    // any relay so UI query load can't head-of-line block system comms.
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    // HTTP client to the Control plane's HTTP subquery channel for live-state
+    // reads. Separate from the Conductor relay so UI query load cannot
+    // head-of-line block system communication.
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     // Task-log dispatcher with both stores injected: MinIO (terminal blobs)
     // and NATS KV (live streamed batches).
     logs: Arc<super::logs_resolver::LogsResolver>,
@@ -208,7 +209,7 @@ async fn api_health_handler(
         super::health::build_lite_health_report(
             &state.repositories,
             &state.command_bus,
-            &state.coordinator,
+            &state.control_plane,
             state.executor_fleet.as_ref(),
             formation,
             state
@@ -224,7 +225,7 @@ async fn api_health_handler(
             &state.repositories,
             state.nats.as_deref(),
             &state.command_bus,
-            &state.coordinator,
+            &state.control_plane,
             state.executor_fleet.as_ref(),
             state.deadlines.ping,
             state
@@ -280,7 +281,7 @@ async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl Into
                 .collect();
             let mut latest_runs = super::latest_run_resolver::resolve_latest_run_states(
                 &state.repositories,
-                &state.coordinator,
+                &state.control_plane,
                 &ids,
             )
             .await;
@@ -429,7 +430,7 @@ async fn get_workflow_detail_handler(
     // derived from the same pick so they cannot name different instances.
     let latest_run = super::latest_run_resolver::resolve_latest_runs(
         &state.repositories,
-        &state.coordinator,
+        &state.control_plane,
         &[wf],
     )
     .await
@@ -598,7 +599,7 @@ async fn workflow_calendar_handler(
         state
             .repositories
             .archived_calendar_candidates(wf, envelope.start, envelope.end),
-        state.coordinator.list_workflow_instances(wf),
+        state.control_plane.list_workflow_instances(wf),
     );
 
     let archive_rows = match archive_res {
@@ -611,10 +612,12 @@ async fn workflow_calendar_handler(
 
     let (live_rows, live_data_available) = match live_res {
         Ok(rows) => (rows, true),
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => (Vec::new(), true),
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
+            (Vec::new(), true)
+        }
         Err(e) => {
             eprintln!(
-                "workflow_calendar_handler: coordinator call failed: {:?}",
+                "workflow_calendar_handler: Control-plane HTTP call failed: {:?}",
                 e
             );
             (Vec::new(), false)
@@ -865,7 +868,7 @@ async fn dashboard_clock_handler(
     let (archive_res, live_res) = tokio::join!(
         state.repositories.archived_dashboard_instances(start, end),
         state
-            .coordinator
+            .control_plane
             .dashboard_clock(query.start_time, query.end_time),
     );
 
@@ -889,7 +892,10 @@ async fn dashboard_clock_handler(
     let (live_rows, live_data_available) = match live_res {
         Ok(rows) => (rows, true),
         Err(e) => {
-            eprintln!("dashboard_clock_handler: coordinator call failed: {:?}", e);
+            eprintln!(
+                "dashboard_clock_handler: Control-plane HTTP call failed: {:?}",
+                e
+            );
             (Vec::new(), false)
         }
     };
@@ -912,10 +918,10 @@ struct UpcomingQuery {
 }
 
 /// Handler for `GET /api/dashboard/upcoming`. Reads the live `Scheduled`
-/// instances from the coordinator (single-node query), sorts them by `next_run_at`
+/// instances from the Control plane (single-node query), sorts them by `next_run_at`
 /// ASC, and trims to `limit` (default 3). Fire-now and waits-on-signal
 /// workflows never produce a `Scheduled` instance, so they are inherently
-/// absent. Up next has no archive half — on a coordinator failure the strip is
+/// absent. Up next has no archive half — on a Control-plane HTTP failure the strip is
 /// empty and the UI renders its "Nothing scheduled." state.
 #[utoipa::path(summary = "API operation", description = "Public HTTP operation.", get, path = "/api/dashboard/upcoming", params(UpcomingQuery), responses((status = 200, body = Vec<super::dto::UpcomingInstanceResponse>)))]
 async fn dashboard_upcoming_handler(
@@ -923,11 +929,11 @@ async fn dashboard_upcoming_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(20) as usize;
-    let rows = match state.coordinator.dashboard_upcoming().await {
+    let rows = match state.control_plane.dashboard_upcoming().await {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!(
-                "dashboard_upcoming_handler: coordinator call failed: {:?}",
+                "dashboard_upcoming_handler: Control-plane HTTP call failed: {:?}",
                 e
             );
             Vec::new()
@@ -1036,8 +1042,10 @@ async fn list_workflow_instances_handler(
                 .await
         }
     };
-    let (archive_res, coordinator_res) =
-        tokio::join!(archive_read, state.coordinator.list_workflow_instances(wf),);
+    let (archive_res, control_plane_res) = tokio::join!(
+        archive_read,
+        state.control_plane.list_workflow_instances(wf),
+    );
 
     let mut archive_rows: Vec<super::dto::WorkflowInstanceResponse> = match archive_res {
         Ok(rows) => rows.into_iter().map(project_archived_instance).collect(),
@@ -1053,12 +1061,14 @@ async fn list_workflow_instances_handler(
         }
     };
 
-    let (live_rows, live_data_available) = match coordinator_res {
+    let (live_rows, live_data_available) = match control_plane_res {
         Ok(rows) => (rows, true),
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => (Vec::new(), true),
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
+            (Vec::new(), true)
+        }
         Err(e) => {
             eprintln!(
-                "list_workflow_instances_handler: coordinator call failed for workflow {}: {:?}",
+                "list_workflow_instances_handler: Control-plane HTTP call failed for workflow {}: {:?}",
                 wf, e
             );
             (Vec::new(), false)
@@ -1153,9 +1163,9 @@ async fn list_task_instances_handler(
         }
     };
 
-    let (archive_res, coordinator_res) = tokio::join!(
+    let (archive_res, control_plane_res) = tokio::join!(
         state.repositories.archived_task_instances(wi),
-        state.coordinator.list_task_instances(wi),
+        state.control_plane.list_task_instances(wi),
     );
 
     let archive_rows: Vec<super::dto::TaskInstanceResponse> = match archive_res {
@@ -1172,12 +1182,14 @@ async fn list_task_instances_handler(
         }
     };
 
-    let (live_rows, live_data_available) = match coordinator_res {
+    let (live_rows, live_data_available) = match control_plane_res {
         Ok(rows) => (rows, true),
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => (Vec::new(), true),
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
+            (Vec::new(), true)
+        }
         Err(e) => {
             eprintln!(
-                "list_task_instances_handler: coordinator call failed for instance {}: {:?}",
+                "list_task_instances_handler: Control-plane HTTP call failed for instance {}: {:?}",
                 wi, e
             );
             (Vec::new(), false)
@@ -1263,9 +1275,9 @@ async fn get_workflow_instance_handler(
     }
 
     // 2. Live fallback. Coordinator's cluster_query is the live source of truth.
-    match state.coordinator.get_workflow_instance(id).await {
+    match state.control_plane.get_workflow_instance(id).await {
         Ok(live) => (StatusCode::OK, Json(live)).into_response(),
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => {
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
             // Neither PG nor coordinator has the instance. Genuinely gone.
             (
                 StatusCode::NOT_FOUND,
@@ -1275,15 +1287,15 @@ async fn get_workflow_instance_handler(
             )
                 .into_response()
         }
-        Err(e @ super::coordinator_client::CoordinatorClientError::Timeout)
-        | Err(e @ super::coordinator_client::CoordinatorClientError::Unreachable(_))
-        | Err(e @ super::coordinator_client::CoordinatorClientError::Server { status: 503 }) => {
-            // Live store unreachable — either the coordinator itself is down
-            // (timeout/connect) or the coordinator reported its cluster query
-            // failed (its own 503). Surface as 503 so the UI shows "live
+        Err(e @ super::control_plane_client::ControlPlaneClientError::Timeout)
+        | Err(e @ super::control_plane_client::ControlPlaneClientError::Unreachable(_))
+        | Err(e @ super::control_plane_client::ControlPlaneClientError::Server { status: 503 }) => {
+            // Live store unreachable — either the Control-plane HTTP channel is down
+            // (timeout/connect) or it reported its cluster query failed (its own
+            // 503). Surface as 503 so the UI shows "live
             // store unavailable" rather than "not found".
             eprintln!(
-                "get_workflow_instance_handler: coordinator call failed for {}: {:?}",
+                "get_workflow_instance_handler: Control-plane HTTP call failed for {}: {:?}",
                 id, e
             );
             public_http_error(
@@ -1293,10 +1305,13 @@ async fn get_workflow_instance_handler(
         }
         Err(e) => {
             eprintln!(
-                "get_workflow_instance_handler: coordinator returned error for {}: {:?}",
+                "get_workflow_instance_handler: Control-plane HTTP channel returned error for {}: {:?}",
                 id, e
             );
-            public_http_error(StatusCode::BAD_GATEWAY, format!("coordinator error: {e}"))
+            public_http_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Control-plane HTTP error: {e}"),
+            )
         }
     }
 }
@@ -1397,9 +1412,9 @@ async fn get_instance_context_handler(
     }
 
     // 2. Live: learn the scope ids from the live snapshot, then read the KV.
-    let snapshot = match state.coordinator.get_workflow_instance(id).await {
+    let snapshot = match state.control_plane.get_workflow_instance(id).await {
         Ok(s) => s,
-        Err(super::coordinator_client::CoordinatorClientError::NotFound(_)) => {
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "workflow instance not found"})),
@@ -3046,11 +3061,11 @@ pub fn openapi_yaml() -> Result<String> {
 pub fn build_app_state(
     nats: Arc<Client>,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
 ) -> Arc<AppState> {
     let command_bus = CommandBus::nats(nats.as_ref().clone());
-    build_app_state_with_command_bus(nats, command_bus, repositories, coordinator, logs)
+    build_app_state_with_command_bus(nats, command_bus, repositories, control_plane, logs)
 }
 
 /// Construct `AppState` with an explicitly selected Command bus.
@@ -3061,7 +3076,7 @@ pub fn build_app_state_with_command_bus(
     nats: Arc<Client>,
     command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
 ) -> Arc<AppState> {
     let fleet_status = Arc::new(
@@ -3074,7 +3089,7 @@ pub fn build_app_state_with_command_bus(
         Some(nats),
         command_bus,
         repositories,
-        coordinator,
+        control_plane,
         logs,
         fleet_status,
     )
@@ -3085,7 +3100,7 @@ pub fn build_app_state_with_fleet_status(
     nats: Option<Arc<Client>>,
     command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
     executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
 ) -> Arc<AppState> {
@@ -3093,7 +3108,7 @@ pub fn build_app_state_with_fleet_status(
         nats,
         command_bus,
         repositories,
-        coordinator,
+        control_plane,
         logs,
         executor_fleet,
         None,
@@ -3105,7 +3120,7 @@ pub fn build_app_state_with_runtime_readiness(
     nats: Option<Arc<Client>>,
     command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
     executor_fleet: Arc<dyn tickr_executor::local_pickup::ExecutorFleetStatus>,
     distributed_ready: Option<FormationReadiness>,
@@ -3115,7 +3130,7 @@ pub fn build_app_state_with_runtime_readiness(
         nats,
         command_bus,
         repositories,
-        coordinator,
+        control_plane,
         logs,
         deadlines: CommandDeadlines::default(),
         lite_ready: None,
@@ -3131,7 +3146,7 @@ pub fn build_app_state_with_runtime_readiness(
 pub fn build_lite_app_state(
     command_bus: CommandBus,
     repositories: Arc<tickr_migrations::backend::ReadOnlyRepositoryBundle>,
-    coordinator: Arc<super::coordinator_client::CoordinatorClient>,
+    control_plane: Arc<super::control_plane_client::ControlPlaneClient>,
     logs: Arc<super::logs_resolver::LogsResolver>,
     ready: Arc<std::sync::atomic::AtomicBool>,
     console_assets: ConsoleAssetResolver,
@@ -3142,7 +3157,7 @@ pub fn build_lite_app_state(
         nats: None,
         command_bus,
         repositories,
-        coordinator,
+        control_plane,
         logs,
         deadlines: CommandDeadlines::default(),
         lite_ready: Some(ready),
@@ -3246,8 +3261,8 @@ pub async fn start_http_server_with_runtime_readiness(
     readiness: Option<FormationReadiness>,
     diagnostics: Option<FormationDiagnostics>,
 ) -> Result<()> {
-    let coordinator = Arc::new(super::coordinator_client::CoordinatorClient::new(
-        tickr_proto::config::coordinator_http_url(),
+    let control_plane = Arc::new(super::control_plane_client::ControlPlaneClient::new(
+        tickr_proto::config::ctrl_http_url(),
     ));
     let storage = crate::config::LogStorageConfig::from_env()?;
     let minio = storage.operator()?;
@@ -3256,7 +3271,7 @@ pub async fn start_http_server_with_runtime_readiness(
         nats.map(Arc::new),
         command_bus,
         repositories,
-        coordinator,
+        control_plane,
         logs,
         executor_fleet,
         readiness.clone(),

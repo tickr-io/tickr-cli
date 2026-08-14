@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use tickr_api::commands::local::LocalCommandBusConfig;
-use tickr_api::http::coordinator_client::CoordinatorClient;
+use tickr_api::http::control_plane_client::ControlPlaneClient;
 use tickr_api::http::health::{
     HealthCoordinationRole, HealthFinalLogStore, HealthFormationProfile, HealthFormationTopology,
     HealthProtocolIdentity, HealthResolvedRole, HealthRoleImplementation, HealthSubstrateSelection,
@@ -330,8 +330,8 @@ impl LiteSupervisor {
             signal_notifier,
         });
 
-        let coordinator = Arc::new(
-            CoordinatorClient::try_new(tickr_proto::config::coordinator_http_url())
+        let control_plane = Arc::new(
+            ControlPlaneClient::try_new(tickr_proto::config::ctrl_http_url())
                 .context("validating Control-plane query client")?,
         );
         let logs = Arc::new(LogsResolver::local(Arc::new(LiteLogStore {
@@ -341,7 +341,7 @@ impl LiteSupervisor {
         let api_state = tickr_api::http::routes::build_lite_app_state(
             command_bus,
             read_only,
-            coordinator,
+            control_plane,
             logs,
             self.ready.clone(),
             crate::embedded_console::resolve,

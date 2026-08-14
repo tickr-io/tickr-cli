@@ -9,7 +9,7 @@ sidebar_position: 1
 Tickr Lite runs one complete Tickr Data plane on your machine: API, Conductor, one Executor, the Console, SQLite state, and local Task logs. It connects to an existing compatible Control plane supplied by your Tickr operator.
 
 :::info Access model
-Tickr Lite is local-first, not Control-plane-free. Obtain the tenant and Coordinator values described in [Obtain access](./access.md) before expecting a workflow Run to execute.
+Tickr Lite is local-first, not Control-plane-free. Obtain the tenant and Control-plane connection values described in [Obtain access](./access.md) before expecting a workflow Run to execute.
 :::
 
 ## What you will do

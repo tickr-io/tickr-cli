@@ -84,8 +84,8 @@ just dsl-check examples/hello-world.ncl
 
 The example demonstrates the authored workflow shape without requiring a
 running formation. Registering, scheduling, and executing workflows requires a
-compatible Tickr coordinator; see [Architecture](docs/architecture.md) for the
-integration endpoints and standalone behavior.
+compatible Tickr Control plane; see [Architecture](docs/architecture.md) for the
+HTTP subquery channel, Conductor relay, and standalone behavior.
 
 ## Runtime commands
 
@@ -114,9 +114,9 @@ not delete volumes or the checkout's local state; only `just fresh` is destructi
 
 `just verify` checks exactly the local runtime: the three Rust services, Console,
 PostgreSQL schema, NATS/JetStream, MinIO, API readiness, and Console readiness.
-A coordinator is not started by this repository. Without one, coordinator-backed
-health and live-data views are expected to report unavailable or degraded while
-the local formation remains ready.
+A Control plane is not started by this repository. Without one, Control-plane
+health and HTTP-subquery live-data views are expected to report unavailable or
+degraded while the local formation remains ready.
 
 Checkout-local overrides belong in ignored `.env.local`. The tracked `.envrc`
 contains loopback-only development defaults and is sourced by formation recipes,
