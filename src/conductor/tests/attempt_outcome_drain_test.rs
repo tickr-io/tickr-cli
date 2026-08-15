@@ -67,6 +67,22 @@ fn dispatch() -> tc::TaskDispatch {
     }
 }
 
+fn completed_event(task: &tc::TaskDispatch) -> Vec<u8> {
+    tc::TaskEvent {
+        task_instance_id: task.task_instance_id.clone(),
+        task_id: task.task_id.clone(),
+        workflow_instance_id: task.workflow_instance_id.clone(),
+        workflow_id: task.workflow_id.clone(),
+        executor_id: Some(Uuid::new_v4().to_string()),
+        kind: Some(tc::task_event::Kind::Completed(tc::task_event::Completed {
+            routing_variables: Default::default(),
+            self_patch: None,
+            self_patch_stall_ttl: None,
+        })),
+    }
+    .encode_to_vec()
+}
+
 async fn pull_one(consumer: &jetstream::consumer::PullConsumer) -> jetstream::Message {
     let mut messages = consumer
         .batch()
@@ -187,4 +203,109 @@ async fn due_deadline_elects_once_and_redelivers_until_forward_ack() {
         .expect("relay-forward boundary completes TaskEvent");
     second_cycle.cancel();
     second_handle.await.expect("second Conductor cycle stops");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outcome_sweep_advances_beyond_each_bounded_batch() {
+    let Some((_nats_container, nats)) = start_nats().await else {
+        return;
+    };
+    let consumer = task_event_consumer(&nats)
+        .await
+        .expect("TaskEvent consumer");
+    let js = jetstream::new(nats.clone());
+    let pickup = js
+        .create_key_value(jetstream::kv::Config {
+            bucket: TASK_PICKUP_BUCKET.to_owned(),
+            history: 1,
+            storage: jetstream::stream::StorageType::File,
+            ..Default::default()
+        })
+        .await
+        .expect("pickup outcome bucket");
+
+    let mut expected = Vec::new();
+    for sequence in 1..=65 {
+        let task = dispatch();
+        let key = format!("dispatch.{sequence}");
+        let event = completed_event(&task);
+        let mut record = TaskPickupRecord {
+            dispatch_key: key.clone(),
+            payload: task.encode_to_vec(),
+            pickup_generation: 1,
+            owner: "executor-one".to_owned(),
+            liveness_deadline_ms: i64::MAX,
+            assigned_event: vec![1],
+            assigned_staged: true,
+            liveness_armed: true,
+            source_completed: true,
+            started_event: Some(vec![2]),
+            terminal: None,
+            rejected_reason: None,
+        };
+        assert_eq!(
+            record.elect(
+                &key,
+                1,
+                "executor-one",
+                AttemptOutcome::ProcessExitedSuccess,
+                &event,
+            ),
+            ElectionDecision::Won
+        );
+        if sequence <= 64 {
+            record
+                .terminal
+                .as_mut()
+                .expect("terminal election")
+                .event_enqueued = true;
+        } else {
+            expected = event;
+        }
+        pickup
+            .create(
+                &key,
+                serde_json::to_vec(&record).expect("encode record").into(),
+            )
+            .await
+            .expect("stage terminal pickup");
+    }
+
+    let cycle = CancellationToken::new();
+    let handle = tokio::spawn(drain_attempt_outcomes(nats.clone(), None, cycle.clone()));
+    let staged = pull_one(&consumer).await;
+    assert_eq!(staged.payload.as_ref(), expected.as_slice());
+    staged.ack().await.expect("ack staged terminal TaskEvent");
+
+    let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let value = pickup
+                .get("dispatch.65")
+                .await
+                .expect("read pending terminal")
+                .expect("pending terminal remains durable");
+            let record: TaskPickupRecord =
+                serde_json::from_slice(&value).expect("decode pending terminal");
+            if record
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.event_enqueued)
+            {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded sweep reaches the next batch");
+    assert_eq!(
+        recovered
+            .terminal
+            .expect("terminal remains durable")
+            .outcome,
+        AttemptOutcome::ProcessExitedSuccess
+    );
+
+    cycle.cancel();
+    handle.await.expect("Conductor outcome drain stops");
 }

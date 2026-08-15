@@ -1473,16 +1473,13 @@ async fn reconcile_pickup_outcome(
 async fn sweep_attempt_outcomes_once(
     task_events: &dyn TaskEventWriter,
     pickup: &jetstream::kv::Store,
-) -> Result<()> {
+    keys: &mut jetstream::kv::Keys,
+) -> Result<bool> {
     let server_time_ms = pickup_server_time(pickup).await?;
-    let mut keys = pickup
-        .keys()
-        .await
-        .map_err(|error| anyhow::anyhow!("list all-NATS pickup deadlines: {error}"))?;
     let mut scanned = 0;
     while scanned < OUTCOME_SWEEP_BATCH {
         let Some(key) = keys.next().await else {
-            break;
+            return Ok(true);
         };
         let key = key.map_err(|error| anyhow::anyhow!("scan all-NATS pickup deadline: {error}"))?;
         if !key.starts_with("dispatch.") {
@@ -1495,7 +1492,7 @@ async fn sweep_attempt_outcomes_once(
             eprintln!("all-NATS outcome reconciliation failed for `{key}`: {error}");
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Periodically reconcile durable pickup deadlines and enqueue elected terminal
@@ -1545,6 +1542,7 @@ pub async fn drain_attempt_outcomes_with_writer(
         None => None,
     };
     let mut cadence = tokio::time::interval(Duration::from_secs(1));
+    let mut outcome_keys = None;
     loop {
         tokio::select! {
             _ = token.cancelled() => break,
@@ -1567,8 +1565,24 @@ pub async fn drain_attempt_outcomes_with_writer(
                 }
             }
         }
-        if let Err(error) = sweep_attempt_outcomes_once(task_events.as_ref(), &pickup).await {
-            eprintln!("all-NATS outcome sweep failed: {error}");
+        if outcome_keys.is_none() {
+            outcome_keys = match pickup.keys().await {
+                Ok(keys) => Some(keys),
+                Err(error) => {
+                    eprintln!("list all-NATS pickup deadlines: {error}");
+                    None
+                }
+            };
+        }
+        if let Some(keys) = outcome_keys.as_mut() {
+            match sweep_attempt_outcomes_once(task_events.as_ref(), &pickup, keys).await {
+                Ok(true) => outcome_keys = None,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("all-NATS outcome sweep failed: {error}");
+                    outcome_keys = None;
+                }
+            }
         }
     }
 }
