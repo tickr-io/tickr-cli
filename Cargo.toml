@@ -103,6 +103,7 @@ anyhow = "1.0"
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 redis = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }

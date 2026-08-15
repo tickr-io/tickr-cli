@@ -247,7 +247,26 @@ fn is_canonical_bearer_token(token: &[u8]) -> bool {
         && token
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
-        && matches!(token.last(), Some(b'A' | b'Q' | b'g' | b'w'))
+        && matches!(
+            token.last(),
+            Some(
+                b'A' | b'E'
+                    | b'I'
+                    | b'M'
+                    | b'Q'
+                    | b'U'
+                    | b'Y'
+                    | b'c'
+                    | b'g'
+                    | b'k'
+                    | b'o'
+                    | b's'
+                    | b'w'
+                    | b'0'
+                    | b'4'
+                    | b'8'
+            )
+        )
 }
 
 fn is_loopback_host(host: &str) -> bool {
