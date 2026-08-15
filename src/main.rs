@@ -346,6 +346,9 @@ async fn run_all_redis_executor(shutdown: CancellationToken) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("Rustls crypto provider was already installed"))?;
     let cli = Cli::parse();
     if let Commands::TaskGuardian { command } = &cli.command {
         let code = tickr::lite_supervisor::run_task_guardian(command.clone()).await?;
