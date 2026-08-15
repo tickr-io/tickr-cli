@@ -1,3 +1,5 @@
+mod tenant_cmd;
+
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
@@ -37,6 +39,11 @@ enum Commands {
     Conductor,
     Api,
     Executor,
+    /// Administer Tenants through the loopback-only Frontend API.
+    Tenant {
+        #[command(subcommand)]
+        command: tenant_cmd::TenantCommand,
+    },
     /// Run the admitted single-process Tickr Lite formation.
     TickrLite,
     /// Apply and verify the selected Data-plane SQL migrations.
@@ -368,6 +375,10 @@ async fn main() -> Result<()> {
     );
     if distributed_root {
         tickr::formation::resolve_formation(&selection)?;
+        if matches!(&cli.command, Commands::Conductor | Commands::Api) {
+            tickr_proto::config::data_plane_sql()
+                .context("validating data-plane SQL configuration before substrate admission")?;
+        }
         if cli.distributed_formation == DistributedFormation::AllNats {
             tickr_conductor::all_nats_formation::connect_and_admit(
                 &tickr_proto::config::nats_url(),
@@ -391,6 +402,7 @@ async fn main() -> Result<()> {
         Commands::Conductor => Box::pin(run_conductor(shutdown.clone())),
         Commands::Api => Box::pin(run_api(shutdown.clone())),
         Commands::Executor => Box::pin(run_executor()),
+        Commands::Tenant { command } => Box::pin(tenant_cmd::run(command)),
         Commands::TickrLite => Box::pin(LiteSupervisor::new(shutdown.clone()).run()),
         Commands::Migrate { formation } => Box::pin(migrate_cmd::run(formation)),
         Commands::TaskGuardian { .. } => unreachable!("Task guardian exits before composition"),
