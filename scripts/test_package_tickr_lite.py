@@ -27,10 +27,10 @@ class PackageTickrLiteTest(unittest.TestCase):
             ctx_binary.write_bytes(b"tickr-ctx-binary")
 
             first, first_checksum = PACKAGE.package(
-                binary, ctx_binary, "0.1.1", "test-target", root / "first"
+                binary, ctx_binary, "0.1.2", "test-target", root / "first"
             )
             second, second_checksum = PACKAGE.package(
-                binary, ctx_binary, "0.1.1", "test-target", root / "second"
+                binary, ctx_binary, "0.1.2", "test-target", root / "second"
             )
 
             self.assertEqual(first.read_bytes(), second.read_bytes())
@@ -40,7 +40,7 @@ class PackageTickrLiteTest(unittest.TestCase):
                 first_checksum.read_text(), f"{digest}  {first.name}\n"
             )
 
-            prefix = "tickr-lite-v0.1.1-test-target"
+            prefix = "tickr-lite-v0.1.2-test-target"
             with tarfile.open(first, "r:gz") as archive:
                 members = {member.name: member for member in archive.getmembers()}
 
