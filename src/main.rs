@@ -1,3 +1,5 @@
+mod examples_cmd;
+mod setup_cmd;
 mod tenant_cmd;
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
@@ -44,6 +46,10 @@ enum Commands {
         #[command(subcommand)]
         command: tenant_cmd::TenantCommand,
     },
+    /// Configure a private Tickr Lite installation.
+    Setup(setup_cmd::SetupArgs),
+    /// Run bundled Tickr Lite examples.
+    Examples(examples_cmd::ExamplesArgs),
     /// Run the admitted single-process Tickr Lite formation.
     TickrLite,
     /// Apply and verify the selected Data-plane SQL migrations.
@@ -361,6 +367,22 @@ async fn main() -> Result<()> {
         let code = tickr::lite_supervisor::run_task_guardian(command.clone()).await?;
         std::process::exit(code);
     }
+    let uses_lite_profile = matches!(
+        &cli.command,
+        Commands::TickrLite
+            | Commands::Examples(_)
+            | Commands::Migrate {
+                formation: MigrationFormation::TickrLite
+            }
+    );
+    let profile = if uses_lite_profile {
+        setup_cmd::load_and_apply_profile()?
+    } else {
+        None
+    };
+    if matches!(&cli.command, Commands::TickrLite | Commands::Examples(_)) {
+        setup_cmd::change_to_release_home(profile.as_ref())?;
+    }
     if !matches!(
         &cli.command,
         Commands::Conductor | Commands::Api | Commands::Executor
@@ -406,6 +428,8 @@ async fn main() -> Result<()> {
         Commands::Api => Box::pin(run_api(shutdown.clone())),
         Commands::Executor => Box::pin(run_executor()),
         Commands::Tenant { command } => Box::pin(tenant_cmd::run(command)),
+        Commands::Setup(args) => Box::pin(setup_cmd::run(args)),
+        Commands::Examples(args) => Box::pin(examples_cmd::run(args, shutdown.clone())),
         Commands::TickrLite => Box::pin(LiteSupervisor::new(shutdown.clone()).run()),
         Commands::Migrate { formation } => Box::pin(migrate_cmd::run(formation)),
         Commands::TaskGuardian { .. } => unreachable!("Task guardian exits before composition"),

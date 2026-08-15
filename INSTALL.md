@@ -13,24 +13,60 @@ on loopback by default.
 
 ## What you need
 
-Obtain these values from the operator of the Control plane:
+Obtain the Tenant slug and bearer credential from the operator of the matched
+Tickr 0.1.4 Control plane. Setup selects the private-beta HTTP and relay
+endpoints.
 
-- the tenant slug;
-- the Control-plane HTTP subquery channel URL;
-- the Control-plane Conductor relay URL.
-- the Tenant bearer token supplied for both channels.
-
-Install these host tools:
-
-- Nix with the `nix-command` and `flakes` features enabled;
-- `curl`;
-- `jq`.
+Install Nix with the `nix-command` and `flakes` features enabled. The guided
+Hello run needs no other shell tools. The advanced runtime-Patch walkthrough
+below also uses `curl` and `jq`.
 
 The release archive contains the `tickr` and `tickr-ctx` executables, the exact
 Core DSL for that release, and the runnable examples. Nickel is installed below
 at the version Tickr validates in CI.
 
-## 1. Verify and extract the archive
+## 1. Install Nix and Nickel
+
+Install Nix with the
+[Determinate Nix Installer](https://install.determinate.systems/).
+
+On Linux:
+
+```sh
+curl -fsSL https://install.determinate.systems/nix |
+  sh -s -- install --determinate --no-confirm
+```
+
+On macOS:
+
+```sh
+curl -Lo Determinate.pkg \
+  https://install.determinate.systems/determinate-pkg/stable/Universal
+sudo installer -pkg ./Determinate.pkg -target /
+```
+
+Open a new terminal after installation, then verify Nix and Flakes:
+
+```sh
+nix --version
+nix flake --help >/dev/null
+```
+
+Install Nickel from Nixpkgs and put the user profile on the current shell's
+search path:
+
+```sh
+nix profile add nixpkgs#nickel
+export PATH="$HOME/.nix-profile/bin:$PATH"
+command -v nickel
+nickel --version
+```
+
+Persist the same `PATH` entry in the shell's startup configuration if a new
+terminal does not retain it. Tickr 0.1.4 accepts Nickel 1.16.0 and 1.17.0;
+Nixpkgs currently installs Nickel 1.17.0.
+
+## 2. Verify and extract the archive
 
 Download one archive and its adjacent `.sha256` file from the same GitHub
 release. On Linux:
@@ -56,136 +92,74 @@ directory, and the bundled DSL must stay matched to the executable.
 export TICKR_HOME="$(pwd -P)"
 ```
 
-## 2. Install the pinned Nickel evaluator
+## 3. Configure Tickr Lite
 
-Tickr invokes `nickel export` when it registers a workflow or parses a runtime
-Patch. Install Nickel 1.16.0 into the extracted bundle so every foreground
-Tickr process and Task sees the same executable.
+Run the setup command from the extracted release directory:
 
 ```sh
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64)
-    nickel_asset=nickel-x86_64-linux
-    nickel_sha256=05d926d6cfdd3743731a65c08a558c2ae5edd55759f3cee57f5096acb2595816
-    ;;
-  Linux-aarch64|Linux-arm64)
-    nickel_asset=nickel-arm64-linux
-    nickel_sha256=1ee39d7c9791d2b1ded7ec656c4226ce20e4fad519808c36c90df55c3b2e1d27
-    ;;
-  Darwin-arm64)
-    nickel_asset=nickel-arm64-macos
-    nickel_sha256=6855a4197a8df9067af6c84eaed129715a78194d97987a5f4e46bead96e616ad
-    ;;
-  *)
-    echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2
-    exit 2
-    ;;
-esac
-
-curl -fL \
-  "https://github.com/nickel-lang/nickel/releases/download/1.16.0/$nickel_asset" \
-  -o nickel
+./tickr setup
 ```
 
-Verify the downloaded executable. On Linux:
+Setup verifies Nix Flakes and a supported Nickel version, then asks for:
+
+- the Tenant slug;
+- the Tenant credential, with terminal echo disabled;
+- the Tickr data directory, recommending
+  `$HOME/.local/share/tickr-lite`.
+
+For this private-beta release, setup selects the matched Control-plane endpoints
+`https://ctrl.tickr.works` and `https://relay.tickr.works`. It keeps the local
+API and embedded Console on `127.0.0.1:6000`.
+
+Setup writes the credential-bearing profile to
+`$HOME/.config/tickr/config.json` with mode `0600`, creates the selected data
+directory with mode `0700`, and applies the Tickr Lite SQLite migrations. Later
+`tickr-lite`, `migrate --formation tickr-lite`, and `examples` commands load
+this profile automatically. Environment variables remain explicit deployment
+overrides.
+When one of those commands starts Tickr Lite, it prepends the extracted release
+directory to the inherited `PATH`. The packaged `tickr-ctx` executable is
+therefore available to runtime-Patch Tasks while the Nix profile remains
+available for `nix` and `nickel`.
+
+For a non-interactive installation, keep the credential out of shell history:
 
 ```sh
-printf '%s  nickel\n' "$nickel_sha256" | sha256sum --check -
+./tickr setup \
+  --tenant-slug acme-demo \
+  --token-file /secure/path/tickr-tenant-token \
+  --data-dir "$HOME/.local/share/tickr-lite"
 ```
 
-On macOS:
+The credential must be the canonical unpadded base64url encoding of exactly 32
+random bytes: 43 ASCII characters matching `[A-Za-z0-9_-]{43}`. Setup never
+puts it in a URL or command-line argument.
+
+Setup is idempotent. A later run reuses the stored Tenant and credential unless
+an explicit flag or environment override supplies a replacement.
+
+## 4. Run the bundled Hello workflow
 
 ```sh
-printf '%s  nickel\n' "$nickel_sha256" | shasum -a 256 --check
+./tickr examples run hello-world
 ```
 
-Then:
+If the local API is not running, this command verifies the SQLite migration,
+starts Tickr Lite for the example, waits for formation readiness, and stops its
+owned process afterward. If Tickr Lite is already running, it uses that process
+and leaves it running.
 
-```sh
-chmod 755 nickel
-./nickel --version
-```
-
-The version output must name Nickel 1.16.0.
-
-## 3. Create the private environment file
-
-Choose a durable state directory outside the extracted release. Replace the
-four values marked `REPLACE_ME`, then write `tickr-lite.env`:
-
-```sh
-cat > tickr-lite.env <<EOF
-export TICKR_HOME="$TICKR_HOME"
-export TICKR_STATE_DIR="$HOME/.local/share/tickr-lite"
-export TICKR_TENANT_SLUG="REPLACE_ME"
-export TICKR_CTRL_HTTP_URL="REPLACE_ME"
-export TICKR_CTRL_RELAY_URL="REPLACE_ME"
-export TICKR_CONTROL_PLANE_BEARER_TOKEN="REPLACE_ME"
-export TICKR_SQL_BACKEND="sqlite"
-export TICKR_SQL_TOPOLOGY="single-node"
-export TICKR_CONDUCTOR_SQLITE_URL="sqlite://$HOME/.local/share/tickr-lite/tickr.db"
-export TICKR_API_BIND_ADDR="127.0.0.1:6000"
-export TICKR_API_URL="http://127.0.0.1:6000"
-export TICKR_DSL_PATHS="$TICKR_HOME/dsl"
-export PATH="$TICKR_HOME:\$PATH"
-EOF
-chmod 600 tickr-lite.env
-```
-
-Reject blank values before continuing:
-
-```sh
-. ./tickr-lite.env
-case "$TICKR_TENANT_SLUG:$TICKR_CTRL_HTTP_URL:$TICKR_CTRL_RELAY_URL:$TICKR_CONTROL_PLANE_BEARER_TOKEN" in
-  *REPLACE_ME*|::*|:*:|:*) echo "Complete tickr-lite.env first" >&2; exit 2 ;;
-esac
-mkdir -p "$TICKR_STATE_DIR"
-chmod 700 "$TICKR_STATE_DIR"
-```
-`TICKR_CONTROL_PLANE_BEARER_TOKEN` is the canonical unpadded base64url encoding
-of exactly 32 random bytes: exactly 43 ASCII characters matching
-`[A-Za-z0-9_-]{43}`, whose decoded bytes re-encode to the identical text. Tickr
-does not trim it. When either Control-plane endpoint is configured, API and
-Conductor validate the token at startup and use the same value for live-state
-queries, the gate-index snapshot, the Pull cycle, and relay establishment. Keep
-it outside URLs, command-line arguments, logs, and committed files.
-
-Remote `TICKR_CTRL_HTTP_URL` and `TICKR_CTRL_RELAY_URL` values must use
-`https://` with normal certificate-chain and hostname verification.
-`TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK=true` is only for an explicit
-development loopback `http://` endpoint; it never permits non-loopback
-plaintext and never disables bearer authentication. Do not set it for this
-remote installation.
-
-The obsolete `TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL`
-variables are unsupported and ignored. When either new variable is absent,
-Tickr uses its existing loopback default.
-
-Every terminal or agent process operating this installation must first run:
-
-```sh
-cd "$TICKR_HOME"
-. ./tickr-lite.env
-```
-
-Do not mix environment files between tenants or releases.
-
-## 4. Initialize local state
-
-```sh
-./tickr migrate --formation tickr-lite
-```
-
-A successful first migration prints:
+The command registers the bundled Nickel source without copying or JSON-escaping
+it, waits for the definition to become `Ready`, triggers it, resolves the
+resulting Signal to a Run, waits for the `hello` Task, and reads its log. A
+successful run ends with:
 
 ```text
-conductor sqlite migrations applied and verified.
+Output:
+hello from Tickr
 ```
 
-The same command is safe to run before later starts; it verifies and applies
-only the migrations belonging to this binary.
-
-## 5. Start Tickr Lite
+## 5. Start Tickr Lite for ongoing use
 
 Keep this foreground process running:
 
@@ -193,91 +167,27 @@ Keep this foreground process running:
 ./tickr tickr-lite
 ```
 
-Use a second terminal for the remaining commands. Source the same environment
-file there:
+The saved setup profile is loaded automatically, and Tickr changes to the
+version-matched release directory before starting local roles. Open the
+embedded Console at <http://127.0.0.1:6000/>.
+
+For detailed health:
 
 ```sh
-cd /absolute/path/to/the/extracted/tickr-lite-directory
-. ./tickr-lite.env
-```
-
-Check the local API, SQLite repository, formation, and Control-plane connection:
-
-```sh
-curl -fsS "$TICKR_API_URL/api/health" |
+curl -fsS http://127.0.0.1:6000/api/health |
   jq '{api, data_plane_sql, control_plane, formation, readiness}'
 ```
 
 Continue only when `readiness.ready` is `true` and the Control-plane component
-reports healthy. Open the embedded Console at <http://127.0.0.1:6000/>.
+reports healthy.
 
-## 6. Register the Hello workflow
-
-Build the request as a file so the Nickel source is transmitted exactly:
-
-```sh
-jq -n --rawfile source "$TICKR_HOME/examples/hello-world.ncl" \
-  '{namespace:"default", nickel_source:$source}' \
-  > hello-register-request.json
-
-curl -fsS -X POST "$TICKR_API_URL/api/workflows/register" \
-  -H 'Content-Type: application/json' \
-  -d @hello-register-request.json |
-  tee hello-register-response.json
-
-hello_workflow_id="$(jq -er '.workflow_id' hello-register-response.json)"
-printf 'hello workflow_id=%s\n' "$hello_workflow_id"
-```
-
-Registration is asynchronous. Fetch its build state once:
+## 6. Register the runtime-Patch workflow
+The remaining runtime-Patch walkthrough uses the HTTP API directly:
 
 ```sh
-curl -fsS "$TICKR_API_URL/api/workflows" |
-  jq --arg id "$hello_workflow_id" \
-    '.[] | select(.id == $id) | {id, slug, version, build_status}'
+export TICKR_API_URL=http://127.0.0.1:6000
 ```
 
-`Ready` means the workflow can run. If it is still `Building`, run that single
-status command again later. Stop on `BuildFailed` and inspect the returned build
-diagnostic; do not trigger a failed definition.
-
-## 7. Trigger and inspect Hello
-
-```sh
-curl -fsS -X POST \
-  "$TICKR_API_URL/api/workflows/$hello_workflow_id/trigger" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"my first Tickr run"}' |
-  tee hello-trigger-response.json
-
-hello_signal_id="$(jq -er '.signal_id' hello-trigger-response.json)"
-printf 'hello signal_id=%s\n' "$hello_signal_id"
-```
-
-Resolve the asynchronous Signal once:
-
-```sh
-curl -fsS "$TICKR_API_URL/api/signals/$hello_signal_id" |
-  tee hello-signal-status.json |
-  jq '{status, workflow_instance_id}'
-```
-
-When the Signal is `materialized`, record the Run id and inspect its Tasks:
-
-```sh
-hello_run_id="$(jq -er '.workflow_instance_id' hello-signal-status.json)"
-curl -fsS "$TICKR_API_URL/api/workflows/instances/$hello_run_id/tasks" |
-  jq '.[] | {id, name, state, attempt}'
-```
-
-After `hello` reaches `Completed`, read its terminal log through the Console or
-the API Task-log endpoint. The log contains:
-
-```text
-hello from Tickr
-```
-
-## 8. Register the runtime-Patch workflow
 
 The second example starts as a three-Task chain:
 
@@ -315,7 +225,7 @@ curl -fsS "$TICKR_API_URL/api/workflows" |
     '.[] | select(.id == $id) | {id, slug, version, build_status}'
 ```
 
-## 9. Trigger and inspect the runtime Patch
+## 7. Trigger and inspect the runtime Patch
 
 Use any integer seed. The same seed always produces the same two arm lengths:
 
@@ -350,31 +260,18 @@ The added names are `left-step-01` through `left-step-N` and `right-step-01`
 through `right-step-M`. The two arms each remain sequential, execute in
 parallel with one another, and rejoin before `summarize-join`.
 
-## Agent operating contract
+## Operational boundaries
 
-An agent following this file must obey these rules:
-
-1. Work only in the extracted directory identified by `TICKR_HOME`.
-2. Source `tickr-lite.env` before every Tickr or API command; never print the
-   complete file in a report.
-3. Manage only the foreground `./tickr tickr-lite` process belonging to this
-   installation. Do not attempt to start, stop, repair, or reconfigure the
-   external Control plane.
-4. Register the exact checked-in `.ncl` source through a JSON request file.
-   Record every returned `workflow_id`, `signal_id`, and
-   `workflow_instance_id`; never guess identifiers from a prior run.
-5. Registration and triggering are asynchronous. Fetch status once and report
-   the observed state. Do not run an unbounded poll or promise a later update.
-6. Trigger only a workflow whose observed `build_status` is `Ready`.
-7. For progress, fetch Task state once. Read logs only when explicitly asked.
-   Use a bounded live-log query for a non-terminal Task and the query-free log
-   endpoint for a terminal Task.
-8. Stop on a non-success response, `BuildFailed`, `Rejected`, or a failed Task.
-   Preserve the response and report the exact failing identifier and state.
-9. Stop Tickr Lite with the foreground process's normal interrupt. Do not use a
-   broad process-name kill.
-10. Fail closed if `./tickr`, `./tickr-ctx`, `./INSTALL.md`, `./dsl/lib.ncl`,
-    `./examples/hello-world.ncl`, or `./tickr-lite.env` is absent.
+- The setup profile contains the Tenant credential. Keep
+  `$HOME/.config/tickr/config.json` private and never print or commit it.
+- Manage only the foreground `./tickr tickr-lite` process belonging to this
+  installation. Do not attempt to reconfigure the external Control plane.
+- Registration and triggering are asynchronous. Use the returned Workflow and
+  Signal identities; never guess identifiers from a prior run.
+- Stop on a non-success response, `BuildFailed`, `Rejected`, or a failed Task.
+  Preserve the response and report the exact failing identifier and state.
+- Stop Tickr Lite with its foreground process's normal interrupt. Do not use a
+  broad process-name kill.
 
 ## Stop Tickr Lite
 
@@ -383,14 +280,14 @@ waits for the Lite supervisor and its critical children to stop.
 
 ## Troubleshooting
 
-- **`failed to execute nickel export`** — confirm `nickel --version` reports
-  1.16.0 and `$TICKR_HOME` is at the front of `PATH`.
-- **`import lib.ncl` fails** — confirm
-  `TICKR_DSL_PATHS="$TICKR_HOME/dsl"` and `dsl/lib.ncl` exists.
-- **a Task cannot find `tickr-ctx`** — confirm `tickr-ctx` exists in
-  `$TICKR_HOME`, is executable, and `$TICKR_HOME` is on the Tickr process PATH.
-- **Nix rejects `path:./examples#...`** — start Tickr Lite from `$TICKR_HOME`
-  and confirm flakes are enabled.
+- **`failed to execute nickel export`** — confirm `$HOME/.nix-profile/bin` is
+  on `PATH` and `nickel --version` reports 1.16.0 or 1.17.0.
+- **`import lib.ncl` fails** — keep the extracted release intact and rerun
+  `./tickr setup` from that directory.
+- **a Task cannot find `tickr-ctx`** — confirm `tickr-ctx` remains executable
+  beside `tickr`.
+- **Nix rejects `path:./examples#...`** — confirm Flakes remain enabled; Tickr
+  automatically runs local roles from the version-matched release directory.
 - **registration remains `Building`** — fetch its build state once and inspect
   the diagnostic rather than triggering it.
 - **the Signal remains `pending`** — fetch the Signal once later; instance

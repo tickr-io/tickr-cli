@@ -6,9 +6,51 @@ sidebar_position: 2
 
 # Install Tickr Lite
 
-Use the archive published for your platform on [GitHub Releases](https://github.com/tickr-io/tickr-cli/releases). Download the adjacent `.sha256` file from the same release.
+## Install Nix
 
-## Verify and extract
+Use the
+[Determinate Nix Installer](https://install.determinate.systems/).
+
+On Linux:
+
+```bash
+curl -fsSL https://install.determinate.systems/nix |
+  sh -s -- install --determinate --no-confirm
+```
+
+On macOS:
+
+```bash
+curl -Lo Determinate.pkg \
+  https://install.determinate.systems/determinate-pkg/stable/Universal
+sudo installer -pkg ./Determinate.pkg -target /
+```
+
+Open a new terminal, then verify Nix and Flakes:
+
+```bash
+nix --version
+nix flake --help >/dev/null
+```
+
+## Install Nickel
+
+```bash
+nix profile add nixpkgs#nickel
+export PATH="$HOME/.nix-profile/bin:$PATH"
+command -v nickel
+nickel --version
+```
+
+Persist the same `PATH` entry in the shell's startup configuration if a new
+terminal does not retain it. Tickr 0.1.4 accepts Nickel 1.16.0 and 1.17.0;
+Nixpkgs currently installs Nickel 1.17.0.
+
+## Verify and extract Tickr Lite
+
+Use the archive published for your platform on
+[GitHub Releases](https://github.com/tickr-io/tickr-cli/releases). Download the
+adjacent `.sha256` file from the same release.
 
 On Linux:
 
@@ -26,90 +68,67 @@ tar -xzf tickr-lite-v*.tar.gz
 cd tickr-lite-v*-*
 ```
 
-Keep the extracted directory intact. It contains version-matched executables, Core DSL, Console assets, examples, and release notices.
+Keep the extracted directory intact. It contains version-matched executables,
+Core DSL, Console assets, examples, and release notices.
 
 ```bash
 export TICKR_HOME="$(pwd -P)"
 ```
 
-## Install Nickel
+## Configure Tickr Lite
 
-Tickr release line 0.1 validates workflow and runtime-Patch source with Nickel 1.16.0. Follow the platform-specific download and checksum values in the archive's `INSTALL.md`, place the executable at `$TICKR_HOME/nickel`, then confirm:
-
-```bash
-chmod 755 ./nickel
-./nickel --version
-```
-
-The output must name Nickel 1.16.0.
-
-## Create the private environment
-
-Replace the three `REPLACE_ME` values with the values from your operator:
+Run setup from the extracted release directory:
 
 ```bash
-cat > tickr-lite.env <<EOF
-export TICKR_HOME="$TICKR_HOME"
-export TICKR_STATE_DIR="$HOME/.local/share/tickr-lite"
-export TICKR_TENANT_SLUG="REPLACE_ME"
-export TICKR_CTRL_HTTP_URL="REPLACE_ME"
-export TICKR_CTRL_RELAY_URL="REPLACE_ME"
-export TICKR_SQL_BACKEND="sqlite"
-export TICKR_SQL_TOPOLOGY="single-node"
-export TICKR_CONDUCTOR_SQLITE_URL="sqlite://$HOME/.local/share/tickr-lite/tickr.db"
-export TICKR_API_BIND_ADDR="127.0.0.1:6000"
-export TICKR_API_URL="http://127.0.0.1:6000"
-export TICKR_DSL_PATHS="$TICKR_HOME/dsl"
-export PATH="$TICKR_HOME:\$PATH"
-EOF
-chmod 600 tickr-lite.env
+./tickr setup
 ```
 
-Load and validate it:
-
-```bash
-. ./tickr-lite.env
-case "$TICKR_TENANT_SLUG:$TICKR_CTRL_HTTP_URL:$TICKR_CTRL_RELAY_URL" in
-  *REPLACE_ME*|::*|:*:|:*) echo "Complete tickr-lite.env first" >&2; exit 2 ;;
-esac
-mkdir -p "$TICKR_STATE_DIR"
-chmod 700 "$TICKR_STATE_DIR"
-```
-The obsolete `TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL`
-variables are unsupported and ignored. When either new variable is absent, Tickr
-uses its existing loopback default.
-
-Every terminal or agent operating this installation must first change to `$TICKR_HOME` and source this file.
-
-## Initialize local state
-
-```bash
-./tickr migrate --formation tickr-lite
-```
-
-The migration is idempotent. A successful first migration prints:
+Setup verifies Nix Flakes and a supported Nickel version, then prompts for the
+Tenant slug,
+the Tenant credential with terminal echo disabled, and a data directory. Press
+Enter to accept the recommended data directory:
 
 ```text
-conductor sqlite migrations applied and verified.
+$HOME/.local/share/tickr-lite
 ```
 
-## Start Tickr Lite
+The private-beta Control-plane endpoints are selected automatically. Setup
+stores the profile at `$HOME/.config/tickr/config.json` with mode `0600`,
+creates the data directory with mode `0700`, and applies the Tickr Lite SQLite
+migrations. Later Tickr Lite commands load the profile automatically; no
+environment file needs to be sourced.
+Tickr prepends the extracted release directory to its inherited `PATH`, making
+the packaged `tickr-ctx` executable available to runtime-Patch Tasks while
+retaining the Nix profile entries.
 
-Keep this process in the foreground:
+For non-interactive setup, use a credential file rather than a command-line
+token:
+
+```bash
+./tickr setup \
+  --tenant-slug acme-demo \
+  --token-file /secure/path/tickr-tenant-token \
+  --data-dir "$HOME/.local/share/tickr-lite"
+```
+
+## Run the first example
+
+Continue with the bundled Hello workflow:
+
+```bash
+./tickr examples run hello-world
+```
+
+The command starts Tickr Lite when necessary and waits for every asynchronous
+transition through terminal Task output.
+
+## Start Tickr Lite for ongoing use
+
+After the guided example, keep Tickr Lite running with:
 
 ```bash
 ./tickr tickr-lite
 ```
 
-In a second terminal, source the same environment and inspect health once:
-
-```bash
-cd "$TICKR_HOME"
-. ./tickr-lite.env
-curl -fsS "$TICKR_API_URL/api/health" |
-  jq '{api, data_plane_sql, control_plane, formation, readiness}'
-```
-
-Continue only when `readiness.ready` is `true` and the Control-plane component is healthy. Open the embedded Console at [http://127.0.0.1:6000/](http://127.0.0.1:6000/).
-
-Next: [Run the Hello workflow](./first-run.md).
+The saved profile is loaded automatically. Open the embedded Console at
+[http://127.0.0.1:6000/](http://127.0.0.1:6000/).
