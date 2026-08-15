@@ -183,10 +183,13 @@ pub(crate) fn load_and_apply_profile() -> Result<Option<SetupProfile>> {
     Ok(profile)
 }
 
-pub(crate) fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<PathBuf> {
+pub(crate) fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<Option<PathBuf>> {
     let release_home = match profile {
         Some(profile) => profile.release_home().to_owned(),
-        None => resolve_release_home(None)?,
+        None => match env::var_os("TICKR_HOME") {
+            Some(path) => PathBuf::from(path),
+            None => return Ok(None),
+        },
     };
     verify_release_resources(&release_home)?;
     env::set_current_dir(&release_home).with_context(|| {
@@ -195,7 +198,7 @@ pub(crate) fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<P
             release_home.display()
         )
     })?;
-    Ok(release_home)
+    Ok(Some(release_home))
 }
 
 fn load_profile() -> Result<Option<SetupProfile>> {
@@ -632,6 +635,21 @@ mod tests {
             supported_nickel_version("nickel-lang-cli nickel 1.18.0"),
             None
         );
+    }
+
+    #[test]
+    fn profile_less_lite_start_does_not_require_release_resources() {
+        let _lock = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = env::var_os("TICKR_HOME");
+        env::remove_var("TICKR_HOME");
+
+        assert_eq!(change_to_release_home(None).unwrap(), None);
+
+        if let Some(previous) = previous {
+            env::set_var("TICKR_HOME", previous);
+        }
     }
 
     #[test]
