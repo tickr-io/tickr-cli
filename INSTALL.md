@@ -18,6 +18,7 @@ Obtain these values from the operator of the Control plane:
 - the tenant slug;
 - the Control-plane HTTP subquery channel URL;
 - the Control-plane Conductor relay URL.
+- the Tenant bearer token supplied for both channels.
 
 Install these host tools:
 
@@ -110,7 +111,7 @@ The version output must name Nickel 1.16.0.
 ## 3. Create the private environment file
 
 Choose a durable state directory outside the extracted release. Replace the
-three values marked `REPLACE_ME`, then write `tickr-lite.env`:
+four values marked `REPLACE_ME`, then write `tickr-lite.env`:
 
 ```sh
 cat > tickr-lite.env <<EOF
@@ -119,6 +120,7 @@ export TICKR_STATE_DIR="$HOME/.local/share/tickr-lite"
 export TICKR_TENANT_SLUG="REPLACE_ME"
 export TICKR_CTRL_HTTP_URL="REPLACE_ME"
 export TICKR_CTRL_RELAY_URL="REPLACE_ME"
+export TICKR_CONTROL_PLANE_BEARER_TOKEN="REPLACE_ME"
 export TICKR_SQL_BACKEND="sqlite"
 export TICKR_SQL_TOPOLOGY="single-node"
 export TICKR_CONDUCTOR_SQLITE_URL="sqlite://$HOME/.local/share/tickr-lite/tickr.db"
@@ -134,15 +136,30 @@ Reject blank values before continuing:
 
 ```sh
 . ./tickr-lite.env
-case "$TICKR_TENANT_SLUG:$TICKR_CTRL_HTTP_URL:$TICKR_CTRL_RELAY_URL" in
+case "$TICKR_TENANT_SLUG:$TICKR_CTRL_HTTP_URL:$TICKR_CTRL_RELAY_URL:$TICKR_CONTROL_PLANE_BEARER_TOKEN" in
   *REPLACE_ME*|::*|:*:|:*) echo "Complete tickr-lite.env first" >&2; exit 2 ;;
 esac
 mkdir -p "$TICKR_STATE_DIR"
 chmod 700 "$TICKR_STATE_DIR"
 ```
+`TICKR_CONTROL_PLANE_BEARER_TOKEN` is the canonical unpadded base64url encoding
+of exactly 32 random bytes: exactly 43 ASCII characters matching
+`[A-Za-z0-9_-]{43}`, whose decoded bytes re-encode to the identical text. Tickr
+does not trim it. When either Control-plane endpoint is configured, API and
+Conductor validate the token at startup and use the same value for live-state
+queries, the gate-index snapshot, the Pull cycle, and relay establishment. Keep
+it outside URLs, command-line arguments, logs, and committed files.
+
+Remote `TICKR_CTRL_HTTP_URL` and `TICKR_CTRL_RELAY_URL` values must use
+`https://` with normal certificate-chain and hostname verification.
+`TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK=true` is only for an explicit
+development loopback `http://` endpoint; it never permits non-loopback
+plaintext and never disables bearer authentication. Do not set it for this
+remote installation.
+
 The obsolete `TICKR_COORDINATOR_HTTP_URL` and `TICKR_COORDINATOR_RELAY_URL`
-variables are unsupported and ignored. When either new variable is absent, Tickr
-uses its existing loopback default.
+variables are unsupported and ignored. When either new variable is absent,
+Tickr uses its existing loopback default.
 
 Every terminal or agent process operating this installation must first run:
 

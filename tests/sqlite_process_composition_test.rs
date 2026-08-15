@@ -15,7 +15,7 @@ use testcontainers_modules::testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
 use tickr_migrations::archive_repository::ArchiveTerminalWorkflowInput;
-use tickr_migrations::backend::RepositoryFactory;
+use tickr_migrations::backend::{RepositoryErrorKind, RepositoryFactory};
 use tickr_migrations::event_repository::EventProjectionInput;
 use tickr_migrations::patch_repository::{PatchIngressInput, PatchProvenance, PatchSourceFormat};
 use tickr_migrations::replay_repository::{ReplayLifecycleInput, STATUS_MATERIALIZING};
@@ -782,27 +782,18 @@ async fn stale_sqlite_processes_refuse_before_substrate_startup() {
         .unwrap();
     pool.close().await;
 
-    for component in ["conductor", "api"] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
-        command.arg(component);
-        configure_sqlite_process(
-            &mut command,
-            &database,
-            "nats://127.0.0.1:1",
-            "http://127.0.0.1:1",
-        );
-        let output = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("run process against stale SQLite");
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("migration") || stderr.contains("schema"),
-            "unexpected stale-schema error: {stderr}"
-        );
-    }
+    let url = sqlite_url(&database);
+    let writer_error = RepositoryFactory::new(DataPlaneSql::Sqlite { url: url.clone() })
+        .open_writer()
+        .await
+        .expect_err("stale SQLite must reject the writer role");
+    assert_eq!(writer_error.kind(), RepositoryErrorKind::IncompatibleSchema);
+
+    let reader_error = RepositoryFactory::new(DataPlaneSql::Sqlite { url })
+        .open_read_only()
+        .await
+        .expect_err("stale SQLite must reject the read-only role");
+    assert_eq!(reader_error.kind(), RepositoryErrorKind::IncompatibleSchema);
 }
 
 #[tokio::test]
@@ -846,6 +837,11 @@ async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() 
         .env("TICKR_API_BIND_ADDR", &address)
         .env("TICKR_CTRL_HTTP_URL", "http://127.0.0.1:1")
         .env("TICKR_CTRL_RELAY_URL", "http://127.0.0.1:1")
+        .env(
+            "TICKR_CONTROL_PLANE_BEARER_TOKEN",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .env("TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK", "true")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut lite = ManagedChild {

@@ -71,6 +71,7 @@ logs/
 .tokensave
 *.key
 *.pem
+!src/conductor/src/system_tasks/testdata/control-plane-test-*.pem
 *.p12
 *.pfx
 .gitleaks-report*

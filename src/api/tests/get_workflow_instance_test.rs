@@ -200,7 +200,8 @@ async fn control_plane_client_decodes_live_response() -> Result<(), Box<dyn std:
     })
     .await;
 
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let response = client.get_workflow_instance(live_id).await?;
     assert_eq!(response.id, live_id.to_string());
     assert_eq!(response.state, "InProgress");
@@ -218,7 +219,8 @@ async fn control_plane_client_surfaces_503_as_server_error(
     })
     .await;
 
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await
@@ -238,13 +240,14 @@ async fn control_plane_client_maps_404_to_not_found() -> Result<(), Box<dyn std:
     })
     .await;
 
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await
         .expect_err("expected NotFound");
     assert!(
-        matches!(err, ControlPlaneClientError::NotFound(_)),
+        matches!(err, ControlPlaneClientError::NotFound),
         "got {:?}",
         err
     );
@@ -260,7 +263,13 @@ async fn control_plane_client_times_out_on_slow_control_plane(
     })
     .await;
 
-    let client = ControlPlaneClient::with_timeout(base, Duration::from_millis(100));
+    let client = ControlPlaneClient::with_timeout(
+        base,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+        Duration::from_millis(100),
+    )
+    .unwrap();
     let err = client
         .get_workflow_instance(Uuid::new_v4())
         .await

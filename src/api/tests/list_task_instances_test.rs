@@ -161,7 +161,8 @@ async fn control_plane_client_decodes_live_task_list() -> Result<(), Box<dyn std
     })
     .await;
 
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let live = client.list_task_instances(Uuid::new_v4()).await?;
     assert_eq!(live.len(), 2);
     Ok(())

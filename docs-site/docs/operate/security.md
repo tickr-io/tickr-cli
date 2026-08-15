@@ -28,6 +28,24 @@ Tickr Lite binds the API and Console to `127.0.0.1` by default. Keep the state d
 
 Do not expose a loopback-oriented installation by changing only `TICKR_API_BIND_ADDR`. Network exposure requires the complete authentication, TLS, origin, and authorization boundary.
 
+## Control-plane connection boundary
+
+Data-plane API and Conductor processes authenticate every protected
+Control-plane HTTP or relay connection with
+`TICKR_CONTROL_PLANE_BEARER_TOKEN`. Remote endpoints require `https://` and
+standard certificate-chain and hostname verification. The only plaintext
+exception is an explicitly enabled development loopback endpoint; it does not
+disable bearer authentication.
+
+Deployment owns the public TLS endpoint, certificates, private networking, and
+secret delivery. The Frontend keeps its HTTP and gRPC listeners private
+plaintext, receives only decrypted application traffic plus the bearer
+credential, and receives no certificate. Deployment must restrict the token and
+the `TICKR_CTRL_CREDENTIALS_FILE` authority file to the relevant service
+identities. Application code validates the exact token grammar, strict authority
+schema, credential lifecycle, and Tenant binding; authority changes take effect
+on a controlled Frontend restart.
+
 ## Task isolation
 
 Task processes receive scoped Tickr context rather than direct access to SQLite or Redis. Preserve that boundary: workflow Tasks should not receive formation-level database, broker, object-store, or Coordination-role credentials.

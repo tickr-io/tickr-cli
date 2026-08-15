@@ -13,7 +13,9 @@ use once_cell::sync::Lazy;
 use tickr_proto::TenantId;
 
 use crate::gate_index::GateIndex;
-use crate::relay::dispatch_gates::{list_dispatched_gates, DispatchGatesError};
+use crate::relay::dispatch_gates::{
+    list_dispatched_gates, DispatchGatesClient, DispatchGatesError,
+};
 
 static GATE_INDEX: Lazy<GateIndex> = Lazy::new(GateIndex::new);
 
@@ -31,26 +33,19 @@ pub fn gate_index() -> GateIndex {
 /// single `replace_all` call so concurrent readers don't observe a
 /// partial index.
 ///
-/// Control-plane HTTP-channel failures (timeout / unreachable / non-2xx) degrade
-/// to an empty rebuild — the next inbound `DispatchPrecondition`
-/// from the server will restock the index. This matches the
-/// graceful-degradation behaviour the conductor uses for every other
-/// cluster-query subquery.
-pub async fn rebuild_from_server(control_plane_http_url: &str, tenant: TenantId) -> usize {
-    let dispatched = match list_dispatched_gates(control_plane_http_url, tenant).await {
-        Ok(d) => d,
-        Err(DispatchGatesError::Timeout) | Err(DispatchGatesError::Unreachable(_)) => {
-            eprintln!(
-                "gate_index rebuild: Control-plane HTTP channel unreachable; rebuilding to empty (next DispatchPrecondition restocks)"
-            );
-            Vec::new()
-        }
-        Err(e) => {
-            eprintln!(
-                "gate_index rebuild: Control-plane HTTP channel returned error; rebuilding to empty: {}",
-                e
-            );
-            Vec::new()
+/// Any Control-plane HTTP-channel failure clears the stale index and is returned
+/// as a typed degraded outcome. Authentication and Tenant-binding rejection
+/// therefore cannot be mistaken for a healthy empty snapshot; the next inbound
+/// `DispatchPrecondition` can still restock the index.
+pub async fn rebuild_from_server(
+    client: &DispatchGatesClient,
+    tenant: TenantId,
+) -> Result<usize, DispatchGatesError> {
+    let dispatched = match list_dispatched_gates(client, tenant).await {
+        Ok(dispatched) => dispatched,
+        Err(error) => {
+            GATE_INDEX.replace_all(Vec::new());
+            return Err(error);
         }
     };
     let count = dispatched.len();
@@ -67,5 +62,5 @@ pub async fn rebuild_from_server(control_plane_http_url: &str, tenant: TenantId)
         })
         .collect();
     GATE_INDEX.replace_all(entries);
-    count
+    Ok(count)
 }

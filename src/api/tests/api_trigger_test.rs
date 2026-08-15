@@ -202,7 +202,10 @@ async fn spawn_api(nats: NatsClient, pool: Arc<sqlx::PgPool>) -> String {
     let control_plane = Arc::new(
         tickr_api::http::control_plane_client::ControlPlaneClient::new(
             "http://127.0.0.1:1".to_string(),
-        ),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            true,
+        )
+        .unwrap(),
     );
     let s3 = opendal::services::S3::default()
         .bucket("ignored")

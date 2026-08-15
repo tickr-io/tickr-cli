@@ -15,6 +15,8 @@ These variables configure released runtime behavior. Test helpers and variables 
 | `TICKR_TENANT_SLUG` | All | Tenant identity |
 | `TICKR_CTRL_HTTP_URL` | All | Control-plane HTTP subquery channel URL |
 | `TICKR_CTRL_RELAY_URL` | All | Control-plane Conductor relay URL |
+| `TICKR_CONTROL_PLANE_BEARER_TOKEN` | API/Conductor/Lite | Canonical 43-character Tenant bearer token for protected HTTP and relay traffic |
+| `TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK` | API/Conductor/Lite | Exact `true` permits development loopback `http://` only |
 | `TICKR_API_BIND_ADDR` | API/Lite | HTTP bind address |
 | `TICKR_DSL_PATHS` | Conductor/Lite | Core DSL import paths |
 | `TICKR_EXECUTOR_CONCURRENCY` | Executor/Lite | Concurrent Task process slots |
@@ -26,6 +28,29 @@ These variables configure released runtime behavior. Test helpers and variables 
 unsupported, and ignored. Set the `TICKR_CTRL_*` replacements explicitly for a
 remote Control plane. If either replacement is absent, Tickr retains its existing
 loopback default for that channel.
+
+### Control-plane connection security
+
+`TICKR_CONTROL_PLANE_BEARER_TOKEN` must be the canonical unpadded base64url
+encoding of exactly 32 random bytes: exactly 43 ASCII characters matching
+`[A-Za-z0-9_-]{43}` and unchanged by decode then re-encode. The value is
+validated without trimming at process startup whenever a Control-plane endpoint
+is configured. Both endpoints otherwise require `https://` with normal
+certificate-chain and hostname verification. The loopback opt-in never allows
+non-loopback plaintext and never bypasses authentication.
+
+The Control-plane Frontend selects its authority with required
+`TICKR_CTRL_CREDENTIALS_FILE`. The readable regular file is strict UTF-8 JSON
+with exactly `{"schema_version":1,"credentials":[...]}` at the top level and at
+least one record. Each record has exactly `token_sha256`, `tenant_id`,
+`expires_at`, and `revoked`: the digest is 64 lowercase hexadecimal characters
+containing SHA-256 of the token's exact ASCII bytes, the Tenant ID is a
+canonical UUID string, expiry is RFC 3339, and revocation is a JSON boolean.
+Unknown, missing, extra, duplicate, raw-token, malformed, unsupported-version,
+or empty-list input rejects Frontend startup before listeners bind. Authority
+changes require a controlled Frontend restart. Secret delivery and ACLs are
+deployment responsibilities; the application checks readability and
+regular-file type, not mode bits or platform ACLs.
 
 ## SQL
 

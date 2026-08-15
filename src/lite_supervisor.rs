@@ -193,6 +193,8 @@ impl LiteSupervisor {
     }
 
     pub async fn run(self) -> Result<()> {
+        let relay_config = tickr_conductor::config::ControlPlaneRelayConfig::from_env()
+            .context("validating Tickr Lite Control-plane relay client")?;
         let selection =
             tickr_proto::config::data_plane_sql().context("resolving Tickr Lite data-plane SQL")?;
         let DataPlaneSql::Sqlite { url } = &selection else {
@@ -439,7 +441,12 @@ impl LiteSupervisor {
             after_admission(
                 work_admission_rx.clone(),
                 self.cancel.child_token(),
-                run_streaming_lite(self.cancel.child_token(), writer.clone(), relay_roles),
+                run_streaming_lite(
+                    self.cancel.child_token(),
+                    relay_config,
+                    writer.clone(),
+                    relay_roles,
+                ),
             ),
         );
         spawn_child(

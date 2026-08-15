@@ -122,7 +122,8 @@ async fn control_plane_client_decodes_list_of_instances() -> Result<(), Box<dyn 
     })
     .await;
 
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let live = client.list_workflow_instances(wf).await?;
     assert_eq!(live.len(), 2);
     Ok(())
@@ -139,7 +140,13 @@ async fn control_plane_timeout_surfaces_as_typed_error() -> Result<(), Box<dyn s
     // The handler degrades to archive-only on any Control-plane HTTP error; this asserts
     // the client surfaces the timeout the handler keys its `live_data_available:
     // false` branch off of.
-    let client = ControlPlaneClient::with_timeout(base, Duration::from_millis(100));
+    let client = ControlPlaneClient::with_timeout(
+        base,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+        Duration::from_millis(100),
+    )
+    .unwrap();
     let err = client
         .list_workflow_instances(Uuid::new_v4())
         .await

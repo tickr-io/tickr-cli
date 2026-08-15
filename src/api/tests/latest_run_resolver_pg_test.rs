@@ -89,8 +89,13 @@ async fn resolves_latest_terminal_per_workflow_from_archive(
     .await;
 
     // Unreachable coordinator → archive-only selected-repository result.
-    let control_plane =
-        ControlPlaneClient::with_timeout("http://127.0.0.1:1", Duration::from_millis(150));
+    let control_plane = ControlPlaneClient::with_timeout(
+        "http://127.0.0.1:1",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+        Duration::from_millis(150),
+    )
+    .unwrap();
     let repository = ReadOnlyRepositoryBundle::from_postgres_pool(pool.clone());
 
     let wf_never = Uuid::new_v4();
