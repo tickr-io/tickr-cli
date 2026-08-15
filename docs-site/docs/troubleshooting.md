@@ -28,6 +28,28 @@ Check:
 
 `/api/health` remains available while work-producing routes are closed.
 
+## The Control-plane connection is rejected
+
+Confirm both `TICKR_CTRL_HTTP_URL` and `TICKR_CTRL_RELAY_URL` use `https://` for
+a remote Control plane and that the public hostname matches its certificate.
+An untrusted chain or hostname mismatch is a transport failure; do not disable
+verification. Plaintext is admitted only for an explicit loopback endpoint when
+`TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK=true`.
+
+`401 Unauthorized` or gRPC `UNAUTHENTICATED` means the bearer credential is
+missing, malformed, unknown, expired, or revoked. `403 Forbidden` or gRPC
+`PERMISSION_DENIED` means the credential is valid but bound to another Tenant.
+Verify the secret source without printing its value. The token must be exactly
+43 canonical unpadded base64url characters and is never trimmed.
+
+The Data-plane token is read at process startup. The Frontend authority selected
+by `TICKR_CTRL_CREDENTIALS_FILE` is loaded before listeners bind and remains an
+immutable snapshot; after an approved authority-file change, perform a
+controlled Frontend restart. Deployment owns secret delivery and file ACLs.
+Application code owns token grammar, authority schema, authentication, and
+Tenant binding; it does not receive certificates or configure the external TLS
+edge.
+
 ## The data directory is locked
 
 Only one Tickr Lite process can own a state directory. Stop the existing owner cleanly. Do not delete lock or manifest files to bypass admission.

@@ -7,3 +7,9 @@ paths = [
   '''(^|/)(target|node_modules|dist|infra|logs|\.pi-subagents)(/|$)''',
   '''^docs-site/(\.docusaurus|build|docs/api)(/|$)''',
 ]
+
+[[allowlists]]
+description = "Static localhost TLS test fixtures contain no production secrets"
+paths = [
+  '''^src/conductor/src/system_tasks/testdata/control-plane-test-(ca|server|server-key)\.pem$''',
+]

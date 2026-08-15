@@ -1,7 +1,9 @@
 //! Implementation of relay service for conductor
 
+use crate::config::ControlPlaneRelayConfig;
 use crate::proto::conductor_relay_service_client::ConductorRelayServiceClient;
 use crate::proto::{ConductorRelayMessage, EntityType};
+use crate::relay::dispatch_gates::{DispatchGatesClient, DispatchGatesError};
 use crate::signal_applied_notifier::SignalAppliedNotifier;
 use crate::system_tasks::build_ack;
 use crate::system_tasks::compaction_drain::{
@@ -11,8 +13,9 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use async_nats::HeaderMap;
 use async_stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use prost::Message;
+use std::error::Error as StdError;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tickr_proto::codec::compaction::decode_envelope;
@@ -34,7 +37,8 @@ use tickr_proto::TenantId;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::{Code, Request, Status, Streaming};
 use uuid::Uuid;
 
 // Global channel for sending relay messages
@@ -47,6 +51,113 @@ const LOOKUP_INTEGRITY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const OUTCOME_SWEEP_BATCH: usize = 64;
 const OUTCOME_ELECTION_RETRIES: usize = 8;
 const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";
+
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+enum RelayEstablishmentError {
+    #[error("Control-plane relay authentication rejected")]
+    Unauthenticated,
+    #[error("Control-plane relay Tenant binding rejected")]
+    Forbidden,
+    #[error("Control-plane relay connection timed out")]
+    Timeout,
+    #[error("Control-plane relay TLS handshake failed")]
+    TlsHandshake,
+    #[error("Control-plane relay peer unavailable")]
+    Unavailable,
+    #[error("Control-plane relay protocol rejected the stream")]
+    Protocol,
+}
+
+fn classify_transport_error(
+    error: tonic::transport::Error,
+    uses_tls: bool,
+) -> RelayEstablishmentError {
+    let mut source: Option<&(dyn StdError + 'static)> = Some(&error);
+    while let Some(current) = source {
+        if current.downcast_ref::<rustls::Error>().is_some() {
+            return RelayEstablishmentError::TlsHandshake;
+        }
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return RelayEstablishmentError::Timeout;
+        }
+        if uses_tls {
+            let diagnostic = current.to_string().to_ascii_lowercase();
+            if diagnostic.contains("certificate")
+                || diagnostic.contains("tls")
+                || diagnostic.contains("handshake")
+            {
+                return RelayEstablishmentError::TlsHandshake;
+            }
+        }
+        source = current.source();
+    }
+    RelayEstablishmentError::Unavailable
+}
+
+fn classify_relay_status(status: Status) -> RelayEstablishmentError {
+    match status.code() {
+        Code::Unauthenticated => RelayEstablishmentError::Unauthenticated,
+        Code::PermissionDenied => RelayEstablishmentError::Forbidden,
+        Code::DeadlineExceeded => RelayEstablishmentError::Timeout,
+        Code::Unavailable => RelayEstablishmentError::Unavailable,
+        _ => RelayEstablishmentError::Protocol,
+    }
+}
+
+async fn connect_relay_client(
+    config: &ControlPlaneRelayConfig,
+) -> Result<ConductorRelayServiceClient<Channel>, RelayEstablishmentError> {
+    let mut endpoint = Channel::from_shared(config.endpoint().to_owned())
+        .map_err(|_| RelayEstablishmentError::Unavailable)?;
+    if config.uses_tls() {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map_err(|error| classify_transport_error(error, true))?;
+    }
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|error| classify_transport_error(error, config.uses_tls()))?;
+    Ok(ConductorRelayServiceClient::new(channel))
+}
+
+#[cfg(test)]
+async fn connect_relay_client_with_tls(
+    config: &ControlPlaneRelayConfig,
+    tls: ClientTlsConfig,
+) -> Result<ConductorRelayServiceClient<Channel>, RelayEstablishmentError> {
+    let endpoint = Channel::from_shared(config.endpoint().to_owned())
+        .map_err(|_| RelayEstablishmentError::Unavailable)?
+        .tls_config(tls)
+        .map_err(|error| classify_transport_error(error, true))?;
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|error| classify_transport_error(error, true))?;
+    Ok(ConductorRelayServiceClient::new(channel))
+}
+
+async fn establish_relay_stream<S>(
+    client: &mut ConductorRelayServiceClient<Channel>,
+    outbound: S,
+    config: &ControlPlaneRelayConfig,
+) -> Result<Streaming<ConductorRelayMessage>, RelayEstablishmentError>
+where
+    S: Stream<Item = ConductorRelayMessage> + Send + 'static,
+{
+    let mut request = Request::new(outbound);
+    request
+        .metadata_mut()
+        .insert("authorization", config.authorization());
+    client
+        .stream_conductor_relay(request)
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(classify_relay_status)
+}
 
 /// Inject the relay-tx slot directly. Production sets it via `run_streaming`
 /// once the gRPC stream is established; integration tests that don't want
@@ -1494,15 +1605,47 @@ enum CompactionStagingRole {
     Selected(Arc<dyn CompactionStaging>),
 }
 
+async fn rebuild_gate_index_for_reconnect(client: &DispatchGatesClient, tenant: TenantId) {
+    match crate::gate_index_lifecycle::rebuild_from_server(client, tenant).await {
+        Ok(0) => {}
+        Ok(count) => {
+            println!("gate_index rebuild: repopulated {count} dispatched gate(s) from server");
+        }
+        Err(DispatchGatesError::Unauthenticated) => {
+            eprintln!("gate_index rebuild: Control-plane authentication rejected; index degraded to empty");
+        }
+        Err(DispatchGatesError::Forbidden) => {
+            eprintln!("gate_index rebuild: Control-plane Tenant binding rejected; index degraded to empty");
+        }
+        Err(DispatchGatesError::Timeout) => {
+            eprintln!(
+                "gate_index rebuild: Control-plane snapshot timed out; index degraded to empty"
+            );
+        }
+        Err(DispatchGatesError::Unavailable) => {
+            eprintln!("gate_index rebuild: Control-plane snapshot peer unavailable; index degraded to empty");
+        }
+        Err(error) => {
+            eprintln!("gate_index rebuild: {error}; index degraded to empty");
+        }
+    }
+}
+
 pub async fn run_streaming(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    gate_snapshot_client: DispatchGatesClient,
+    tenant: TenantId,
 ) -> Result<()> {
     run_streaming_with_role_selection(
         shutdown_token,
+        relay_config,
         definition_repository,
         signal_applied_notifier,
+        gate_snapshot_client,
+        tenant,
         TaskEventRoles::AllNats,
         TaskDispatchRole::AllNats,
         TaskCancellationRoles::AllNats,
@@ -1513,15 +1656,21 @@ pub async fn run_streaming(
 
 pub async fn run_streaming_with_task_events(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     task_event_consumer: Arc<dyn TaskEventConsumer>,
     task_event_writer: Arc<dyn TaskEventWriter>,
     signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    gate_snapshot_client: DispatchGatesClient,
+    tenant: TenantId,
 ) -> Result<()> {
     run_streaming_with_role_selection(
         shutdown_token,
+        relay_config,
         definition_repository,
         signal_applied_notifier,
+        gate_snapshot_client,
+        tenant,
         TaskEventRoles::Selected {
             consumer: task_event_consumer,
             writer: task_event_writer,
@@ -1534,6 +1683,7 @@ pub async fn run_streaming_with_task_events(
 }
 pub async fn run_streaming_with_roles(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     task_event_consumer: Arc<dyn TaskEventConsumer>,
     task_event_writer: Arc<dyn TaskEventWriter>,
@@ -1542,11 +1692,16 @@ pub async fn run_streaming_with_roles(
     cancellation_acknowledgements: Arc<dyn TaskCancellationAckConsumer>,
     compaction_staging: Arc<dyn CompactionStaging>,
     signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    gate_snapshot_client: DispatchGatesClient,
+    tenant: TenantId,
 ) -> Result<()> {
     run_streaming_with_role_selection(
         shutdown_token,
+        relay_config,
         definition_repository,
         signal_applied_notifier,
+        gate_snapshot_client,
+        tenant,
         TaskEventRoles::Selected {
             consumer: task_event_consumer,
             writer: task_event_writer,
@@ -1563,8 +1718,11 @@ pub async fn run_streaming_with_roles(
 
 async fn run_streaming_with_role_selection(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
+    gate_snapshot_client: DispatchGatesClient,
+    tenant: TenantId,
     task_events: TaskEventRoles,
     task_dispatch: TaskDispatchRole,
     task_cancellation: TaskCancellationRoles,
@@ -1583,9 +1741,12 @@ async fn run_streaming_with_role_selection(
             return Ok(());
         }
 
+        rebuild_gate_index_for_reconnect(&gate_snapshot_client, tenant).await;
+
         let started = Instant::now();
         match try_run_streaming(
             shutdown_token.clone(),
+            &relay_config,
             Arc::clone(&definition_repository),
             Arc::clone(&signal_applied_notifier),
             task_events.clone(),
@@ -1627,6 +1788,7 @@ async fn run_streaming_with_role_selection(
 /// or a transport error occurs. Caller (`run_streaming`) decides whether to retry.
 async fn try_run_streaming(
     shutdown_token: CancellationToken,
+    relay_config: &ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     signal_applied_notifier: Arc<dyn SignalAppliedNotifier>,
     task_events: TaskEventRoles,
@@ -1685,11 +1847,9 @@ async fn try_run_streaming(
         .await
         .map_err(anyhow::Error::msg)?;
 
-    // Connect to the configured Control-plane Conductor relay endpoint.
-    let channel = Channel::from_shared(tickr_proto::config::ctrl_relay_url())?
-        .connect()
-        .await?;
-    let mut client = ConductorRelayServiceClient::new(channel);
+    // The endpoint policy was admitted before the runtime started. HTTPS
+    // activates standard Web-PKI roots and verifies the URI hostname.
+    let mut client = connect_relay_client(relay_config).await?;
 
     // Create channel for bidirectional communication
     let (tx, rx) = mpsc::channel::<ConductorRelayMessage>(32);
@@ -1771,8 +1931,7 @@ async fn try_run_streaming(
         }
     };
 
-    let response = client.stream_conductor_relay(outbound).await?;
-    let mut inbound = response.into_inner();
+    let mut inbound = establish_relay_stream(&mut client, outbound, relay_config).await?;
     let nats_clone = nats.clone();
     let task_dispatch_clone = task_dispatch.clone();
     let compaction_staging_clone = compaction_staging.clone();
@@ -2133,14 +2292,15 @@ pub trait LiteRelayRoles: Send + Sync {
 /// bounded retry behavior and never reinterpret local durable state.
 pub async fn run_streaming_lite(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     roles: Arc<dyn LiteRelayRoles>,
 ) -> Result<()> {
     run_streaming_lite_at(
         shutdown_token,
+        relay_config,
         definition_repository,
         roles,
-        tickr_proto::config::ctrl_relay_url(),
         TenantId::from_env().to_string(),
     )
     .await
@@ -2148,9 +2308,9 @@ pub async fn run_streaming_lite(
 
 async fn run_streaming_lite_at(
     shutdown_token: CancellationToken,
+    relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     roles: Arc<dyn LiteRelayRoles>,
-    relay_url: String,
     tenant_id: String,
 ) -> Result<()> {
     use std::time::{Duration, Instant};
@@ -2167,8 +2327,8 @@ async fn run_streaming_lite_at(
         let started = Instant::now();
         match try_run_streaming_lite(
             shutdown_token.clone(),
+            &relay_config,
             Arc::clone(&definition_repository),
-            &relay_url,
             &tenant_id,
             Arc::clone(&roles),
         )
@@ -2193,15 +2353,12 @@ async fn run_streaming_lite_at(
 
 async fn try_run_streaming_lite(
     shutdown_token: CancellationToken,
+    relay_config: &ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
-    relay_url: &str,
     tenant_id: &str,
     roles: Arc<dyn LiteRelayRoles>,
 ) -> Result<()> {
-    let channel = Channel::from_shared(relay_url.to_owned())?
-        .connect()
-        .await?;
-    let mut client = ConductorRelayServiceClient::new(channel);
+    let mut client = connect_relay_client(relay_config).await?;
     let (tx, rx) = mpsc::channel::<ConductorRelayMessage>(32);
     init_relay_tx(tx.clone()).await;
 
@@ -2215,8 +2372,7 @@ async fn try_run_streaming_lite(
         tenant_id: Some(tenant_id.to_owned()),
     })
     .chain(tokio_stream::wrappers::ReceiverStream::new(rx));
-    let response = client.stream_conductor_relay(outbound).await?;
-    let mut inbound = response.into_inner();
+    let mut inbound = establish_relay_stream(&mut client, outbound, relay_config).await?;
 
     tokio::select! {
         result = async {
@@ -2344,6 +2500,903 @@ async fn try_run_streaming_lite(
 }
 
 #[cfg(all(test, not(madsim)))]
+mod relay_security_tests {
+    use super::*;
+    use crate::gate_index_lifecycle::{gate_index, rebuild_from_server};
+    use crate::proto::conductor_relay_service_server::{
+        ConductorRelayService, ConductorRelayServiceServer,
+    };
+    use crate::relay::dispatch_gates::{
+        list_dispatched_gates, DispatchGatesClient, DispatchGatesError, DispatchedGate,
+    };
+    use crate::system_tasks::events_pull::{
+        pull_once, EventsPullClient, EventsPullError, PullOutcome,
+    };
+    use axum::extract::{Path, Query, State};
+    use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response as AxumResponse};
+    use axum::{routing::get, Json, Router};
+    use chrono::{DateTime, Utc};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+    use serde::Deserialize;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread::JoinHandle;
+    use tempfile::TempDir;
+    use tickr_migrations::backend::{RepositoryFactory, WriterRepositoryBundle};
+    use tickr_migrations::{apply_sqlite, sqlite_writer_options, MigrationTarget};
+    use tickr_proto::config::DataPlaneSql;
+    use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+    use tonic::{Response, Streaming};
+
+    const TEST_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const TEST_AUTHORIZATION: &str = "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const TEST_CA_PEM: &str = include_str!("../system_tasks/testdata/control-plane-test-ca.pem");
+    const TEST_SERVER_CERT_PEM: &str =
+        include_str!("../system_tasks/testdata/control-plane-test-server.pem");
+    const TEST_SERVER_KEY_PEM: &str =
+        include_str!("../system_tasks/testdata/control-plane-test-server-key.pem");
+
+    type RelayStream =
+        Pin<Box<dyn Stream<Item = Result<ConductorRelayMessage, Status>> + Send + 'static>>;
+
+    #[derive(Default)]
+    struct RelayObservation {
+        authorization_count: AtomicUsize,
+        authorization_matches: AtomicBool,
+        message_count: AtomicUsize,
+        message_contains_token: AtomicBool,
+        certificate_metadata_seen: AtomicBool,
+    }
+
+    #[derive(Clone)]
+    struct OriginRelay {
+        observation: Arc<RelayObservation>,
+        expected_tenant: Option<TenantId>,
+    }
+
+    #[tonic::async_trait]
+    impl ConductorRelayService for OriginRelay {
+        type StreamConductorRelayStream = RelayStream;
+
+        async fn stream_conductor_relay(
+            &self,
+            request: Request<Streaming<ConductorRelayMessage>>,
+        ) -> Result<Response<Self::StreamConductorRelayStream>, Status> {
+            let authorizations: Vec<_> =
+                request.metadata().get_all("authorization").iter().collect();
+            self.observation
+                .authorization_count
+                .store(authorizations.len(), Ordering::Release);
+            let authorization_matches = authorizations.len() == 1
+                && authorizations[0].as_encoded_bytes() == TEST_AUTHORIZATION.as_bytes();
+            self.observation
+                .authorization_matches
+                .store(authorization_matches, Ordering::Release);
+            self.observation.certificate_metadata_seen.store(
+                [
+                    "x-forwarded-client-cert",
+                    "x-tls-client-cert",
+                    "ssl-client-cert",
+                ]
+                .into_iter()
+                .any(|name| request.metadata().contains_key(name)),
+                Ordering::Release,
+            );
+            if !authorization_matches {
+                return Err(Status::unauthenticated("relay credential was not admitted"));
+            }
+
+            let observation = Arc::clone(&self.observation);
+            let expected_tenant = self.expected_tenant;
+            let mut inbound = request.into_inner();
+            let first = inbound
+                .message()
+                .await
+                .map_err(|_| Status::invalid_argument("invalid relay handshake"))?;
+            if let Some(message) = first {
+                if expected_tenant.is_some_and(|tenant| {
+                    message.tenant_id.as_deref() != Some(tenant.to_string().as_str())
+                }) {
+                    return Err(Status::permission_denied(
+                        "relay Tenant binding was not admitted",
+                    ));
+                }
+                observe_relay_message(&observation, &message);
+            }
+
+            let (response_tx, response_rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                while let Some(message) = inbound.next().await {
+                    let Ok(message) = message else {
+                        break;
+                    };
+                    observe_relay_message(&observation, &message);
+                }
+                drop(response_tx);
+            });
+            Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(response_rx),
+            )))
+        }
+    }
+
+    fn observe_relay_message(observation: &RelayObservation, message: &ConductorRelayMessage) {
+        observation.message_count.fetch_add(1, Ordering::AcqRel);
+        let token = TEST_BEARER_TOKEN.as_bytes();
+        if message
+            .payload
+            .windows(token.len())
+            .any(|window| window == token)
+            || message.tenant_id.as_deref().is_some_and(|tenant| {
+                tenant
+                    .as_bytes()
+                    .windows(token.len())
+                    .any(|window| window == token)
+            })
+        {
+            observation
+                .message_contains_token
+                .store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Clone)]
+    struct TlsRelayProxy {
+        upstream: String,
+    }
+
+    #[tonic::async_trait]
+    impl ConductorRelayService for TlsRelayProxy {
+        type StreamConductorRelayStream = RelayStream;
+
+        async fn stream_conductor_relay(
+            &self,
+            request: Request<Streaming<ConductorRelayMessage>>,
+        ) -> Result<Response<Self::StreamConductorRelayStream>, Status> {
+            let metadata = request.metadata().clone();
+            let inbound = request
+                .into_inner()
+                .filter_map(|message| futures::future::ready(message.ok()));
+            let mut upstream_request = Request::new(inbound);
+            *upstream_request.metadata_mut() = metadata;
+            let mut client = ConductorRelayServiceClient::connect(self.upstream.clone())
+                .await
+                .map_err(|_| Status::unavailable("relay origin unavailable"))?;
+            let response = client.stream_conductor_relay(upstream_request).await?;
+            Ok(Response::new(Box::pin(response.into_inner())))
+        }
+    }
+
+    async fn start_origin(
+        observation: Arc<RelayObservation>,
+        expected_tenant: Option<TenantId>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _)| stream);
+            }
+        };
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ConductorRelayServiceServer::new(OriginRelay {
+                    observation,
+                    expected_tenant,
+                }))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        (address, server)
+    }
+
+    async fn start_tls_proxy(
+        upstream: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _)| stream);
+            }
+        };
+        let identity = Identity::from_pem(TEST_SERVER_CERT_PEM, TEST_SERVER_KEY_PEM);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(ServerTlsConfig::new().identity(identity))
+                .unwrap()
+                .add_service(ConductorRelayServiceServer::new(TlsRelayProxy { upstream }))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        (address, server)
+    }
+
+    fn test_tls() -> ClientTlsConfig {
+        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(TEST_CA_PEM))
+    }
+
+    #[derive(Default)]
+    struct HttpOriginObservation {
+        requests: AtomicUsize,
+        api_live_state_queries: AtomicUsize,
+        gate_snapshots: AtomicUsize,
+        pull_cycles: AtomicUsize,
+        pull_cursor_seen: AtomicBool,
+        certificate_header_seen: AtomicBool,
+    }
+
+    #[derive(Clone, serde::Serialize)]
+    struct StubEvent {
+        id: Uuid,
+        ts: DateTime<Utc>,
+        event_type: String,
+        payload: serde_json::Value,
+        archived_at: DateTime<Utc>,
+    }
+
+    #[derive(Clone)]
+    struct HttpOriginState {
+        tenant: TenantId,
+        visible_instance_id: Uuid,
+        gate: DispatchedGate,
+        event: StubEvent,
+        observation: Arc<HttpOriginObservation>,
+    }
+
+    #[derive(Deserialize)]
+    struct TenantQuery {
+        tenant: Uuid,
+    }
+
+    #[derive(Deserialize)]
+    struct PullQuery {
+        tenant: Uuid,
+        after_archived_at: Option<DateTime<Utc>>,
+        after_id: Option<Uuid>,
+        #[allow(dead_code)]
+        limit: Option<u32>,
+    }
+
+    fn observe_plaintext_http(headers: &HeaderMap, observation: &HttpOriginObservation) {
+        observation.requests.fetch_add(1, Ordering::AcqRel);
+        let certificate_header_seen = headers.keys().any(|name| {
+            matches!(
+                name.as_str(),
+                "x-forwarded-client-cert" | "x-tls-client-cert" | "ssl-client-cert"
+            )
+        });
+        observation
+            .certificate_header_seen
+            .fetch_or(certificate_header_seen, Ordering::AcqRel);
+    }
+
+    fn admitted_http(headers: &HeaderMap) -> bool {
+        headers
+            .get(AUTHORIZATION)
+            .is_some_and(|value| value.as_bytes() == TEST_AUTHORIZATION.as_bytes())
+    }
+
+    async fn api_live_state(
+        Path(instance_id): Path<Uuid>,
+        State(state): State<HttpOriginState>,
+        headers: HeaderMap,
+    ) -> AxumResponse {
+        observe_plaintext_http(&headers, &state.observation);
+        if !admitted_http(&headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        state
+            .observation
+            .api_live_state_queries
+            .fetch_add(1, Ordering::AcqRel);
+        if instance_id != state.visible_instance_id {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Json(serde_json::json!({
+            "id": instance_id,
+            "state": "Running",
+        }))
+        .into_response()
+    }
+
+    async fn dispatched_gates(
+        Query(query): Query<TenantQuery>,
+        State(state): State<HttpOriginState>,
+        headers: HeaderMap,
+    ) -> AxumResponse {
+        observe_plaintext_http(&headers, &state.observation);
+        if !admitted_http(&headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if query.tenant != state.tenant.as_uuid() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        state
+            .observation
+            .gate_snapshots
+            .fetch_add(1, Ordering::AcqRel);
+        Json(vec![state.gate]).into_response()
+    }
+
+    async fn events_pull(
+        Query(query): Query<PullQuery>,
+        State(state): State<HttpOriginState>,
+        headers: HeaderMap,
+    ) -> AxumResponse {
+        observe_plaintext_http(&headers, &state.observation);
+        if !admitted_http(&headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if query.tenant != state.tenant.as_uuid() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        state.observation.pull_cycles.fetch_add(1, Ordering::AcqRel);
+        let cursor = query.after_archived_at.zip(query.after_id);
+        if cursor.is_some() {
+            state
+                .observation
+                .pull_cursor_seen
+                .store(true, Ordering::Release);
+        }
+        let rows = if cursor.is_none_or(|cursor| (state.event.archived_at, state.event.id) > cursor)
+        {
+            vec![state.event]
+        } else {
+            Vec::new()
+        };
+        Json(rows).into_response()
+    }
+
+    async fn start_http_origin(
+        state: HttpOriginState,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/api/workflows/instances/{id}", get(api_live_state))
+            .route("/api/internal/dispatched-gates", get(dispatched_gates))
+            .route("/api/internal/events", get(events_pull))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, server)
+    }
+
+    struct HttpTlsTerminator {
+        endpoint: String,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl HttpTlsTerminator {
+        fn start(upstream: SocketAddr) -> Self {
+            let certificates = vec![CertificateDer::from(pem_der(TEST_SERVER_CERT_PEM))];
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pem_der(TEST_SERVER_KEY_PEM)));
+            let mut config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certificates, key)
+                .unwrap();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let config = Arc::new(config);
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => forward_decrypted_http(stream, upstream, &config),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                endpoint: format!("https://localhost:{port}"),
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for HttpTlsTerminator {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn forward_decrypted_http(stream: TcpStream, upstream: SocketAddr, config: &Arc<ServerConfig>) {
+        let _ = stream.set_nonblocking(false);
+        let timeout = Some(Duration::from_secs(2));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
+        let Ok(connection) = ServerConnection::new(Arc::clone(config)) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(connection, stream);
+        let request = read_http_request(&mut tls);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return;
+        };
+        let Ok(mut origin) = TcpStream::connect(upstream) else {
+            return;
+        };
+        let _ = origin.set_read_timeout(timeout);
+        let _ = origin.set_write_timeout(timeout);
+        let mut forwarded = request[..header_end].to_vec();
+        forwarded.extend_from_slice(b"\r\nconnection: close\r\n\r\n");
+        if origin.write_all(&forwarded).is_err() {
+            return;
+        }
+        let mut response = Vec::new();
+        if origin.read_to_end(&mut response).is_err() {
+            return;
+        }
+        let _ = tls.write_all(&response);
+        let _ = tls.flush();
+    }
+
+    fn read_http_request(stream: &mut impl Read) -> Vec<u8> {
+        let mut request = Vec::with_capacity(2048);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut buffer) else {
+                return request;
+            };
+            if read == 0 {
+                return request;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return request;
+            }
+        }
+    }
+
+    fn pem_der(pem: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut accumulator = 0_u32;
+        let mut bits = 0_u8;
+        for byte in pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .flat_map(str::bytes)
+        {
+            if byte == b'=' {
+                break;
+            }
+            let value = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => continue,
+            };
+            accumulator = (accumulator << 6) | u32::from(value);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                output.push((accumulator >> bits) as u8);
+                accumulator &= (1_u32 << bits) - 1;
+            }
+        }
+        output
+    }
+
+    struct LocalTlsProxy {
+        http: HttpTlsTerminator,
+        relay_address: SocketAddr,
+        relay: tokio::task::JoinHandle<()>,
+    }
+
+    impl LocalTlsProxy {
+        async fn start(http_upstream: SocketAddr, relay_upstream: String) -> Self {
+            let http = HttpTlsTerminator::start(http_upstream);
+            let (relay_address, relay) = start_tls_proxy(relay_upstream).await;
+            Self {
+                http,
+                relay_address,
+                relay,
+            }
+        }
+
+        fn http_endpoint(&self) -> &str {
+            &self.http.endpoint
+        }
+
+        fn relay_endpoint(&self) -> String {
+            format!("https://localhost:{}", self.relay_address.port())
+        }
+    }
+
+    impl Drop for LocalTlsProxy {
+        fn drop(&mut self) {
+            self.relay.abort();
+        }
+    }
+
+    fn trusted_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(TEST_CA_PEM.as_bytes()).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    async fn event_repositories() -> (TempDir, Arc<WriterRepositoryBundle>) {
+        let directory = TempDir::new().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("secure-connection.db").display()
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlite_writer_options(&url, true).unwrap())
+            .await
+            .unwrap();
+        apply_sqlite(MigrationTarget::Conductor, &pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let writer = RepositoryFactory::new(DataPlaneSql::Sqlite { url })
+            .open_writer()
+            .await
+            .unwrap();
+        (directory, Arc::new(writer))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn secure_control_plane_connection_scenario_uses_one_tls_proxy_and_plaintext_origins() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let tenant = TenantId::from_slug("secure-connection-tenant");
+        let foreign_tenant = TenantId::from_slug("foreign-secure-connection-tenant");
+        let visible_instance_id = Uuid::new_v4();
+        let event = StubEvent {
+            id: Uuid::new_v4(),
+            ts: "2026-08-14T00:00:00Z".parse().unwrap(),
+            event_type: "WorkflowInstanceCreated".to_owned(),
+            payload: serde_json::json!({"WorkflowInstanceCreated": {}}),
+            archived_at: "2026-08-14T00:00:03Z".parse().unwrap(),
+        };
+        let observation = Arc::new(HttpOriginObservation::default());
+        let state = HttpOriginState {
+            tenant,
+            visible_instance_id,
+            gate: DispatchedGate {
+                workflow_instance_id: visible_instance_id,
+                edge_id: Uuid::new_v4(),
+                signal_name: "release".to_owned(),
+                predicate: None,
+                captures_spec: Vec::new(),
+            },
+            event,
+            observation: Arc::clone(&observation),
+        };
+        let (http_origin_address, http_origin) = start_http_origin(state).await;
+        let relay_observation = Arc::new(RelayObservation::default());
+        let (relay_origin_address, relay_origin) =
+            start_origin(Arc::clone(&relay_observation), Some(tenant)).await;
+        let proxy = LocalTlsProxy::start(
+            http_origin_address,
+            format!("http://{relay_origin_address}"),
+        )
+        .await;
+
+        let api_response = trusted_http_client()
+            .get(format!(
+                "{}/api/workflows/instances/{visible_instance_id}",
+                proxy.http_endpoint()
+            ))
+            .header(AUTHORIZATION, TEST_AUTHORIZATION)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(api_response.status(), StatusCode::OK);
+        let foreign_instance = trusted_http_client()
+            .get(format!(
+                "{}/api/workflows/instances/{}",
+                proxy.http_endpoint(),
+                Uuid::new_v4()
+            ))
+            .header(AUTHORIZATION, TEST_AUTHORIZATION)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_instance.status(), StatusCode::NOT_FOUND);
+        let missing_credential = trusted_http_client()
+            .get(format!(
+                "{}/api/workflows/instances/{visible_instance_id}",
+                proxy.http_endpoint()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_credential.status(), StatusCode::UNAUTHORIZED);
+
+        let gate_client = DispatchGatesClient::with_client(
+            trusted_http_client(),
+            proxy.http_endpoint(),
+            TEST_BEARER_TOKEN,
+        )
+        .unwrap();
+        assert_eq!(rebuild_from_server(&gate_client, tenant).await.unwrap(), 1);
+        assert_eq!(gate_index().len(), 1);
+        assert_eq!(
+            list_dispatched_gates(&gate_client, foreign_tenant)
+                .await
+                .unwrap_err(),
+            DispatchGatesError::Forbidden
+        );
+
+        let (_event_directory, repositories) = event_repositories().await;
+        let events_client = EventsPullClient::with_client(
+            trusted_http_client(),
+            proxy.http_endpoint(),
+            TEST_BEARER_TOKEN,
+        )
+        .unwrap();
+        assert_eq!(
+            pull_once(&repositories, &events_client, tenant.as_uuid())
+                .await
+                .unwrap(),
+            PullOutcome {
+                fetched: 1,
+                inserted: 1,
+            }
+        );
+        assert_eq!(
+            pull_once(&repositories, &events_client, tenant.as_uuid())
+                .await
+                .unwrap(),
+            PullOutcome {
+                fetched: 0,
+                inserted: 0,
+            }
+        );
+        assert!(matches!(
+            pull_once(&repositories, &events_client, foreign_tenant.as_uuid()).await,
+            Err(EventsPullError::Forbidden)
+        ));
+
+        let relay_config =
+            ControlPlaneRelayConfig::new(&proxy.relay_endpoint(), TEST_BEARER_TOKEN, false)
+                .unwrap();
+        for payload in [b"initial-relay".as_slice(), b"reconnect".as_slice()] {
+            let mut client = connect_relay_client_with_tls(&relay_config, test_tls())
+                .await
+                .unwrap();
+            let outbound = tokio_stream::iter([ConductorRelayMessage {
+                entity_type: EntityType::TaskEvent as i32,
+                payload: payload.to_vec(),
+                tenant_id: Some(tenant.to_string()),
+            }]);
+            establish_relay_stream(&mut client, outbound, &relay_config)
+                .await
+                .unwrap();
+        }
+        let mut mismatched_relay = connect_relay_client_with_tls(&relay_config, test_tls())
+            .await
+            .unwrap();
+        let mismatch = establish_relay_stream(
+            &mut mismatched_relay,
+            tokio_stream::iter([ConductorRelayMessage {
+                entity_type: EntityType::TaskEvent as i32,
+                payload: b"foreign-relay".to_vec(),
+                tenant_id: Some(foreign_tenant.to_string()),
+            }]),
+            &relay_config,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch, RelayEstablishmentError::Forbidden);
+
+        let untrusted_gate =
+            DispatchGatesClient::new(proxy.http_endpoint(), TEST_BEARER_TOKEN, false).unwrap();
+        assert_eq!(
+            list_dispatched_gates(&untrusted_gate, tenant)
+                .await
+                .unwrap_err(),
+            DispatchGatesError::Unavailable
+        );
+        let mismatched_http_endpoint = proxy.http_endpoint().replace("localhost", "127.0.0.1");
+        let mismatched_gate = DispatchGatesClient::with_client(
+            trusted_http_client(),
+            &mismatched_http_endpoint,
+            TEST_BEARER_TOKEN,
+        )
+        .unwrap();
+        assert_eq!(
+            list_dispatched_gates(&mismatched_gate, tenant)
+                .await
+                .unwrap_err(),
+            DispatchGatesError::Unavailable
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while relay_observation.message_count.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observation.requests.load(Ordering::Acquire) >= 8);
+        assert_eq!(
+            observation.api_live_state_queries.load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(observation.gate_snapshots.load(Ordering::Acquire), 1);
+        assert_eq!(observation.pull_cycles.load(Ordering::Acquire), 2);
+        assert!(observation.pull_cursor_seen.load(Ordering::Acquire));
+        assert!(!observation.certificate_header_seen.load(Ordering::Acquire));
+        assert!(!relay_observation
+            .certificate_metadata_seen
+            .load(Ordering::Acquire));
+        assert!(!relay_observation
+            .message_contains_token
+            .load(Ordering::Acquire));
+
+        http_origin.abort();
+        relay_origin.abort();
+    }
+
+    #[test]
+    fn relay_configuration_is_secret_safe_and_rejects_plaintext_except_loopback() {
+        let secure =
+            ControlPlaneRelayConfig::new("https://control-plane.example", TEST_BEARER_TOKEN, false)
+                .unwrap();
+        let rendered = format!("{secure:?}");
+        assert!(!rendered.contains(TEST_BEARER_TOKEN));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(secure.authorization_is_sensitive());
+
+        assert_eq!(
+            ControlPlaneRelayConfig::new("http://127.0.0.1:50052", TEST_BEARER_TOKEN, false,)
+                .unwrap_err(),
+            crate::config::ControlPlaneConfigError::InsecureEndpoint
+        );
+        assert_eq!(
+            ControlPlaneRelayConfig::new(
+                "http://control-plane.example:50052",
+                TEST_BEARER_TOKEN,
+                true,
+            )
+            .unwrap_err(),
+            crate::config::ControlPlaneConfigError::InsecureEndpoint
+        );
+        ControlPlaneRelayConfig::new("http://127.0.0.1:50052", TEST_BEARER_TOKEN, true).unwrap();
+        assert_eq!(
+            ControlPlaneRelayConfig::new(
+                "https://embedded@control-plane.example",
+                TEST_BEARER_TOKEN,
+                false,
+            )
+            .unwrap_err(),
+            crate::config::ControlPlaneConfigError::InvalidEndpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_tls_proxy_receives_one_authorization_and_rejects_bad_trust_or_hostname() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let observation = Arc::new(RelayObservation::default());
+        let (origin_address, origin) = start_origin(Arc::clone(&observation), None).await;
+        let (proxy_address, proxy) = start_tls_proxy(format!("http://{origin_address}")).await;
+
+        let config = ControlPlaneRelayConfig::new(
+            &format!("https://localhost:{}", proxy_address.port()),
+            TEST_BEARER_TOKEN,
+            false,
+        )
+        .unwrap();
+        let mut client = connect_relay_client_with_tls(&config, test_tls())
+            .await
+            .unwrap();
+        let outbound = tokio_stream::iter([ConductorRelayMessage {
+            entity_type: 0,
+            payload: b"relay-handshake".to_vec(),
+            tenant_id: Some(Uuid::new_v4().to_string()),
+        }]);
+        establish_relay_stream(&mut client, outbound, &config)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while observation.message_count.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(observation.authorization_count.load(Ordering::Acquire), 1);
+        assert!(observation.authorization_matches.load(Ordering::Acquire));
+        assert!(!observation.message_contains_token.load(Ordering::Acquire));
+        assert!(!observation
+            .certificate_metadata_seen
+            .load(Ordering::Acquire));
+
+        assert!(matches!(
+            connect_relay_client(&config).await,
+            Err(RelayEstablishmentError::TlsHandshake)
+        ));
+        let mismatched = ControlPlaneRelayConfig::new(
+            &format!("https://127.0.0.1:{}", proxy_address.port()),
+            TEST_BEARER_TOKEN,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            connect_relay_client_with_tls(&mismatched, test_tls()).await,
+            Err(RelayEstablishmentError::TlsHandshake)
+        ));
+
+        let unused = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unused_port = unused.local_addr().unwrap().port();
+        drop(unused);
+        let unavailable = ControlPlaneRelayConfig::new(
+            &format!("https://localhost:{unused_port}"),
+            TEST_BEARER_TOKEN,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            connect_relay_client_with_tls(&unavailable, test_tls()).await,
+            Err(RelayEstablishmentError::Unavailable)
+        ));
+
+        origin.abort();
+        proxy.abort();
+    }
+
+    #[test]
+    fn relay_establishment_statuses_have_distinct_secret_safe_classifications() {
+        let cases = [
+            (
+                Status::unauthenticated("sentinel credential"),
+                RelayEstablishmentError::Unauthenticated,
+            ),
+            (
+                Status::permission_denied("sentinel credential"),
+                RelayEstablishmentError::Forbidden,
+            ),
+            (
+                Status::deadline_exceeded("sentinel credential"),
+                RelayEstablishmentError::Timeout,
+            ),
+            (
+                Status::unavailable("sentinel credential"),
+                RelayEstablishmentError::Unavailable,
+            ),
+        ];
+        for (status, expected) in cases {
+            let classified = classify_relay_status(status);
+            assert_eq!(classified, expected);
+            assert!(!classified.to_string().contains("sentinel"));
+        }
+    }
+}
+
+#[cfg(all(test, not(madsim)))]
 mod lite_relay_tests {
     use super::*;
     use crate::proto::conductor_relay_service_server::{
@@ -2363,10 +3416,12 @@ mod lite_relay_tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status, Streaming};
 
+    const TEST_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     struct RelayEnvironment {
-        previous: [(&'static str, Option<OsString>); 2],
+        previous: [(&'static str, Option<OsString>); 4],
     }
 
     impl RelayEnvironment {
@@ -2378,10 +3433,20 @@ mod lite_relay_tests {
                         std::env::var_os("TICKR_CTRL_RELAY_URL"),
                     ),
                     ("TICKR_TENANT_SLUG", std::env::var_os("TICKR_TENANT_SLUG")),
+                    (
+                        "TICKR_CONTROL_PLANE_BEARER_TOKEN",
+                        std::env::var_os("TICKR_CONTROL_PLANE_BEARER_TOKEN"),
+                    ),
+                    (
+                        "TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK",
+                        std::env::var_os("TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK"),
+                    ),
                 ],
             };
             std::env::set_var("TICKR_CTRL_RELAY_URL", relay_url);
             std::env::set_var("TICKR_TENANT_SLUG", tenant_slug);
+            std::env::set_var("TICKR_CONTROL_PLANE_BEARER_TOKEN", TEST_BEARER_TOKEN);
+            std::env::set_var("TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK", "true");
             environment
         }
     }
@@ -2523,10 +3588,12 @@ mod lite_relay_tests {
         .await;
         let _environment =
             RelayEnvironment::set(&format!("http://{address}"), "configured-relay-tenant");
+        let relay_config = ControlPlaneRelayConfig::from_env().unwrap();
         let (_directory, repository) = definition_repository().await;
         let shutdown = CancellationToken::new();
         let relay = tokio::spawn(run_streaming_lite(
             shutdown.clone(),
+            relay_config,
             repository,
             Arc::new(NoopRoles),
         ));
@@ -2556,11 +3623,13 @@ mod lite_relay_tests {
         assert!(!first_server.is_finished(), "test relay failed to start");
         let (_directory, repository) = definition_repository().await;
         let shutdown = CancellationToken::new();
+        let relay_config =
+            ControlPlaneRelayConfig::new(&relay_url, TEST_BEARER_TOKEN, true).unwrap();
         let relay = tokio::spawn(run_streaming_lite_at(
             shutdown.clone(),
+            relay_config,
             repository,
             Arc::new(NoopRoles),
-            relay_url,
             "test-tenant".to_owned(),
         ));
 
@@ -2633,11 +3702,14 @@ mod lite_relay_tests {
             .await
             .unwrap();
         let shutdown = CancellationToken::new();
+        let relay_config =
+            ControlPlaneRelayConfig::new(&format!("http://{address}"), TEST_BEARER_TOKEN, true)
+                .unwrap();
         let relay = tokio::spawn(run_streaming_lite_at(
             shutdown.clone(),
+            relay_config,
             Arc::clone(&repository),
             Arc::new(NoopRoles),
-            format!("http://{address}"),
             "test-tenant".to_owned(),
         ));
 

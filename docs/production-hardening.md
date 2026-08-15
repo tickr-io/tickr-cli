@@ -25,6 +25,26 @@ Before production deployment:
 - run dependency, secret, image, source-policy, and reachable-history scans on
   every release.
 
+## Control-plane application boundary
+
+Set `TICKR_CONTROL_PLANE_BEARER_TOKEN` through the deployment secret mechanism
+for every API or Conductor process with a Control-plane endpoint. Restrict the
+secret to its service identity and keep it out of URLs, arguments, generated
+configuration, and diagnostics. Remote `TICKR_CTRL_HTTP_URL` and
+`TICKR_CTRL_RELAY_URL` values require `https://` with standard certificate-chain
+and hostname verification. `TICKR_ALLOW_INSECURE_CONTROL_PLANE_LOOPBACK=true`
+is development-only, applies solely to loopback plaintext, and never disables
+authentication.
+
+Deployment owns the external TLS endpoint, certificates, network exposure, and
+secret ACLs. The application keeps Frontend HTTP and gRPC listeners private
+plaintext and receives decrypted application traffic, not certificates. The
+Frontend reads the strict authority snapshot selected by
+`TICKR_CTRL_CREDENTIALS_FILE` before listeners bind; approved file changes
+require a controlled Frontend restart. The application checks that this path is
+a readable regular file but leaves filesystem modes and platform ACL policy to
+deployment.
+
 `just security-static` is non-destructive and validates repository policy.
 `just security` additionally runs RustSec, cargo-deny, gitleaks, and npm audit;
 it requires those tools to be installed. It is not a substitute for deployment

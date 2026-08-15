@@ -108,7 +108,8 @@ async fn live_decodes_and_merge_resolves_collision_to_archive(
         }),
     ])
     .await;
-    let client = ControlPlaneClient::new(base);
+    let client =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let live = client.dashboard_clock(None, None).await?;
     assert_eq!(live.len(), 2, "live rows decode");
 
@@ -132,7 +133,12 @@ async fn live_decodes_and_merge_resolves_collision_to_archive(
 async fn unreachable_coordinator_errors_so_handler_degrades() {
     // An unroutable address: the client surfaces an error, which the handler
     // maps to an empty live half + `live_data_available = false`.
-    let client = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
+    let client = ControlPlaneClient::new(
+        "http://127.0.0.1:1".to_string(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+    )
+    .unwrap();
     let res = client.dashboard_clock(None, None).await;
     assert!(
         res.is_err(),

@@ -612,9 +612,7 @@ async fn workflow_calendar_handler(
 
     let (live_rows, live_data_available) = match live_res {
         Ok(rows) => (rows, true),
-        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
-            (Vec::new(), true)
-        }
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound) => (Vec::new(), true),
         Err(e) => {
             eprintln!(
                 "workflow_calendar_handler: Control-plane HTTP call failed: {:?}",
@@ -1063,9 +1061,7 @@ async fn list_workflow_instances_handler(
 
     let (live_rows, live_data_available) = match control_plane_res {
         Ok(rows) => (rows, true),
-        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
-            (Vec::new(), true)
-        }
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound) => (Vec::new(), true),
         Err(e) => {
             eprintln!(
                 "list_workflow_instances_handler: Control-plane HTTP call failed for workflow {}: {:?}",
@@ -1184,9 +1180,7 @@ async fn list_task_instances_handler(
 
     let (live_rows, live_data_available) = match control_plane_res {
         Ok(rows) => (rows, true),
-        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
-            (Vec::new(), true)
-        }
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound) => (Vec::new(), true),
         Err(e) => {
             eprintln!(
                 "list_task_instances_handler: Control-plane HTTP call failed for instance {}: {:?}",
@@ -1277,7 +1271,7 @@ async fn get_workflow_instance_handler(
     // 2. Live fallback. Coordinator's cluster_query is the live source of truth.
     match state.control_plane.get_workflow_instance(id).await {
         Ok(live) => (StatusCode::OK, Json(live)).into_response(),
-        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound) => {
             // Neither PG nor coordinator has the instance. Genuinely gone.
             (
                 StatusCode::NOT_FOUND,
@@ -1288,7 +1282,7 @@ async fn get_workflow_instance_handler(
                 .into_response()
         }
         Err(e @ super::control_plane_client::ControlPlaneClientError::Timeout)
-        | Err(e @ super::control_plane_client::ControlPlaneClientError::Unreachable(_))
+        | Err(e @ super::control_plane_client::ControlPlaneClientError::Unreachable)
         | Err(e @ super::control_plane_client::ControlPlaneClientError::Server { status: 503 }) => {
             // Live store unreachable — either the Control-plane HTTP channel is down
             // (timeout/connect) or it reported its cluster query failed (its own
@@ -1414,7 +1408,7 @@ async fn get_instance_context_handler(
     // 2. Live: learn the scope ids from the live snapshot, then read the KV.
     let snapshot = match state.control_plane.get_workflow_instance(id).await {
         Ok(s) => s,
-        Err(super::control_plane_client::ControlPlaneClientError::NotFound(_)) => {
+        Err(super::control_plane_client::ControlPlaneClientError::NotFound) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "workflow instance not found"})),
@@ -3261,9 +3255,9 @@ pub async fn start_http_server_with_runtime_readiness(
     readiness: Option<FormationReadiness>,
     diagnostics: Option<FormationDiagnostics>,
 ) -> Result<()> {
-    let control_plane = Arc::new(super::control_plane_client::ControlPlaneClient::new(
+    let control_plane = Arc::new(super::control_plane_client::ControlPlaneClient::try_new(
         tickr_proto::config::ctrl_http_url(),
-    ));
+    )?);
     let storage = crate::config::LogStorageConfig::from_env()?;
     let minio = storage.operator()?;
     let logs = Arc::new(super::logs_resolver::LogsResolver::new(minio, log_streams));

@@ -54,6 +54,7 @@ serde_yaml = { workspace = true }
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
+rustls = { workspace = true }
 
 [target.'cfg(not(madsim))'.dev-dependencies]
 # Integration tests stand up a real conductor command-bus subscriber against

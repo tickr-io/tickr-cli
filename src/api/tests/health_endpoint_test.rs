@@ -33,7 +33,7 @@ use testcontainers_modules::testcontainers::ImageExt;
 use tickr_api::commands::client::send_command;
 use tickr_api::commands::client::CommandBus;
 use tickr_api::commands::local::LocalCommandBusConfig;
-use tickr_api::http::control_plane_client::ControlPlaneClient;
+use tickr_api::http::control_plane_client::{ControlPlaneClient, ControlPlaneClientError};
 use tickr_api::http::health::{
     api_self, build_health_report, build_health_report_with_fleet_status, check_conductor,
     check_control_plane, check_data_plane_sql, check_executor_fleet_observations, check_executors,
@@ -229,13 +229,52 @@ async fn spawn_fake_control_plane(status: &'static str) -> String {
     format!("http://{}", addr)
 }
 
+async fn spawn_auth_rejecting_control_plane() -> (String, Arc<AtomicBool>) {
+    let health_authorized = Arc::new(AtomicBool::new(false));
+    let health_observation = Arc::clone(&health_authorized);
+    let app = axum::Router::new()
+        .route(
+            "/api/dashboard/clock",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "upstream-secret-sentinel",
+                )
+            }),
+        )
+        .route(
+            "/api/internal/health",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let health_observation = Arc::clone(&health_observation);
+                async move {
+                    health_observation.store(
+                        headers.contains_key(axum::http::header::AUTHORIZATION),
+                        Ordering::SeqCst,
+                    );
+                    axum::Json(serde_json::json!({ "status": "healthy" }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind fake Control plane");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap_or(()) });
+    (format!("http://{addr}"), health_authorized)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_plane_unreachable_frontend_row_is_unhealthy() {
     // The Frontend is the only path the UI reaches the Control plane through, so the
     // Control plane is one rollup reached via one HTTP hop — and an unreachable
     // Frontend makes the row unhealthy, mirroring the Frontend's own
     // live-store-unreachable degrade path.
-    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
+    let control_plane = ControlPlaneClient::new(
+        "http://127.0.0.1:1".to_string(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+    )
+    .unwrap();
     let row = check_control_plane(&control_plane).await;
     assert_eq!(
         row.status,
@@ -251,7 +290,8 @@ async fn control_plane_healthy_when_frontend_rollup_healthy() {
     // healthy. Exactly one HTTP hop to /api/internal/health; the rollup is
     // reported as one row, never split per-component.
     let base = spawn_fake_control_plane("healthy").await;
-    let control_plane = ControlPlaneClient::new(base);
+    let control_plane =
+        ControlPlaneClient::new(base, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", true).unwrap();
     let row = check_control_plane(&control_plane).await;
     assert_eq!(
         row.status,
@@ -259,6 +299,28 @@ async fn control_plane_healthy_when_frontend_rollup_healthy() {
         "healthy rollup ⇒ control-plane row healthy, got detail: {}",
         row.detail
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_rejection_overrides_a_healthy_public_rollup_without_leaking() {
+    const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (base, health_authorized) = spawn_auth_rejecting_control_plane().await;
+    let control_plane = ControlPlaneClient::new(base.clone(), TOKEN, true).unwrap();
+
+    let rejection = control_plane.dashboard_clock(None, None).await.unwrap_err();
+    assert_eq!(rejection, ControlPlaneClientError::Unauthenticated);
+    let row = check_control_plane(&control_plane).await;
+    assert_eq!(row.status, ComponentStatus::Unhealthy);
+    assert_eq!(row.detail, "Control plane authentication rejected");
+    assert!(
+        !health_authorized.load(Ordering::SeqCst),
+        "the tenant-neutral health probe must remain credential-free"
+    );
+
+    let rendered = format!("{rejection:?} {rejection} {}", row.detail);
+    for secret in [TOKEN, base.as_str(), "upstream-secret-sentinel"] {
+        assert!(!rendered.contains(secret));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -278,7 +340,12 @@ async fn serialized_report_shape_is_stable_and_lowercase() {
         .expect("client builds");
     // Dead-address coordinator: the control-plane hop fails, so that row is
     // unhealthy — still present with a stable shape, which is all this asserts.
-    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_string());
+    let control_plane = ControlPlaneClient::new(
+        "http://127.0.0.1:1".to_string(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+    )
+    .unwrap();
 
     let repositories =
         tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
@@ -343,7 +410,12 @@ async fn all_redis_capability_projection_is_exposed_verbatim_and_secret_free() {
     let repositories =
         tickr_migrations::backend::ReadOnlyRepositoryBundle::from_postgres_pool(pool);
     let (command_bus, _writer) = CommandBus::local(LocalCommandBusConfig::default());
-    let control_plane = ControlPlaneClient::new("http://127.0.0.1:1".to_owned());
+    let control_plane = ControlPlaneClient::new(
+        "http://127.0.0.1:1".to_owned(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        true,
+    )
+    .unwrap();
     let fleet =
         LocalExecutorCapacity::new(Uuid::new_v4(), NonZeroUsize::new(1).unwrap()).observation();
     let projection = serde_json::json!({
@@ -522,7 +594,10 @@ async fn spawn_api(nats: async_nats::Client, pool: Arc<sqlx::PgPool>) -> String 
     let control_plane = Arc::new(
         tickr_api::http::control_plane_client::ControlPlaneClient::new(
             "http://127.0.0.1:1".to_string(),
-        ),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            true,
+        )
+        .unwrap(),
     );
     let s3 = opendal::services::S3::default()
         .bucket("ignored")
@@ -1160,7 +1235,14 @@ fn test_console_asset(path: &str) -> Option<ConsoleAsset> {
 async fn live_lite_health_reports_ready_degraded_unready_failure_and_reconnect_states() {
     let (directory, _url, repositories) = migrated_sqlite_repository().await;
     let (control_plane_url, control_plane_state) = spawn_mutable_control_plane().await;
-    let control_plane = Arc::new(ControlPlaneClient::new(control_plane_url));
+    let control_plane = Arc::new(
+        ControlPlaneClient::new(
+            control_plane_url,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            true,
+        )
+        .unwrap(),
+    );
     let (command_bus, command_writer) = CommandBus::local(LocalCommandBusConfig::default());
     let command_cancel = CancellationToken::new();
     let command_task = tokio::spawn(command_writer.run(

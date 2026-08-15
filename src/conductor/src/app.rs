@@ -143,6 +143,15 @@ async fn run_conductor_composed(
     lifecycle_work: Option<LifecycleWork>,
 ) -> Result<()> {
     println!("Starting conductor client...");
+    let control_plane_http_url = tickr_proto::config::ctrl_http_url();
+    let events_pull_client =
+        system_tasks::EventsPullClient::from_env(Some(control_plane_http_url.clone()))?
+            .expect("Control-plane endpoint was supplied");
+    let gate_snapshot_client =
+        relay::dispatch_gates::DispatchGatesClient::from_env(Some(control_plane_http_url))?
+            .expect("Control-plane endpoint was supplied");
+    let relay_config = crate::config::ControlPlaneRelayConfig::from_env()
+        .context("validating Control-plane relay client")?;
 
     // Resolve the Core DSL import search path used when evaluating submitted
     // Nickel source. Empty/unset is non-fatal: registration still accepts
@@ -202,6 +211,7 @@ async fn run_conductor_composed(
     let stream_task_cancellation = task_cancellation;
     let stream_compaction_staging = compaction.as_ref().map(|(staging, _, _)| staging.clone());
     let stream_signal_applied_notifier = Arc::clone(&signal_applied_notifier);
+    let stream_tenant = tickr_proto::TenantId::from_env();
     let streaming_handle = tokio::spawn(async move {
         let result = match (
             stream_task_events,
@@ -217,6 +227,7 @@ async fn run_conductor_composed(
             ) => {
                 relay::run_streaming_with_roles(
                     stream_shutdown,
+                    relay_config.clone(),
                     stream_definitions,
                     consumer,
                     writer,
@@ -225,24 +236,32 @@ async fn run_conductor_composed(
                     acknowledgements,
                     compaction_staging,
                     stream_signal_applied_notifier,
+                    gate_snapshot_client.clone(),
+                    stream_tenant,
                 )
                 .await
             }
             (Some((consumer, writer)), None, None, None) => {
                 relay::run_streaming_with_task_events(
                     stream_shutdown,
+                    relay_config.clone(),
                     stream_definitions,
                     consumer,
                     writer,
                     stream_signal_applied_notifier,
+                    gate_snapshot_client.clone(),
+                    stream_tenant,
                 )
                 .await
             }
             (None, None, None, None) => {
                 relay::run_streaming(
                     stream_shutdown,
+                    relay_config,
                     stream_definitions,
                     stream_signal_applied_notifier,
+                    gate_snapshot_client,
+                    stream_tenant,
                 )
                 .await
             }
@@ -314,21 +333,6 @@ async fn run_conductor_composed(
         Ok(0) => {}
         Ok(n) => println!("replay boot reconciliation: re-drove {n} unsettled replay(s)"),
         Err(e) => eprintln!("replay boot reconciliation failed: {}", e),
-    }
-
-    // Rebuild the per-instance gate index from the configured coordinator.
-    // An unavailable coordinator degrades to an empty index; relay updates
-    // repopulate it after connectivity returns.
-    let dispatched_count = crate::gate_index_lifecycle::rebuild_from_server(
-        &tickr_proto::config::ctrl_http_url(),
-        tickr_proto::TenantId::from_env(),
-    )
-    .await;
-    if dispatched_count > 0 {
-        println!(
-            "gate_index rebuild: repopulated {} dispatched gate(s) from server",
-            dispatched_count
-        );
     }
 
     // Definition-build reconciliation receives only its role wakeup stream and
@@ -474,7 +478,7 @@ async fn run_conductor_composed(
     let events_pull_repositories = Arc::clone(&definition_repository);
     let events_pull_handle = tokio::spawn(system_tasks::run_events_pull(
         events_pull_repositories,
-        tickr_proto::config::ctrl_http_url(),
+        events_pull_client,
         // Pull only this conductor's own tenant slice from the shared archive.
         tickr_proto::TenantId::from_env().as_uuid(),
         events_pull_shutdown,

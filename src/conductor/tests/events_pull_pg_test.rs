@@ -11,14 +11,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use tickr_conductor::system_tasks::{pull_once, PullOutcome};
+use tickr_conductor::system_tasks::{pull_once, EventsPullClient, EventsPullError, PullOutcome};
 use tickr_migrations::backend::{ReadOnlyRepositoryBundle, WriterRepositoryBundle};
 use tickr_migrations::event_repository::EventFilter;
 use uuid::Uuid;
 
 mod common;
+
+const TEST_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_AUTHORIZATION: &str = "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[derive(serde::Serialize, Clone)]
 struct StubEvent {
@@ -46,6 +51,8 @@ struct StubState {
     response_delay: Duration,
     requests: AtomicUsize,
     saw_cursor: AtomicBool,
+    status: StatusCode,
+    saw_authorization: AtomicBool,
 }
 
 #[derive(serde::Deserialize)]
@@ -60,10 +67,22 @@ async fn spawn_stub_coordinator(state: Arc<StubState>) -> String {
     let app = axum::Router::new().route(
         "/api/internal/events",
         axum::routing::get(
-            move |axum::extract::Query(query): axum::extract::Query<StubQuery>| {
+            move |headers: HeaderMap,
+                  axum::extract::Query(query): axum::extract::Query<StubQuery>| {
                 let state = Arc::clone(&state);
                 async move {
                     state.requests.fetch_add(1, Ordering::SeqCst);
+                    if headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        != Some(TEST_AUTHORIZATION)
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    state.saw_authorization.store(true, Ordering::SeqCst);
+                    if state.status != StatusCode::OK {
+                        return state.status.into_response();
+                    }
                     if state.stall.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                     }
@@ -82,7 +101,7 @@ async fn spawn_stub_coordinator(state: Arc<StubState>) -> String {
                         .cloned()
                         .collect::<Vec<_>>();
                     rows.sort_by_key(|row| (row.archived_at, row.id));
-                    axum::Json(rows)
+                    axum::Json(rows).into_response()
                 }
             },
         ),
@@ -99,6 +118,10 @@ async fn spawn_stub_coordinator(state: Arc<StubState>) -> String {
 
 async fn conductor_pg() -> Option<(common::DbGuard, PgPool)> {
     common::test_db().await
+}
+
+fn events_client(url: &str) -> EventsPullClient {
+    EventsPullClient::new(url, TEST_BEARER_TOKEN, true).unwrap()
 }
 
 fn lifecycle_rows() -> Vec<StubEvent> {
@@ -130,6 +153,8 @@ fn state(rows: Vec<StubEvent>, respect_cursor: bool) -> Arc<StubState> {
         response_delay: Duration::ZERO,
         requests: AtomicUsize::new(0),
         saw_cursor: AtomicBool::new(false),
+        status: StatusCode::OK,
+        saw_authorization: AtomicBool::new(false),
     })
 }
 
@@ -141,12 +166,12 @@ async fn lifecycle_lands_once_and_replayed_page_consumes_no_sequence() {
     let rows = lifecycle_rows();
     let state = state(rows.clone(), false);
     let url = spawn_stub_coordinator(Arc::clone(&state)).await;
-    let client = reqwest::Client::new();
+    let client = events_client(&url);
     let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
     let (writer, reader) = repositories(&pool);
 
     assert_eq!(
-        pull_once(&writer, &client, &url, tenant).await.unwrap(),
+        pull_once(&writer, &client, tenant).await.unwrap(),
         PullOutcome {
             fetched: rows.len(),
             inserted: rows.len() as u64,
@@ -158,7 +183,7 @@ async fn lifecycle_lands_once_and_replayed_page_consumes_no_sequence() {
     let highest = first[0].seq;
 
     assert_eq!(
-        pull_once(&writer, &client, &url, tenant).await.unwrap(),
+        pull_once(&writer, &client, tenant).await.unwrap(),
         PullOutcome {
             fetched: rows.len(),
             inserted: 0,
@@ -182,15 +207,17 @@ async fn concurrent_cycles_duplicate_fetch_but_commit_one_dense_projection() {
         response_delay: Duration::from_millis(150),
         requests: AtomicUsize::new(0),
         saw_cursor: AtomicBool::new(false),
+        status: StatusCode::OK,
+        saw_authorization: AtomicBool::new(false),
     });
     let url = spawn_stub_coordinator(Arc::clone(&state)).await;
-    let client = reqwest::Client::new();
+    let client = events_client(&url);
     let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
     let (writer, reader) = repositories(&pool);
 
     let (left, right) = tokio::join!(
-        pull_once(&writer, &client, &url, tenant),
-        pull_once(&writer, &client, &url, tenant)
+        pull_once(&writer, &client, tenant),
+        pull_once(&writer, &client, tenant)
     );
     let left = left.unwrap();
     let right = right.unwrap();
@@ -219,6 +246,7 @@ async fn control_plane_fetch_completes_before_insertion_waits_for_writer_lock() 
     let url = spawn_stub_coordinator(Arc::clone(&state)).await;
     let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
     let (writer, reader) = repositories(&pool);
+    let client = events_client(&url);
 
     let mut holder = pool.begin().await.expect("writer lock transaction");
     sqlx::query("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
@@ -228,8 +256,7 @@ async fn control_plane_fetch_completes_before_insertion_waits_for_writer_lock() 
 
     let task = tokio::spawn({
         let writer = writer.clone();
-        let url = url.clone();
-        async move { pull_once(&writer, &reqwest::Client::new(), &url, tenant).await }
+        async move { pull_once(&writer, &client, tenant).await }
     });
     tokio::time::timeout(Duration::from_secs(2), async {
         while state.requests.load(Ordering::SeqCst) == 0 {
@@ -259,15 +286,15 @@ async fn cursor_is_derived_after_commit_and_retention_rebuild_keeps_seq_monotoni
     let rows = lifecycle_rows();
     let state = state(rows.clone(), true);
     let url = spawn_stub_coordinator(Arc::clone(&state)).await;
-    let client = reqwest::Client::new();
+    let client = events_client(&url);
     let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
     let (writer, reader) = repositories(&pool);
 
-    pull_once(&writer, &client, &url, tenant).await.unwrap();
+    pull_once(&writer, &client, tenant).await.unwrap();
     assert!(!state.saw_cursor.load(Ordering::SeqCst));
     let old_highest = reader.events(EventFilter::All, None, 1).await.unwrap()[0].seq;
 
-    pull_once(&writer, &client, &url, tenant).await.unwrap();
+    pull_once(&writer, &client, tenant).await.unwrap();
     assert!(state.saw_cursor.load(Ordering::SeqCst));
 
     writer
@@ -276,7 +303,7 @@ async fn cursor_is_derived_after_commit_and_retention_rebuild_keeps_seq_monotoni
         .unwrap();
     assert!(writer.event_archive_cursor().await.unwrap().is_none());
     state.saw_cursor.store(false, Ordering::SeqCst);
-    pull_once(&writer, &client, &url, tenant).await.unwrap();
+    pull_once(&writer, &client, tenant).await.unwrap();
     assert!(!state.saw_cursor.load(Ordering::SeqCst));
     let rebuilt = reader.events(EventFilter::All, None, 500).await.unwrap();
     assert_eq!(rebuilt.len(), rows.len());
@@ -292,21 +319,56 @@ async fn stalled_fetch_times_out_without_open_transaction_or_projection_change()
     let state = state(rows.clone(), true);
     state.stall.store(true, Ordering::SeqCst);
     let url = spawn_stub_coordinator(Arc::clone(&state)).await;
-    let client = reqwest::Client::new();
+    let client = events_client(&url);
     let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
     let (writer, reader) = repositories(&pool);
 
     let started = Instant::now();
-    assert!(pull_once(&writer, &client, &url, tenant).await.is_err());
+    assert!(matches!(
+        pull_once(&writer, &client, tenant).await,
+        Err(EventsPullError::Timeout)
+    ));
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(reader.event_count(EventFilter::All).await.unwrap(), 0);
 
     state.stall.store(false, Ordering::SeqCst);
     assert_eq!(
-        pull_once(&writer, &client, &url, tenant)
-            .await
-            .unwrap()
-            .inserted,
+        pull_once(&writer, &client, tenant).await.unwrap().inserted,
         rows.len() as u64
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_failures_are_typed_and_leave_the_projection_unchanged() {
+    let Some((_guard, pool)) = conductor_pg().await else {
+        return;
+    };
+    let tenant = tickr_proto::TenantId::from_slug("acme").as_uuid();
+    let (writer, reader) = repositories(&pool);
+
+    for (status, expected) in [
+        (StatusCode::UNAUTHORIZED, EventsPullError::Unauthenticated),
+        (StatusCode::FORBIDDEN, EventsPullError::Forbidden),
+    ] {
+        let state = Arc::new(StubState {
+            rows: lifecycle_rows(),
+            respect_cursor: true,
+            stall: AtomicBool::new(false),
+            response_delay: Duration::ZERO,
+            requests: AtomicUsize::new(0),
+            saw_cursor: AtomicBool::new(false),
+            status,
+            saw_authorization: AtomicBool::new(false),
+        });
+        let url = spawn_stub_coordinator(Arc::clone(&state)).await;
+        let client = events_client(&url);
+        let error = pull_once(&writer, &client, tenant).await.unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        assert!(state.saw_authorization.load(Ordering::SeqCst));
+        assert_eq!(reader.event_count(EventFilter::All).await.unwrap(), 0);
+        assert!(writer.event_archive_cursor().await.unwrap().is_none());
+    }
 }

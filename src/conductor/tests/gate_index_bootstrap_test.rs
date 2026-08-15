@@ -18,10 +18,15 @@
 use std::net::SocketAddr;
 
 use tickr_conductor::gate_index_lifecycle::{gate_index, rebuild_from_server};
-use tickr_conductor::relay::dispatch_gates::DispatchedGate;
+use tickr_conductor::relay::dispatch_gates::{
+    DispatchGatesClient, DispatchGatesError, DispatchedGate,
+};
 use tickr_proto::workflow as wf;
 use tickr_proto::TenantId;
 use uuid::Uuid;
+
+const TEST_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_AUTHORIZATION: &str = "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /// Stand up a stub HTTP server mirroring the coordinator's
 /// `/api/internal/dispatched-gates` shape — a JSON-encoded
@@ -30,9 +35,17 @@ use uuid::Uuid;
 async fn spawn_fake_dispatched_gates(gates: Vec<DispatchedGate>) -> String {
     let app = axum::Router::new().route(
         "/api/internal/dispatched-gates",
-        axum::routing::get(move || {
+        axum::routing::get(move |headers: axum::http::HeaderMap| {
             let body = gates.clone();
-            async move { axum::Json(body) }
+            async move {
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(TEST_AUTHORIZATION)
+                );
+                axum::Json(body)
+            }
         }),
     );
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -75,7 +88,10 @@ async fn gate_index_rebuilds_from_coordinator_on_startup() {
     }])
     .await;
 
-    let count = rebuild_from_server(&base, TenantId::from_slug("test")).await;
+    let client = DispatchGatesClient::new(&base, TEST_BEARER_TOKEN, true).unwrap();
+    let count = rebuild_from_server(&client, TenantId::from_slug("test"))
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     // Stale entry is gone; fresh entry is present with the declared
@@ -106,8 +122,11 @@ async fn gate_index_rebuild_degrades_to_empty_when_coordinator_unreachable() {
     // Point at an unreachable port — the rebuild must degrade to empty
     // rather than propagating the error (the next inbound
     // DispatchPrecondition restocks the index).
-    let count = rebuild_from_server("http://127.0.0.1:1", TenantId::from_slug("test")).await;
-    assert_eq!(count, 0);
+    let client = DispatchGatesClient::new("http://127.0.0.1:1", TEST_BEARER_TOKEN, true).unwrap();
+    let error = rebuild_from_server(&client, TenantId::from_slug("test"))
+        .await
+        .unwrap_err();
+    assert_eq!(error, DispatchGatesError::Unavailable);
     assert!(gate_index()
         .lookup_by_signal_name("stale-unreach")
         .is_empty());

@@ -31,7 +31,7 @@ use tickr_proto::coord::{
 use utoipa::ToSchema;
 
 use crate::commands::client::{ping_command_bus, CommandBus};
-use crate::http::control_plane_client::ControlPlaneClient;
+use crate::http::control_plane_client::{ControlPlaneClient, ControlPlaneClientError};
 
 /// The KV bucket the health surface probes for JetStream reachability. Later
 /// slices populate it with executor component-liveness keys; here it is read-only
@@ -564,14 +564,47 @@ pub async fn check_control_plane(control_plane: &ControlPlaneClient) -> Componen
                 ComponentStatus::Degraded,
                 "Control plane degraded (Frontend up, live store degraded)",
             ),
-            other => ComponentHealth::instant(
+            _ => ComponentHealth::instant(
                 ComponentStatus::Unhealthy,
-                format!("control plane rollup unhealthy: {other}"),
+                "Control plane rollup unhealthy",
             ),
         },
-        Err(e) => ComponentHealth::instant(
+        Err(ControlPlaneClientError::Unauthenticated) => ComponentHealth::instant(
             ComponentStatus::Unhealthy,
-            format!("Control plane unreachable via Frontend: {e}"),
+            "Control plane authentication rejected",
+        ),
+        Err(ControlPlaneClientError::Forbidden) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane Tenant authorization rejected",
+        ),
+        Err(ControlPlaneClientError::Timeout) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane request timed out",
+        ),
+        Err(ControlPlaneClientError::Unreachable) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane unavailable via Frontend",
+        ),
+        Err(ControlPlaneClientError::NotFound) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane health route unavailable",
+        ),
+        Err(ControlPlaneClientError::Server { .. }) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane health request rejected",
+        ),
+        Err(ControlPlaneClientError::Decode(_)) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane health response invalid",
+        ),
+        Err(
+            ControlPlaneClientError::MissingBearerToken
+            | ControlPlaneClientError::InvalidBearerToken
+            | ControlPlaneClientError::InvalidEndpoint
+            | ControlPlaneClientError::InsecureEndpoint,
+        ) => ComponentHealth::instant(
+            ComponentStatus::Unhealthy,
+            "Control plane client configuration invalid",
         ),
     }
 }
