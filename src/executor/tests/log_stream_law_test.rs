@@ -11,6 +11,7 @@ use testcontainers_modules::testcontainers::ImageExt;
 use tickr_executor::log_stream::{
     ensure_all_nats_log_stream, AllNatsLogStream, LogStream, LogStreamRoute,
 };
+use tickr_proto::coord::all_nats;
 use tickr_proto::coord::log_stream::{AcceptOutcome, ReplayedLogRecord};
 use uuid::Uuid;
 
@@ -78,6 +79,8 @@ async fn all_nats_adapter_satisfies_log_stream_laws_and_ambiguous_retry() -> Res
         workflow_instance_id,
         task_instance_id: ambiguous.task_instance_id,
     };
+    let mut storage = js.get_stream(all_nats::LOG_STREAM).await?;
+    let messages_before_timeout = storage.info().await?.state.messages;
     let mut timed_out = AllNatsLogStream::open(
         Arc::clone(&js),
         route.clone(),
@@ -93,6 +96,18 @@ async fn all_nats_adapter_satisfies_log_stream_laws_and_ambiguous_retry() -> Res
         ))
         .await
         .is_err());
+    let mut accepted_before_lost_ack = false;
+    for _ in 0..50 {
+        if storage.info().await?.state.messages > messages_before_timeout {
+            accepted_before_lost_ack = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        accepted_before_lost_ack,
+        "the zero-timeout publish must land before retry"
+    );
     drop(timed_out);
     let mut retry =
         AllNatsLogStream::open(js, route, ambiguous.clone(), Duration::from_secs(2)).await?;

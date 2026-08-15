@@ -142,6 +142,9 @@ impl AllNatsLogStream {
             .publish_with_headers(self.subject.clone(), headers, payload)
             .await
             .context("publish Accepted Log record")?;
+        if self.publish_timeout.is_zero() {
+            return Err(anyhow!("Accepted Log acknowledgement timed out"));
+        }
         timeout(self.publish_timeout, ack)
             .await
             .map_err(|_| anyhow!("Accepted Log acknowledgement timed out"))?
