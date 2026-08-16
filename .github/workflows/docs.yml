@@ -1,7 +1,9 @@
 name: docs
 
 on:
-  workflow_call:
+  workflow_run:
+    workflows: [release-tickr-lite]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +17,9 @@ concurrency:
 
 jobs:
   build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

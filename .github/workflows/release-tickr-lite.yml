@@ -151,11 +151,3 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
 
-  docs:
-    name: publish release documentation
-    needs: publish
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/docs.yml
