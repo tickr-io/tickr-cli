@@ -16,7 +16,7 @@ use tickr_migrations::{
 };
 
 fn migrate_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
     command
         .arg("migrate")
         .env_remove("TICKR_SQL_BACKEND")
@@ -35,7 +35,7 @@ fn run_sqlite_migration(path: &Path) -> Output {
             format!("sqlite://{}", path.display()),
         )
         .output()
-        .expect("invoke `tickr migrate` for SQLite")
+        .expect("invoke `tickr-cli migrate` for SQLite")
 }
 
 fn run_tickr_lite_migration(path: &Path) -> Output {
@@ -65,10 +65,10 @@ async fn migrate_subcommand_keeps_unset_backend_on_postgres() {
     let output = migrate_command()
         .env("TICKR_CONDUCTOR_POSTGRES_URL", &url)
         .output()
-        .expect("invoke `tickr migrate`");
+        .expect("invoke `tickr-cli migrate`");
     assert!(
         output.status.success(),
-        "tickr migrate failed: {}",
+        "tickr-cli migrate failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -154,7 +154,7 @@ async fn sqlite_migrate_subcommand_is_repeatable_and_reopenable() {
         let output = run_sqlite_migration(&path);
         assert!(
             output.status.success(),
-            "tickr migrate failed: {}",
+            "tickr-cli migrate failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

@@ -40,7 +40,7 @@ async fn conductor_admits_all_nats_before_opening_postgres() {
     }
     let client = client.expect("isolated NATS accepts connections");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tickr"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .arg("conductor")
         .env("TICKR_NATS_URL", &url)
         .env(

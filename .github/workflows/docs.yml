@@ -1,14 +1,7 @@
 name: docs
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docs-site/**'
-      - 'console/openapi.yaml'
-      - 'dsl/**'
-      - 'examples/**'
-      - '.github/workflows/docs.yml'
+  workflow_call:
   workflow_dispatch:
 
 permissions:

@@ -12,6 +12,7 @@ env:
   CARGO_TERM_COLOR: never
   NODE_VERSION: 24.16.0
   NPM_VERSION: 11.13.0
+  GO_VERSION: 1.26.4
 
 jobs:
   ci:
@@ -40,6 +41,9 @@ jobs:
         with:
           toolchain: 1.92.0
           targets: ${{ matrix.target }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -61,28 +65,48 @@ jobs:
           npm run check-api
       - name: Build self-contained Tickr Lite executables
         run: cargo build --locked --release -p tickr -p tickr_ctx --target "${{ matrix.target }}"
+      - name: Build polyglot Go Task
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) os=linux; arch=amd64 ;;
+            aarch64-unknown-linux-gnu) os=linux; arch=arm64 ;;
+            aarch64-apple-darwin) os=darwin; arch=arm64 ;;
+            *) echo "unsupported Go release target: $TARGET" >&2; exit 1 ;;
+          esac
+          CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
+            -o "target/${TARGET}/release/tickr-polyglot-go" examples/polyglot/greet.go
       - name: Package Tickr Lite
         env:
           TARGET: ${{ matrix.target }}
         run: |
           version=${GITHUB_REF_NAME#v}
           python3 scripts/package_tickr_lite.py \
-            --binary "target/${TARGET}/release/tickr" \
+            --cli-binary "target/${TARGET}/release/tickr-cli" \
+            --lite-binary "target/${TARGET}/release/tickr-lite" \
             --ctx-binary "target/${TARGET}/release/tickr-ctx" \
+            --polyglot-go-binary "target/${TARGET}/release/tickr-polyglot-go" \
+            --polyglot-rust-binary "target/${TARGET}/release/tickr-polyglot-rust" \
             --version "$version" \
             --target "$TARGET" \
             --output dist
           artifact="tickr-lite-v${version}-${TARGET}"
           mkdir extracted
           tar -xzf "dist/${artifact}.tar.gz" -C extracted
+          test -x "extracted/${artifact}/tickr-cli"
+          test -x "extracted/${artifact}/tickr-lite"
           test -x "extracted/${artifact}/tickr-ctx"
           test -f "extracted/${artifact}/INSTALL.md"
           test -f "extracted/${artifact}/dsl/lib.ncl"
           test -f "extracted/${artifact}/examples/hello-world.ncl"
           test -f "extracted/${artifact}/examples/runtime-patch.ncl"
-          "extracted/${artifact}/tickr" tickr-lite --help
-          "extracted/${artifact}/tickr" setup --help
-          "extracted/${artifact}/tickr" examples run hello-world --help
+          test -f "extracted/${artifact}/examples/polyglot.ncl"
+          test -x "extracted/${artifact}/examples/polyglot/bin/tickr-polyglot-go"
+          test -x "extracted/${artifact}/examples/polyglot/bin/tickr-polyglot-rust"
+          "extracted/${artifact}/tickr-lite" --help
+          "extracted/${artifact}/tickr-cli" setup --help
+          "extracted/${artifact}/tickr-cli" examples run hello-world runtime-patch polyglot --help
       - name: Upload release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -126,3 +150,12 @@ jobs:
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
+
+  docs:
+    name: publish release documentation
+    needs: publish
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/docs.yml

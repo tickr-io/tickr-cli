@@ -29,4 +29,6 @@ pub mod redis_task_cancellation;
 pub mod redis_task_events;
 pub mod redis_task_liveness;
 pub mod redis_task_pickup;
+pub mod setup_cmd;
+pub mod terminal;
 pub mod tickr_ctx_endpoint;

@@ -127,7 +127,7 @@ pub enum MigrationError {
 pub enum MigrationsDriftError {
     #[error(transparent)]
     Registration(#[from] MigrationRegistrationError),
-    #[error("{target} schema is behind: {have} of {want} migrations applied; next pending is {next_version} ({next_description}). Run `just migrate` (or `tickr migrate`) before starting this component.")]
+    #[error("{target} schema is behind: {have} of {want} migrations applied; next pending is {next_version} ({next_description}). Run `just migrate` (or `tickr-cli migrate`) before starting this component.")]
     Behind {
         target: MigrationTarget,
         have: usize,

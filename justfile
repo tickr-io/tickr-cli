@@ -58,7 +58,7 @@ check-licenses:
     python3 scripts/license_gate.py --check
 
 migrate:
-    bash -c 'source .envrc; exec cargo run --bin tickr -- migrate'
+    bash -c 'source .envrc; exec cargo run --bin tickr-cli -- migrate'
 
 # Start PostgreSQL, NATS/JetStream, MinIO, and the idempotent bucket provisioner.
 infra-up:

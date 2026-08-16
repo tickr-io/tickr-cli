@@ -29,10 +29,12 @@ pub trait BuildExecutor: Send + Sync {
     async fn build(&self, job: &TaskBuildJob) -> BuildOutcome;
 }
 
-/// Production executor. Shells out to `nix build <nix_expression_path>`
-/// and treats a non-zero exit code as a failure, capturing stderr into
-/// the failure's error text. The build realizes the derivation by
-/// expression path alone — runtime args belong to `nix run`, not the
+/// Production executor. Shells out to
+/// `nix build --no-link <nix_expression_path>` and treats a non-zero exit code
+/// as a failure, capturing stderr into the failure's error text. `--no-link`
+/// prevents concurrent Task builds from racing over a process-wide `result`
+/// symlink. The build realizes the derivation by expression path alone —
+/// runtime args belong to `nix run`, not the
 /// build. The wall-clock latency of a
 /// real build is whatever `nix` takes — workers handle one job at a
 /// time so a slow build doesn't head-of-line-block other workers in the
@@ -45,6 +47,7 @@ impl BuildExecutor for NixBuildExecutor {
         use tokio::process::Command;
         let mut cmd = Command::new("nix");
         cmd.arg("build");
+        cmd.arg("--no-link");
         cmd.arg(&job.nix_expression_path);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());

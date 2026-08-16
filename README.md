@@ -125,7 +125,7 @@ so prior `direnv allow` is optional.
 ## Data-plane SQL storage
 
 The Conductor writes Data-plane SQL state and the API reads the same selected
-repository. Run `tickr migrate` with the same environment before starting either
+repository. Run `tickr-cli migrate` with the same environment before starting either
 process.
 
 - **Postgres (default):** leave `TICKR_SQL_BACKEND` unset, or set it to

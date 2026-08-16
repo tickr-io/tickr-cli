@@ -1,25 +1,28 @@
 ---
 title: CLI reference
-description: Commands and formation selection exposed by the tickr executable.
+description: Commands exposed by the tickr-cli and tickr-lite executables.
 sidebar_position: 1
 ---
 
 # CLI reference
 
 ```text
-Usage: tickr [OPTIONS] <COMMAND>
+Usage: tickr-cli [OPTIONS] <COMMAND>
 ```
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `tickr conductor` | Run the distributed Conductor component |
-| `tickr api` | Run the distributed API component |
-| `tickr executor` | Run a distributed Executor component |
-| `tickr tickr-lite` | Run the admitted single-process Tickr Lite formation |
-| `tickr migrate` | Apply and verify selected Data-plane SQL migrations |
-| `tickr help` | Print command help |
+| `tickr-cli setup` | Configure a private Tickr Lite installation |
+| `tickr-cli examples run <EXAMPLES>...` | Run packaged examples and enter the interactive example session |
+| `tickr-cli tenant` | Administer Tenants through the loopback Control-plane API |
+| `tickr-cli conductor` | Run the distributed Conductor component |
+| `tickr-cli api` | Run the distributed API component |
+| `tickr-cli executor` | Run a distributed Executor component |
+| `tickr-cli migrate` | Apply and verify selected Data-plane SQL migrations |
+| `tickr-lite` | Run the admitted single-process Tickr Lite formation |
+| `tickr-cli help` | Print command help |
 
 ## Distributed formation option
 
@@ -35,20 +38,20 @@ Possible values:
 The option precedes the distributed component command:
 
 ```bash
-tickr --formation all-nats conductor
-tickr --formation all-redis api
+tickr-cli --formation all-nats conductor
+tickr-cli --formation all-redis api
 ```
 
-Tickr Lite is a dedicated command, not a value of the distributed `--formation` option:
+Tickr Lite is a standalone executable, not a distributed formation option:
 
 ```bash
-tickr tickr-lite
+tickr-lite
 ```
 
 ## Migrations
 
 ```text
-Usage: tickr migrate [OPTIONS]
+Usage: tickr-cli migrate [OPTIONS]
 
 --formation <FORMATION>
   possible values: distributed, tickr-lite
@@ -58,11 +61,11 @@ Usage: tickr migrate [OPTIONS]
 Examples:
 
 ```bash
-tickr migrate
-tickr migrate --formation tickr-lite
+tickr-cli migrate
+tickr-cli migrate --formation tickr-lite
 ```
 
-Use the same profile, SQL configuration, release binary, and durable state identity for migration and runtime startup.
+Use the matched release executables, profile, SQL configuration, and durable state identity for migration and runtime startup.
 
 ## Common options
 

@@ -3,6 +3,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 import type * as OpenApiPlugin from 'docusaurus-plugin-openapi-docs';
 import {themes as prismThemes} from 'prism-react-renderer';
 import {currentRelease, versionConfig} from './release-support';
+import packageManifest from './package.json';
 
 
 const config: Config = {
@@ -15,6 +16,9 @@ const config: Config = {
   projectName: 'tickr-cli',
   deploymentBranch: 'gh-pages',
   trailingSlash: false,
+  customFields: {
+    releaseVersion: packageManifest.version,
+  },
   onBrokenLinks: 'throw',
   markdown: {
     mermaid: true,

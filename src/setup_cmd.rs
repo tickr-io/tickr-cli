@@ -6,35 +6,83 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-use tickr::migrate_cmd::{self, MigrationFormation};
+use crate::migrate_cmd::{self, MigrationFormation};
+use crate::terminal::{TerminalStyle, Tone};
 
 const PROFILE_FORMAT_VERSION: u32 = 1;
+const INVITATION_FORMAT_VERSION: u32 = 1;
 const SUPPORTED_NICKEL_VERSIONS: [&str; 2] = ["1.16.0", "1.17.0"];
 const DEFAULT_CONTROL_PLANE_HTTP_URL: &str = "https://ctrl.tickr.works";
 const DEFAULT_CONTROL_PLANE_RELAY_URL: &str = "https://relay.tickr.works";
-const DEFAULT_API_BIND_ADDR: &str = "127.0.0.1:6000";
-const DEFAULT_API_URL: &str = "http://127.0.0.1:6000";
+// Port 6000 is browser-blocked X11; Lite follows the Console entrypoint on 3000.
+const DEFAULT_API_BIND_ADDR: &str = "127.0.0.1:3000";
+const DEFAULT_API_URL: &str = "http://127.0.0.1:3000";
 const CONFIG_PATH_ENV: &str = "TICKR_CONFIG_PATH";
 const TOKEN_ENV: &str = "TICKR_CONTROL_PLANE_BEARER_TOKEN";
 
 #[derive(Args, Clone, Debug, Default)]
-pub(crate) struct SetupArgs {
-    /// Tenant slug supplied with the private-beta invitation.
-    #[arg(long)]
-    tenant_slug: Option<String>,
-    /// Read the Tenant bearer credential from this file instead of prompting.
-    #[arg(long, value_name = "PATH")]
-    token_file: Option<PathBuf>,
+pub struct SetupArgs {
+    /// Import an operator-issued Tickr invitation.
+    #[arg(long = "from", value_name = "INVITATION")]
+    from: Option<PathBuf>,
     /// Directory for Tickr Lite's SQLite database, logs, and durable state.
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Invitation {
+    format_version: u32,
+    tenant_slug: String,
+    credential: String,
+    control_plane_http_url: String,
+    control_plane_relay_url: String,
+    compatible_lite_version: String,
+    expires_at: DateTime<Utc>,
+}
+
+impl Invitation {
+    fn validate(&self, now: DateTime<Utc>) -> Result<()> {
+        if self.format_version != INVITATION_FORMAT_VERSION {
+            bail!(
+                "unsupported Tickr invitation format {}",
+                self.format_version
+            );
+        }
+        validate_tenant_slug(&self.tenant_slug)?;
+        validate_bearer_token(&self.credential)?;
+        validate_https_endpoint(
+            "Control-plane HTTP subquery channel",
+            &self.control_plane_http_url,
+        )?;
+        validate_https_endpoint(
+            "Control-plane Conductor relay",
+            &self.control_plane_relay_url,
+        )?;
+        if self.compatible_lite_version != env!("CARGO_PKG_VERSION") {
+            bail!(
+                "Tickr invitation requires Tickr Lite {}; this executable is {}",
+                self.compatible_lite_version,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        if self.expires_at <= now {
+            bail!(
+                "Tickr invitation expired at {}",
+                self.expires_at.to_rfc3339()
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct SetupProfile {
+pub struct SetupProfile {
     format_version: u32,
     cli_version: String,
     tenant_slug: String,
@@ -49,6 +97,8 @@ impl SetupProfile {
     fn new(
         tenant_slug: String,
         bearer_token: String,
+        control_plane_http_url: String,
+        control_plane_relay_url: String,
         data_dir: PathBuf,
         release_home: PathBuf,
     ) -> Self {
@@ -57,21 +107,21 @@ impl SetupProfile {
             cli_version: env!("CARGO_PKG_VERSION").to_owned(),
             tenant_slug,
             bearer_token,
-            control_plane_http_url: DEFAULT_CONTROL_PLANE_HTTP_URL.to_owned(),
-            control_plane_relay_url: DEFAULT_CONTROL_PLANE_RELAY_URL.to_owned(),
+            control_plane_http_url,
+            control_plane_relay_url,
             data_dir,
             release_home,
         }
     }
 
-    pub(crate) fn release_home(&self) -> &Path {
+    pub fn release_home(&self) -> &Path {
         &self.release_home
     }
 
     fn validate(&self) -> Result<()> {
         if self.format_version != PROFILE_FORMAT_VERSION {
             bail!(
-                "unsupported Tickr setup profile format {}; run `tickr setup` with this release",
+                "unsupported Tickr setup profile format {}; run `tickr-cli setup` with this release",
                 self.format_version
             );
         }
@@ -94,7 +144,7 @@ impl SetupProfile {
         Ok(())
     }
 
-    pub(crate) fn apply_to_environment(&self) -> Result<()> {
+    pub fn apply_to_environment(&self) -> Result<()> {
         let sqlite_path = self.data_dir.join("tickr.db");
         let values = [
             ("TICKR_HOME", self.release_home.as_os_str().to_owned()),
@@ -139,43 +189,110 @@ impl SetupProfile {
     }
 }
 
-pub(crate) async fn run(args: SetupArgs) -> Result<()> {
-    let existing = load_profile()?
-        .map(|profile| {
-            profile
-                .validate()
-                .context("validating the existing Tickr setup profile")?;
-            Ok::<_, anyhow::Error>(profile)
-        })
-        .transpose()?;
-    let release_home = resolve_release_home(existing.as_ref())?;
+pub async fn run(args: SetupArgs) -> Result<()> {
+    let invitation = args.from.as_deref().map(load_invitation).transpose()?;
+    let explicit_existing = match explicit_profile_path()? {
+        Some(path) => load_profile_at(&path)?,
+        None => None,
+    };
+    let release_home = resolve_release_home(explicit_existing.as_ref())?;
+    let path = profile_path(Some(&release_home))?;
+    let existing = match explicit_existing {
+        Some(profile) => Some(profile),
+        None => load_profile_at(&path)?,
+    }
+    .map(|profile| {
+        profile
+            .validate()
+            .context("validating the existing Tickr setup profile")?;
+        Ok::<_, anyhow::Error>(profile)
+    })
+    .transpose()?;
+    if let (Some(invitation), Some(existing)) = (&invitation, &existing) {
+        if invitation.tenant_slug != existing.tenant_slug {
+            bail!(
+                "Tickr invitation belongs to Tenant `{}`, but this installation profile belongs to Tenant `{}`; use a separate extracted release directory, or set explicit TICKR_CONFIG_PATH and --data-dir overrides",
+                invitation.tenant_slug,
+                existing.tenant_slug
+            );
+        }
+    }
     verify_release_resources(&release_home)?;
     verify_prerequisites(&release_home)?;
 
-    let tenant_slug = resolve_tenant_slug(args.tenant_slug, existing.as_ref())?;
-    let bearer_token = resolve_bearer_token(args.token_file.as_deref(), existing.as_ref())?;
-    let requested_data_dir = resolve_data_directory(args.data_dir, existing.as_ref())?;
+    let from_invitation = invitation.is_some();
+    let (tenant_slug, bearer_token, control_plane_http_url, control_plane_relay_url) =
+        match invitation {
+            Some(invitation) => (
+                invitation.tenant_slug,
+                invitation.credential,
+                invitation.control_plane_http_url,
+                invitation.control_plane_relay_url,
+            ),
+            None => (
+                resolve_tenant_slug(existing.as_ref())?,
+                resolve_bearer_token(existing.as_ref())?,
+                existing
+                    .as_ref()
+                    .map(|profile| profile.control_plane_http_url.clone())
+                    .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_HTTP_URL.to_owned()),
+                existing
+                    .as_ref()
+                    .map(|profile| profile.control_plane_relay_url.clone())
+                    .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_RELAY_URL.to_owned()),
+            ),
+        };
+    let requested_data_dir = if from_invitation && args.data_dir.is_none() && existing.is_none() {
+        default_data_directory(&release_home)
+    } else {
+        resolve_data_directory(args.data_dir, existing.as_ref(), &release_home)?
+    };
     let data_dir = create_data_directory(&requested_data_dir)?;
-    let profile = SetupProfile::new(tenant_slug, bearer_token, data_dir, release_home);
-    profile.validate()?;
+    let profile = SetupProfile::new(
+        tenant_slug,
+        bearer_token,
+        control_plane_http_url,
+        control_plane_relay_url,
+        data_dir,
+        release_home,
+    );
 
-    let path = profile_path()?;
     write_profile(&path, &profile)?;
     profile.apply_to_environment()?;
     migrate_cmd::run(MigrationFormation::TickrLite)
         .await
         .context("initializing Tickr Lite state")?;
 
-    println!("Tickr Lite setup complete.");
-    println!("  configuration: {}", path.display());
-    println!("  data: {}", profile.data_dir.display());
-    println!("  Tenant: {}", profile.tenant_slug);
-    println!("Next: ./tickr examples run hello-world");
+    let style = TerminalStyle::stdout();
+    println!(
+        "{}",
+        style.paint(Tone::Success, "Tickr Lite setup complete.")
+    );
+    println!(
+        "  {}: {}",
+        style.paint(Tone::Accent, "configuration"),
+        path.display()
+    );
+    println!(
+        "  {}: {}",
+        style.paint(Tone::Accent, "data"),
+        profile.data_dir.display()
+    );
+    println!(
+        "  {}: {}",
+        style.paint(Tone::Accent, "Tenant"),
+        profile.tenant_slug
+    );
+    println!(
+        "{}: ./tickr-cli examples run hello-world runtime-patch polyglot",
+        style.paint(Tone::Strong, "Next")
+    );
     Ok(())
 }
 
-pub(crate) fn load_and_apply_profile() -> Result<Option<SetupProfile>> {
-    let profile = load_profile()?;
+pub fn load_and_apply_profile() -> Result<Option<SetupProfile>> {
+    let release_home = resolve_installed_release_home()?;
+    let profile = load_profile(release_home.as_deref())?;
     if let Some(profile) = profile.as_ref() {
         profile.validate()?;
         profile.apply_to_environment()?;
@@ -183,7 +300,7 @@ pub(crate) fn load_and_apply_profile() -> Result<Option<SetupProfile>> {
     Ok(profile)
 }
 
-pub(crate) fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<Option<PathBuf>> {
+pub fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<Option<PathBuf>> {
     let release_home = match profile {
         Some(profile) => profile.release_home().to_owned(),
         None => match env::var_os("TICKR_HOME") {
@@ -201,9 +318,24 @@ pub(crate) fn change_to_release_home(profile: Option<&SetupProfile>) -> Result<O
     Ok(Some(release_home))
 }
 
-fn load_profile() -> Result<Option<SetupProfile>> {
-    let path = profile_path()?;
-    let mut file = match File::open(&path) {
+fn load_invitation(path: &Path) -> Result<Invitation> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading Tickr invitation {}", path.display()))?;
+    let invitation: Invitation = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing Tickr invitation {}", path.display()))?;
+    invitation
+        .validate(Utc::now())
+        .with_context(|| format!("validating Tickr invitation {}", path.display()))?;
+    Ok(invitation)
+}
+
+fn load_profile(release_home: Option<&Path>) -> Result<Option<SetupProfile>> {
+    let path = profile_path(release_home)?;
+    load_profile_at(&path)
+}
+
+fn load_profile_at(path: &Path) -> Result<Option<SetupProfile>> {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -278,19 +410,73 @@ fn write_profile(path: &Path, profile: &SetupProfile) -> Result<()> {
     write_result
 }
 
-fn profile_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os(CONFIG_PATH_ENV) {
-        let path = PathBuf::from(path);
-        if path.is_absolute() {
-            return Ok(path);
-        }
+fn explicit_profile_path() -> Result<Option<PathBuf>> {
+    let Some(path) = env::var_os(CONFIG_PATH_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
         bail!("{CONFIG_PATH_ENV} must be an absolute path");
     }
-    Ok(home_directory()?.join(".config/tickr/config.json"))
+    Ok(Some(path))
 }
 
-fn default_data_directory() -> Result<PathBuf> {
-    Ok(home_directory()?.join(".local/share/tickr-lite"))
+fn profile_path(release_home: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit_profile_path()? {
+        return Ok(path);
+    }
+    Ok(default_profile_path(release_home, &home_directory()?))
+}
+
+fn default_profile_path(release_home: Option<&Path>, home: &Path) -> PathBuf {
+    match release_home.filter(|path| is_installed_release_directory(path)) {
+        Some(release_home) => release_home.join("profile/config.json"),
+        None => home.join(".config/tickr/config.json"),
+    }
+}
+
+fn is_installed_release_directory(path: &Path) -> bool {
+    [
+        "tickr-cli",
+        "tickr-lite",
+        "tickr-ctx",
+        "INSTALL.md",
+        "dsl/lib.ncl",
+        "examples/hello-world.ncl",
+    ]
+    .into_iter()
+    .all(|relative| path.join(relative).is_file())
+}
+
+fn resolve_installed_release_home() -> Result<Option<PathBuf>> {
+    let candidates = [
+        env::var_os("TICKR_HOME").map(PathBuf::from),
+        env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_owned)),
+        env::current_dir().ok(),
+    ];
+    first_installed_release_home(candidates.into_iter().flatten())
+}
+
+fn first_installed_release_home(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>> {
+    for candidate in candidates {
+        if is_installed_release_directory(&candidate) {
+            return candidate.canonicalize().map(Some).with_context(|| {
+                format!(
+                    "resolving installed Tickr release directory {}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+    Ok(None)
+}
+
+fn default_data_directory(release_home: &Path) -> PathBuf {
+    release_home.join("data")
 }
 
 fn home_directory() -> Result<PathBuf> {
@@ -327,6 +513,8 @@ fn verify_release_resources(release_home: &Path) -> Result<()> {
     for relative in [
         "dsl/lib.ncl",
         "examples/hello-world.ncl",
+        "examples/runtime-patch.ncl",
+        "examples/polyglot.ncl",
         "examples/flake.nix",
     ] {
         let path = release_home.join(relative);
@@ -337,12 +525,9 @@ fn verify_release_resources(release_home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_tenant_slug(
-    argument: Option<String>,
-    existing: Option<&SetupProfile>,
-) -> Result<String> {
-    let value = argument
-        .or_else(|| env::var("TICKR_TENANT_SLUG").ok())
+fn resolve_tenant_slug(existing: Option<&SetupProfile>) -> Result<String> {
+    let value = env::var("TICKR_TENANT_SLUG")
+        .ok()
         .or_else(|| existing.map(|profile| profile.tenant_slug.clone()))
         .map(Ok)
         .unwrap_or_else(|| prompt_line("Tenant slug", None))?;
@@ -358,14 +543,8 @@ fn validate_tenant_slug(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_bearer_token(
-    token_file: Option<&Path>,
-    existing: Option<&SetupProfile>,
-) -> Result<String> {
-    let value = if let Some(path) = token_file {
-        fs::read_to_string(path)
-            .with_context(|| format!("reading Tenant credential from {}", path.display()))?
-    } else if let Ok(value) = env::var(TOKEN_ENV) {
+fn resolve_bearer_token(existing: Option<&SetupProfile>) -> Result<String> {
+    let value = if let Ok(value) = env::var(TOKEN_ENV) {
         value
     } else if let Some(profile) = existing {
         profile.bearer_token.clone()
@@ -391,6 +570,7 @@ fn validate_bearer_token(value: &str) -> Result<()> {
 fn resolve_data_directory(
     argument: Option<PathBuf>,
     existing: Option<&SetupProfile>,
+    release_home: &Path,
 ) -> Result<PathBuf> {
     if let Some(path) = argument {
         return expand_home(path);
@@ -398,7 +578,7 @@ fn resolve_data_directory(
     if let Some(profile) = existing {
         return Ok(profile.data_dir.clone());
     }
-    let default = default_data_directory()?;
+    let default = default_data_directory(release_home);
     let answer = prompt_line("Tickr data directory", Some(&default.display().to_string()))?;
     expand_home(PathBuf::from(answer))
 }
@@ -431,7 +611,7 @@ fn create_data_directory(path: &Path) -> Result<PathBuf> {
 
 fn prompt_line(label: &str, default: Option<&str>) -> Result<String> {
     if !io::stdin().is_terminal() {
-        bail!("{label} is required in non-interactive mode");
+        bail!("{label} is required; use `tickr-cli setup --from invitation.json`");
     }
     match default {
         Some(default) => print!("{label} [{default}]: "),
@@ -454,7 +634,7 @@ fn prompt_line(label: &str, default: Option<&str>) -> Result<String> {
 
 fn prompt_secret(label: &str) -> Result<String> {
     if !io::stdin().is_terminal() {
-        bail!("{label} is required; set {TOKEN_ENV} or use --token-file");
+        bail!("{label} is required; use `tickr-cli setup --from invitation.json`");
     }
     print!("{label}: ");
     io::stdout().flush().context("flushing credential prompt")?;
@@ -559,9 +739,159 @@ mod tests {
         SetupProfile::new(
             "acme-demo".to_owned(),
             "A".repeat(43),
+            DEFAULT_CONTROL_PLANE_HTTP_URL.to_owned(),
+            DEFAULT_CONTROL_PLANE_RELAY_URL.to_owned(),
             root.join("data"),
             root.join("release"),
         )
+    }
+
+    fn installed_profile(root: &Path, tenant_slug: &str) -> SetupProfile {
+        SetupProfile::new(
+            tenant_slug.to_owned(),
+            "A".repeat(43),
+            DEFAULT_CONTROL_PLANE_HTTP_URL.to_owned(),
+            DEFAULT_CONTROL_PLANE_RELAY_URL.to_owned(),
+            root.join("data"),
+            root.to_owned(),
+        )
+    }
+
+    fn create_installed_release(root: &Path) {
+        fs::create_dir_all(root.join("dsl")).unwrap();
+        fs::create_dir_all(root.join("examples")).unwrap();
+        for relative in [
+            "tickr-cli",
+            "tickr-lite",
+            "tickr-ctx",
+            "INSTALL.md",
+            "dsl/lib.ncl",
+            "examples/hello-world.ncl",
+        ] {
+            fs::write(root.join(relative), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn installed_release_defaults_profile_beside_its_data() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("tickr-lite-v1");
+        let home = root.path().join("home");
+        create_installed_release(&release);
+
+        assert_eq!(
+            default_profile_path(Some(&release), &home),
+            release.join("profile/config.json")
+        );
+        assert_eq!(default_data_directory(&release), release.join("data"));
+    }
+
+    #[test]
+    fn source_workspace_retains_the_global_profile_default() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir_all(source.join("dsl")).unwrap();
+        fs::create_dir_all(source.join("examples")).unwrap();
+        fs::write(source.join("dsl/lib.ncl"), "").unwrap();
+        fs::write(source.join("examples/hello-world.ncl"), "").unwrap();
+
+        assert_eq!(
+            default_profile_path(Some(&source), &home),
+            home.join(".config/tickr/config.json")
+        );
+    }
+
+    #[test]
+    fn installed_release_discovery_does_not_depend_on_current_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let unrelated = root.path().join("elsewhere");
+        let release = root.path().join("tickr-lite-v1");
+        fs::create_dir_all(&unrelated).unwrap();
+        create_installed_release(&release);
+
+        assert_eq!(
+            first_installed_release_home([unrelated, release.clone()]).unwrap(),
+            Some(release.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn installed_releases_load_only_their_own_profiles() {
+        let _lock = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let release_a = root.path().join("tickr-lite-a");
+        let release_b = root.path().join("tickr-lite-b");
+        create_installed_release(&release_a);
+        create_installed_release(&release_b);
+
+        let previous_config = env::var_os(CONFIG_PATH_ENV);
+        let previous_home = env::var_os("HOME");
+        env::remove_var(CONFIG_PATH_ENV);
+        env::set_var("HOME", &home);
+
+        let global_path = home.join(".config/tickr/config.json");
+        write_profile(
+            &global_path,
+            &installed_profile(root.path(), "global-tenant"),
+        )
+        .unwrap();
+        let path_a = default_profile_path(Some(&release_a), &home);
+        write_profile(&path_a, &installed_profile(&release_a, "tenant-a")).unwrap();
+
+        assert_eq!(
+            load_profile(Some(&release_a)).unwrap().unwrap().tenant_slug,
+            "tenant-a"
+        );
+        assert_eq!(load_profile(Some(&release_b)).unwrap(), None);
+
+        let path_b = default_profile_path(Some(&release_b), &home);
+        write_profile(&path_b, &installed_profile(&release_b, "tenant-b")).unwrap();
+        assert_eq!(
+            load_profile(Some(&release_b)).unwrap().unwrap().tenant_slug,
+            "tenant-b"
+        );
+
+        match previous_config {
+            Some(value) => env::set_var(CONFIG_PATH_ENV, value),
+            None => env::remove_var(CONFIG_PATH_ENV),
+        }
+        match previous_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn explicit_profile_path_overrides_an_installed_release() {
+        let _lock = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("tickr-lite-v1");
+        let explicit = root.path().join("explicit/config.json");
+        create_installed_release(&release);
+
+        let previous = env::var_os(CONFIG_PATH_ENV);
+        env::set_var(CONFIG_PATH_ENV, &explicit);
+        assert_eq!(profile_path(Some(&release)).unwrap(), explicit);
+        match previous {
+            Some(value) => env::set_var(CONFIG_PATH_ENV, value),
+            None => env::remove_var(CONFIG_PATH_ENV),
+        }
+    }
+
+    #[test]
+    fn fresh_setup_defaults_data_to_the_release_directory() {
+        let release_home = PathBuf::from("/tickr-lite-v1");
+
+        assert_eq!(
+            default_data_directory(&release_home),
+            release_home.join("data")
+        );
     }
 
     #[test]
@@ -597,6 +927,7 @@ mod tests {
         assert_eq!(env::var("TICKR_TENANT_SLUG").unwrap(), "acme-demo");
         assert_eq!(env::var("TICKR_SQL_BACKEND").unwrap(), "sqlite");
         assert_eq!(env::var("TICKR_API_BIND_ADDR").unwrap(), "127.0.0.1:7000");
+        assert_eq!(env::var("TICKR_API_URL").unwrap(), "http://127.0.0.1:3000");
         assert_eq!(
             env::var("TICKR_CONDUCTOR_SQLITE_URL").unwrap(),
             format!("sqlite://{}", root.path().join("data/tickr.db").display())
@@ -620,6 +951,74 @@ mod tests {
         assert!(validate_bearer_token(&format!("{}-", "a".repeat(42))).is_ok());
         assert!(validate_bearer_token(&"a".repeat(42)).is_err());
         assert!(validate_bearer_token(&format!("{}=", "a".repeat(42))).is_err());
+    }
+
+    #[test]
+    fn invitation_loads_operator_connection_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("invitation.json");
+        fs::write(
+            &path,
+            serde_json::json!({
+                "format_version": 1,
+                "tenant_slug": "acme-demo",
+                "credential": "A".repeat(43),
+                "control_plane_http_url": "https://control.example.test",
+                "control_plane_relay_url": "https://relay.example.test",
+                "compatible_lite_version": env!("CARGO_PKG_VERSION"),
+                "expires_at": "2999-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let invitation = load_invitation(&path).unwrap();
+
+        assert_eq!(invitation.tenant_slug, "acme-demo");
+        assert_eq!(
+            invitation.control_plane_http_url,
+            "https://control.example.test"
+        );
+        assert_eq!(
+            invitation.control_plane_relay_url,
+            "https://relay.example.test"
+        );
+    }
+
+    #[test]
+    fn invitation_rejects_expiry_and_incompatible_lite_versions() {
+        let invitation = Invitation {
+            format_version: INVITATION_FORMAT_VERSION,
+            tenant_slug: "acme-demo".to_owned(),
+            credential: "A".repeat(43),
+            control_plane_http_url: "https://control.example.test".to_owned(),
+            control_plane_relay_url: "https://relay.example.test".to_owned(),
+            compatible_lite_version: env!("CARGO_PKG_VERSION").to_owned(),
+            expires_at: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let now = DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(invitation
+            .validate(now)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+
+        let incompatible = Invitation {
+            compatible_lite_version: "999.0.0".to_owned(),
+            expires_at: DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..invitation
+        };
+        assert!(incompatible
+            .validate(now)
+            .unwrap_err()
+            .to_string()
+            .contains("requires Tickr Lite 999.0.0"));
     }
     #[test]
     fn nickel_116_and_117_are_supported() {
@@ -658,7 +1057,13 @@ mod tests {
         let path = root.path().join("config/tickr/config.json");
         write_profile(&path, &profile(root.path())).unwrap();
 
-        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let directory_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(directory_mode, 0o700);
     }
 }

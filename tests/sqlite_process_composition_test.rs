@@ -207,6 +207,20 @@ async fn wait_for_api(address: &str) {
     panic!("API process never opened its HTTP listener");
 }
 
+async fn wait_for_degraded_api(address: &str) {
+    for _ in 0..100 {
+        if http_request(address, "GET", "/health", "")
+            .await
+            .map(|response| response.starts_with("HTTP/1.1 503"))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Tickr Lite did not expose degraded health while relay was unavailable");
+}
+
 async fn assert_public_read(address: &str, path: &str, expected: &[&str]) -> String {
     let response = http_request(address, "GET", path, "").await.unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
@@ -412,7 +426,7 @@ fn spawn_sqlite_components(
     object_storage_url: &str,
     api_address: &str,
 ) -> (ManagedChild, ManagedChild) {
-    let mut conductor_command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut conductor_command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
     conductor_command.arg("conductor");
     configure_sqlite_process(
         &mut conductor_command,
@@ -425,7 +439,7 @@ fn spawn_sqlite_components(
         child: conductor_command.spawn().expect("start Conductor"),
     };
 
-    let mut api_command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut api_command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
     api_command
         .arg("api")
         .env("TICKR_API_BIND_ADDR", api_address);
@@ -443,7 +457,7 @@ fn spawn_postgres_components(
     object_storage_url: &str,
     api_address: &str,
 ) -> (ManagedChild, ManagedChild) {
-    let mut conductor_command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut conductor_command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
     conductor_command.arg("conductor");
     configure_postgres_process(
         &mut conductor_command,
@@ -456,7 +470,7 @@ fn spawn_postgres_components(
         child: conductor_command.spawn().expect("start Conductor"),
     };
 
-    let mut api_command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut api_command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
     api_command
         .arg("api")
         .env("TICKR_API_BIND_ADDR", api_address);
@@ -740,7 +754,7 @@ fn inadmissible_sqlite_processes_refuse_before_creating_or_serving() {
             let database = directory
                 .path()
                 .join(format!("{component}-{}.db", topology.unwrap_or("missing")));
-            let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_tickr-cli"));
             command
                 .arg(component)
                 .env_remove("TICKR_SQL_TOPOLOGY")
@@ -797,7 +811,7 @@ async fn stale_sqlite_processes_refuse_before_substrate_startup() {
 }
 
 #[tokio::test]
-async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() {
+async fn tickr_lite_withholds_readiness_while_control_plane_relay_is_unavailable() {
     let directory = tempfile::tempdir().unwrap();
     let data_root = directory.path().join("data");
     std::fs::create_dir(&data_root).unwrap();
@@ -805,7 +819,7 @@ async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() 
     let database = data_root.join("tickr.db");
     let sqlite_url = sqlite_url(&database);
 
-    let migration = Command::new(env!("CARGO_BIN_EXE_tickr"))
+    let migration = Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args(["migrate", "--formation", "tickr-lite"])
         .env("TICKR_SQL_BACKEND", "sqlite")
         .env("TICKR_SQL_TOPOLOGY", "single-node")
@@ -822,9 +836,8 @@ async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() 
     let address = format!("127.0.0.1:{}", port_probe.local_addr().unwrap().port());
     drop(port_probe);
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr-lite"));
     command
-        .arg("tickr-lite")
         .current_dir(directory.path())
         .env_remove("TICKR_CONDUCTOR_POSTGRES_URL")
         .env_remove("TICKR_NATS_URL")
@@ -849,6 +862,6 @@ async fn tickr_lite_opens_health_with_only_the_release_binary_and_local_state() 
         child: command.spawn().expect("spawn Tickr Lite"),
     };
 
-    wait_for_api(&address).await;
+    wait_for_degraded_api(&address).await;
     lite.terminate().await;
 }

@@ -356,6 +356,7 @@ impl LiteSupervisor {
             .context("binding Tickr Lite API listener")?;
 
         let (work_admission_tx, work_admission_rx) = watch::channel(false);
+        let (relay_readiness_tx, mut relay_readiness_rx) = watch::channel(false);
         spawn_child(
             &mut children,
             "command-writer",
@@ -438,15 +439,12 @@ impl LiteSupervisor {
         spawn_child(
             &mut children,
             "relay",
-            after_admission(
-                work_admission_rx.clone(),
+            run_streaming_lite(
                 self.cancel.child_token(),
-                run_streaming_lite(
-                    self.cancel.child_token(),
-                    relay_config,
-                    writer.clone(),
-                    relay_roles,
-                ),
+                relay_config,
+                writer.clone(),
+                relay_roles,
+                relay_readiness_tx,
             ),
         );
         spawn_child(
@@ -478,26 +476,34 @@ impl LiteSupervisor {
         });
 
         tokio::task::yield_now().await;
-        if self.cancel.is_cancelled() {
+        let relay_admitted = match await_initial_relay_readiness(
+            &mut relay_readiness_rx,
+            &self.cancel,
+            &mut children,
+        )
+        .await
+        {
+            Ok(admitted) => admitted,
+            Err(startup_failure) => {
+                self.ready.store(false, Ordering::Release);
+                ctx_handle.clear_ready();
+                self.cancel.cancel();
+                if let Err(shutdown_failure) = shutdown_children(&mut children).await {
+                    return Err(startup_failure).context(format!(
+                        "bounded startup teardown failed: {shutdown_failure}"
+                    ));
+                }
+                return Err(startup_failure);
+            }
+        };
+        if !relay_admitted {
             self.ready.store(false, Ordering::Release);
             ctx_handle.clear_ready();
             self.cancel.cancel();
             return shutdown_children(&mut children).await;
         }
-        if let Err(startup_failure) = ensure_no_child_exited_before_admission(&mut children) {
-            self.ready.store(false, Ordering::Release);
-            ctx_handle.clear_ready();
-            self.cancel.cancel();
-            if let Err(shutdown_failure) = shutdown_children(&mut children).await {
-                return Err(startup_failure).context(format!(
-                    "bounded startup teardown failed: {shutdown_failure}"
-                ));
-            }
-            return Err(startup_failure);
-        }
 
         ctx_handle.mark_ready();
-        self.ready.store(true, Ordering::Release);
         if work_admission_tx.send(true).is_err() {
             self.ready.store(false, Ordering::Release);
             ctx_handle.clear_ready();
@@ -507,6 +513,16 @@ impl LiteSupervisor {
                 .context("tearing down after work-admission failure")?;
             bail!("Tickr Lite work-admission gate has no critical children");
         }
+        self.ready.store(true, Ordering::Release);
+        spawn_child(
+            &mut children,
+            "relay-readiness",
+            mirror_relay_readiness(
+                relay_readiness_rx,
+                self.ready.clone(),
+                self.cancel.child_token(),
+            ),
+        );
         println!("Tickr Lite ready");
 
         let failure = tokio::select! {
@@ -927,18 +943,43 @@ where
     future.await
 }
 
-fn ensure_no_child_exited_before_admission(
+async fn await_initial_relay_readiness(
+    readiness: &mut watch::Receiver<bool>,
+    cancel: &CancellationToken,
     children: &mut JoinSet<(&'static str, Result<()>)>,
-) -> Result<()> {
-    let Some(joined) = children.try_join_next() else {
-        return Ok(());
-    };
-    match joined {
-        Ok((name, Ok(()))) => bail!("critical Tickr Lite child `{name}` exited"),
-        Ok((name, Err(error))) => {
-            Err(error).with_context(|| format!("critical Tickr Lite child `{name}` failed"))
+) -> Result<bool> {
+    loop {
+        if *readiness.borrow() {
+            return Ok(true);
         }
-        Err(error) => bail!("critical Tickr Lite child panicked: {error}"),
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(false),
+            joined = children.join_next() => return Err(critical_child_failure(joined)),
+            changed = readiness.changed() => {
+                changed.map_err(|_| anyhow!("Tickr Lite relay readiness channel closed"))?;
+            }
+        }
+    }
+}
+
+async fn mirror_relay_readiness(
+    mut readiness: watch::Receiver<bool>,
+    ready: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    loop {
+        ready.store(*readiness.borrow(), Ordering::Release);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                ready.store(false, Ordering::Release);
+                return Ok(());
+            }
+            changed = readiness.changed() => {
+                changed.map_err(|_| anyhow!("Tickr Lite relay readiness channel closed"))?;
+            }
+        }
     }
 }
 
@@ -1003,6 +1044,7 @@ async fn run_executor(
         let outcome = executor.run_one();
         tokio::pin!(outcome);
         let outcome = tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 let task_handler = executor.task_handler();
                 let stop_all = task_handler.stop_all();
@@ -1309,6 +1351,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_readiness_waits_for_relay_acceptance() {
+        let (accepted, mut readiness) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        let mut children = JoinSet::new();
+        spawn_child(&mut children, "pending-child", async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        {
+            let wait = await_initial_relay_readiness(&mut readiness, &cancel, &mut children);
+            tokio::pin!(wait);
+
+            tokio::select! {
+                result = &mut wait => panic!("readiness opened before relay acceptance: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            accepted.send(true).unwrap();
+            assert!(wait.await.unwrap());
+        }
+        children.abort_all();
+        while children.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
     async fn trigger_captures_are_seeded_into_the_materialized_run_scope() {
         use sqlx::sqlite::SqlitePoolOptions;
         use tickr_conductor::signal_captures::NamedEnvelope;
@@ -1385,18 +1451,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_failure_prevents_readiness_transition() {
-        let ready = AtomicBool::new(false);
+    async fn child_failure_prevents_initial_relay_readiness() {
+        let (_accepted, mut readiness) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let mut children = JoinSet::new();
         spawn_child(&mut children, "failed-child", async {
             Err(anyhow!("startup failure"))
         });
         tokio::task::yield_now().await;
 
-        let error = ensure_no_child_exited_before_admission(&mut children).unwrap_err();
+        let error = await_initial_relay_readiness(&mut readiness, &cancel, &mut children)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("failed-child"));
-        assert!(!ready.load(Ordering::Acquire));
     }
 
     #[test]

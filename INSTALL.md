@@ -1,11 +1,13 @@
 # Install and operate Tickr Lite
 
-This guide takes a released Tickr Lite archive from checksum verification to two
-successful runs against an existing compatible Tickr Control plane:
+This guide takes a released Tickr Lite archive from checksum verification to
+three successful Runs against an existing compatible Tickr Control plane:
 
 1. `hello-world`, a single Task that prints `hello from Tickr`;
 2. `runtime-patch`, which deterministically grows its live graph into two
-   sequential arms from a supplied integer seed.
+   sequential arms from a supplied integer seed;
+3. `polyglot`, a four-Task Python, JavaScript, Go, and Rust chain that reads one
+   predefined greeting through `tickr-ctx`.
 
 The commands support Linux x86-64, Linux ARM64, and Apple silicon. Run them from
 an ordinary unprivileged account. Tickr Lite keeps its API and embedded Console
@@ -14,7 +16,7 @@ on loopback by default.
 ## What you need
 
 Obtain the Tenant slug and bearer credential from the operator of the matched
-Tickr 0.1.4 Control plane. Setup selects the private-beta HTTP and relay
+Tickr 0.1.5 Control plane. Setup selects the private-beta HTTP and relay
 endpoints.
 
 Install Nix with the `nix-command` and `flakes` features enabled. The guided
@@ -63,7 +65,7 @@ nickel --version
 ```
 
 Persist the same `PATH` entry in the shell's startup configuration if a new
-terminal does not retain it. Tickr 0.1.4 accepts Nickel 1.16.0 and 1.17.0;
+terminal does not retain it. Tickr 0.1.5 accepts Nickel 1.16.0 and 1.17.0;
 Nixpkgs currently installs Nickel 1.17.0.
 
 ## 2. Verify and extract the archive
@@ -94,87 +96,92 @@ export TICKR_HOME="$(pwd -P)"
 
 ## 3. Configure Tickr Lite
 
-Run the setup command from the extracted release directory:
+Run setup with the invitation supplied by your Tickr operator:
 
 ```sh
-./tickr setup
+./tickr-cli setup --from invitation.json
 ```
 
-Setup verifies Nix Flakes and a supported Nickel version, then asks for:
+The invitation supplies the Tenant identity, credential, matched Control-plane
+endpoints, compatible Tickr Lite version, and expiry. Setup rejects an expired
+invitation or one issued for another Tickr Lite version. Each extracted release
+owns one installation-local profile. To configure another Tenant, use another
+extracted release directory; explicit `TICKR_CONFIG_PATH` and `--data-dir`
+overrides remain available for managed installations.
 
-- the Tenant slug;
-- the Tenant credential, with terminal echo disabled;
-- the Tickr data directory, recommending
-  `$HOME/.local/share/tickr-lite`.
+Without an invitation, `./tickr-cli setup` retains the interactive fallback and
+asks for the Tenant slug, Tenant credential, and data directory. Tickr Lite
+keeps the local API and embedded Console on `127.0.0.1:3000`, matching the
+Console entrypoint used by other formations.
 
-For this private-beta release, setup selects the matched Control-plane endpoints
-`https://ctrl.tickr.works` and `https://relay.tickr.works`. It keeps the local
-API and embedded Console on `127.0.0.1:6000`.
-
-Setup writes the credential-bearing profile to
-`$HOME/.config/tickr/config.json` with mode `0600`, creates the selected data
-directory with mode `0700`, and applies the Tickr Lite SQLite migrations. Later
-`tickr-lite`, `migrate --formation tickr-lite`, and `examples` commands load
-this profile automatically. Environment variables remain explicit deployment
-overrides.
+Setup reads the credential from the invitation file; it never places the
+credential in a URL or command-line argument. For a fresh installation, setup
+writes the generated profile to `profile/config.json` and defaults durable
+state to `data/`, both inside the extracted release directory.
+`TICKR_CONFIG_PATH=<absolute-path>` and `--data-dir <path>` select other
+locations explicitly. Setup creates the profile directory and data directory
+with mode `0700`, writes the profile with mode `0600`, and applies the Tickr
+Lite SQLite migrations. Later `tickr-lite`, `tickr-cli migrate --formation
+tickr-lite`, and `tickr-cli examples` commands resolve this installation-local
+profile automatically, even when invoked from another working directory.
+Environment variables remain explicit deployment overrides.
 When one of those commands starts Tickr Lite, it prepends the extracted release
 directory to the inherited `PATH`. The packaged `tickr-ctx` executable is
 therefore available to runtime-Patch Tasks while the Nix profile remains
 available for `nix` and `nickel`.
 
-For a non-interactive installation, keep the credential out of shell history:
+
+Setup is idempotent. A later run with an invitation for the same Tenant reuses
+the stored data directory while refreshing its credential and Control-plane
+endpoints.
+
+## 4. Explore Tickr in the Console
 
 ```sh
-./tickr setup \
-  --tenant-slug acme-demo \
-  --token-file /secure/path/tickr-tenant-token \
-  --data-dir "$HOME/.local/share/tickr-lite"
-```
-
-The credential must be the canonical unpadded base64url encoding of exactly 32
-random bytes: 43 ASCII characters matching `[A-Za-z0-9_-]{43}`. Setup never
-puts it in a URL or command-line argument.
-
-Setup is idempotent. A later run reuses the stored Tenant and credential unless
-an explicit flag or environment override supplies a replacement.
-
-## 4. Run the bundled Hello workflow
-
-```sh
-./tickr examples run hello-world
+./tickr-cli examples run hello-world runtime-patch polyglot
 ```
 
 If the local API is not running, this command verifies the SQLite migration,
-starts Tickr Lite for the example, waits for formation readiness, and stops its
-owned process afterward. If Tickr Lite is already running, it uses that process
-and leaves it running.
+starts the standalone `tickr-lite` executable, waits for formation readiness,
+and opens the embedded Console at <http://127.0.0.1:3000/>. If Tickr Lite is
+already running, the command uses that process and never assumes ownership of
+it.
 
-The command registers the bundled Nickel source without copying or JSON-escaping
-it, waits for the definition to become `Ready`, triggers it, resolves the
-resulting Signal to a Run, waits for the `hello` Task, and reads its log. A
-successful run ends with:
+The three definitions register concurrently and each triggers with predefined
+onboarding inputs as soon as its build becomes `Ready`. Python, JavaScript, Go,
+and Rust packages come from the pinned Nix flake and are built during polyglot
+registration; the Tasks do not compile source after the Run begins.
+
+After the initial Runs settle, the terminal becomes an interactive example
+session:
 
 ```text
-Output:
-hello from Tickr
+Commands: run <example>, list, open, help, quit
+tickr › run <example>
 ```
 
-## 5. Start Tickr Lite for ongoing use
+Use `list` to inspect packaged examples, `run <example>` to trigger another
+Run, and `open` to reopen the Console. Ghost text suggests the next untried
+example; press Right Arrow to accept it and Tab to complete names. `Ctrl-C` or
+`quit` ends the session and stops only a `tickr-lite` process the command
+started.
 
-Keep this foreground process running:
+## 5. Start Tickr Lite later
+
+Run the standalone runtime:
 
 ```sh
-./tickr tickr-lite
+./tickr-lite
 ```
 
-The saved setup profile is loaded automatically, and Tickr changes to the
+The saved setup profile is loaded automatically, and Tickr Lite changes to the
 version-matched release directory before starting local roles. Open the
-embedded Console at <http://127.0.0.1:6000/>.
+embedded Console at <http://127.0.0.1:3000/>.
 
 For detailed health:
 
 ```sh
-curl -fsS http://127.0.0.1:6000/api/health |
+curl -fsS http://127.0.0.1:3000/api/health |
   jq '{api, data_plane_sql, control_plane, formation, readiness}'
 ```
 
@@ -185,7 +192,7 @@ reports healthy.
 The remaining runtime-Patch walkthrough uses the HTTP API directly:
 
 ```sh
-export TICKR_API_URL=http://127.0.0.1:6000
+export TICKR_API_URL=http://127.0.0.1:3000
 ```
 
 
@@ -262,9 +269,10 @@ parallel with one another, and rejoin before `summarize-join`.
 
 ## Operational boundaries
 
-- The setup profile contains the Tenant credential. Keep
-  `$HOME/.config/tickr/config.json` private and never print or commit it.
-- Manage only the foreground `./tickr tickr-lite` process belonging to this
+- The invitation and generated setup profile contain the Tenant credential.
+  Keep `invitation.json` and `profile/config.json` private; never print or
+  commit either file.
+- Manage only the foreground `./tickr-lite` process belonging to this
   installation. Do not attempt to reconfigure the external Control plane.
 - Registration and triggering are asynchronous. Use the returned Workflow and
   Signal identities; never guess identifiers from a prior run.
@@ -283,9 +291,9 @@ waits for the Lite supervisor and its critical children to stop.
 - **`failed to execute nickel export`** — confirm `$HOME/.nix-profile/bin` is
   on `PATH` and `nickel --version` reports 1.16.0 or 1.17.0.
 - **`import lib.ncl` fails** — keep the extracted release intact and rerun
-  `./tickr setup` from that directory.
+  `./tickr-cli setup` from that directory.
 - **a Task cannot find `tickr-ctx`** — confirm `tickr-ctx` remains executable
-  beside `tickr`.
+  beside `tickr-lite`.
 - **Nix rejects `path:./examples#...`** — confirm Flakes remain enabled; Tickr
   automatically runs local roles from the version-matched release directory.
 - **registration remains `Building`** — fetch its build state once and inspect

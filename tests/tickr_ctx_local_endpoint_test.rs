@@ -36,7 +36,7 @@ fn tickr_ctx_binary() -> PathBuf {
 }
 
 fn migrate(path: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args(["migrate", "--formation", "tickr-lite"])
         .env("TICKR_SQL_BACKEND", "sqlite")
         .env("TICKR_SQL_TOPOLOGY", "single-node")

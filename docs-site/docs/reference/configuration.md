@@ -52,6 +52,42 @@ changes require a controlled Frontend restart. Secret delivery and ACLs are
 deployment responsibilities; the application checks readability and
 regular-file type, not mode bits or platform ACLs.
 
+### Tickr Lite invitation
+
+`tickr-cli setup --from <path>` accepts a strict UTF-8 JSON invitation with these
+fields:
+
+```json
+{
+  "format_version": 1,
+  "tenant_slug": "acme-demo",
+  "credential": "<43-character base64url token>",
+  "control_plane_http_url": "https://ctrl.example.com",
+  "control_plane_relay_url": "https://relay.example.com",
+  "compatible_lite_version": "0.1.5",
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+```
+
+Unknown or missing fields, unsupported format versions, malformed credentials,
+non-HTTPS endpoints, expired invitations, and invitations for another Tickr
+Lite version reject setup before the local profile or data directory is
+created. The invitation and generated profile both contain the Tenant
+credential and must remain private.
+
+For an extracted installation, setup defaults the profile to
+`profile/config.json` and durable state to `data/` inside the resolved Tickr
+Lite release directory. `TICKR_CONFIG_PATH=<absolute-path>` and
+`--data-dir <path>` override those locations. The profile directory and data
+directory use mode `0700`; the profile uses mode `0600`. `tickr-cli` and
+`tickr-lite` resolve the release-local profile from the executable location,
+not the caller's working directory. Source-workspace operation retains the
+global `$HOME/.config/tickr/config.json` default.
+
+Rerunning setup for an existing installation profile preserves that profile's
+recorded data directory unless the override is supplied. An installed release
+does not fall back to a global profile belonging to another Tenant.
+
 ## SQL
 
 | Variable | Applies to | Meaning |

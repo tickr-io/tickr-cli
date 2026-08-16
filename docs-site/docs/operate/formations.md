@@ -19,7 +19,7 @@ Tickr admits exactly three complete named profiles. A profile owns topology, sto
 Run the complete local formation with:
 
 ```bash
-./tickr tickr-lite
+./tickr-lite
 ```
 
 Characteristics:
@@ -35,9 +35,9 @@ Characteristics:
 Select explicitly:
 
 ```bash
-tickr --formation all-nats conductor
-tickr --formation all-nats api
-tickr --formation all-nats executor
+tickr-cli --formation all-nats conductor
+tickr-cli --formation all-nats api
+tickr-cli --formation all-nats executor
 ```
 
 If a distributed formation flag is omitted, the CLI currently resolves to `all-nats`. Deployment manifests should still make the selected profile visible to operators.

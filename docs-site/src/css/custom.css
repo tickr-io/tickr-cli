@@ -169,6 +169,11 @@ body {
   line-height: 1;
 }
 
+.theme-doc-markdown .getting-started-title {
+  font-size: clamp(2.15rem, 4vw, 3.25rem);
+  letter-spacing: -0.045em;
+}
+
 .theme-doc-markdown h2 {
   margin-top: 3rem;
   padding-top: 1rem;

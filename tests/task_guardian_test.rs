@@ -16,7 +16,7 @@ async fn parent_liveness_eof_kills_guarded_task_group() {
         "trap '' TERM; sleep 60 & echo $! > '{}'; wait",
         pid_file.display()
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tickr-lite"));
     command
         .arg("__task-guardian")
         .arg("--")

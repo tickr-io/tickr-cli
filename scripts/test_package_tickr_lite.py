@@ -21,16 +21,36 @@ class PackageTickrLiteTest(unittest.TestCase):
     def test_archive_is_deterministic_and_contains_the_runnable_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary = root / "tickr"
+            cli_binary = root / "tickr-cli"
+            lite_binary = root / "tickr-lite"
             ctx_binary = root / "tickr-ctx"
-            binary.write_bytes(b"tickr-binary")
+            polyglot_go_binary = root / "tickr-polyglot-go"
+            polyglot_rust_binary = root / "tickr-polyglot-rust"
+            cli_binary.write_bytes(b"tickr-cli-binary")
+            lite_binary.write_bytes(b"tickr-lite-binary")
             ctx_binary.write_bytes(b"tickr-ctx-binary")
+            polyglot_go_binary.write_bytes(b"polyglot-go-binary")
+            polyglot_rust_binary.write_bytes(b"polyglot-rust-binary")
 
             first, first_checksum = PACKAGE.package(
-                binary, ctx_binary, "0.1.4", "test-target", root / "first"
+                cli_binary,
+                lite_binary,
+                ctx_binary,
+                polyglot_go_binary,
+                polyglot_rust_binary,
+                "0.1.5",
+                "test-target",
+                root / "first",
             )
             second, second_checksum = PACKAGE.package(
-                binary, ctx_binary, "0.1.4", "test-target", root / "second"
+                cli_binary,
+                lite_binary,
+                ctx_binary,
+                polyglot_go_binary,
+                polyglot_rust_binary,
+                "0.1.5",
+                "test-target",
+                root / "second",
             )
 
             self.assertEqual(first.read_bytes(), second.read_bytes())
@@ -40,12 +60,13 @@ class PackageTickrLiteTest(unittest.TestCase):
                 first_checksum.read_text(), f"{digest}  {first.name}\n"
             )
 
-            prefix = "tickr-lite-v0.1.4-test-target"
+            prefix = "tickr-lite-v0.1.5-test-target"
             with tarfile.open(first, "r:gz") as archive:
                 members = {member.name: member for member in archive.getmembers()}
 
             required = {
-                f"{prefix}/tickr",
+                f"{prefix}/tickr-cli",
+                f"{prefix}/tickr-lite",
                 f"{prefix}/tickr-ctx",
                 f"{prefix}/INSTALL.md",
                 f"{prefix}/dsl/lib.ncl",
@@ -57,10 +78,26 @@ class PackageTickrLiteTest(unittest.TestCase):
                 f"{prefix}/examples/runtime-patch/patch.sh",
                 f"{prefix}/examples/runtime-patch/echo-pause.sh",
                 f"{prefix}/examples/runtime-patch/summary.sh",
+                f"{prefix}/examples/polyglot.ncl",
+                f"{prefix}/examples/polyglot/greet.py",
+                f"{prefix}/examples/polyglot/greet.js",
+                f"{prefix}/examples/polyglot/greet.go",
+                f"{prefix}/examples/polyglot/greet.rs",
+                f"{prefix}/examples/polyglot/bin/tickr-polyglot-go",
+                f"{prefix}/examples/polyglot/bin/tickr-polyglot-rust",
             }
             self.assertTrue(required.issubset(members))
-            self.assertEqual(members[f"{prefix}/tickr"].mode, 0o755)
+            self.assertEqual(members[f"{prefix}/tickr-cli"].mode, 0o755)
+            self.assertEqual(members[f"{prefix}/tickr-lite"].mode, 0o755)
             self.assertEqual(members[f"{prefix}/tickr-ctx"].mode, 0o755)
+            self.assertEqual(
+                members[f"{prefix}/examples/polyglot/bin/tickr-polyglot-go"].mode,
+                0o755,
+            )
+            self.assertEqual(
+                members[f"{prefix}/examples/polyglot/bin/tickr-polyglot-rust"].mode,
+                0o755,
+            )
             self.assertNotIn(f"{prefix}/README.txt", members)
 
 

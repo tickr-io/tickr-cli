@@ -22,6 +22,13 @@ One `DataDirectory` lease owns the local root for the lifetime of Tickr Lite. Th
 
 A second process cannot acquire the same directory. The lease remains held until critical children, Task process groups, SQLite connections, and durable flushes settle.
 
+A fresh setup defaults the private profile to `profile/config.json` and the
+durable root to `data/` inside the extracted Tickr Lite release directory.
+Separate installations therefore do not silently share Tenant credentials or
+one SQLite database. Explicit `TICKR_CONFIG_PATH` and `--data-dir` overrides
+select managed locations, and an existing installation profile continues to
+use its recorded directory.
+
 ### Backup
 
 Stop Tickr Lite cleanly before taking a simple filesystem backup. If online backup is required, use a SQLite-aware method that includes committed WAL state and preserves the complete admitted directory. Copying only the main database while the writer is active is not valid.

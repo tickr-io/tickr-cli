@@ -842,6 +842,7 @@ It is platform-independent and includes development and optional dependencies.
 | clean-stack | 2.2.0 | MIT | https://registry.npmjs.org/clean-stack/-/clean-stack-2.2.0.tgz | [48da2f39e100d408](#48da2f39e100d408) |
 | cli-boxes | 3.0.0 | MIT | https://registry.npmjs.org/cli-boxes/-/cli-boxes-3.0.0.tgz | [5c932d88256b4ab9](#5c932d88256b4ab9) |
 | cli-table3 | 0.6.5 | MIT | https://registry.npmjs.org/cli-table3/-/cli-table3-0.6.5.tgz | [beb6b55bc79e0660](#beb6b55bc79e0660) |
+| clipboard-win | 5.4.1 | BSL-1.0 | https://github.com/DoumanAsh/clipboard-win | [84c6ef3ea9e3254a](#84c6ef3ea9e3254a), [6c9b0413130652dd](#6c9b0413130652dd) |
 | cliui | 8.0.1 | ISC | https://registry.npmjs.org/cliui/-/cliui-8.0.1.tgz | [2dc0465729366c3a](#2dc0465729366c3a) |
 | clone-deep | 4.0.1 | MIT | https://registry.npmjs.org/clone-deep/-/clone-deep-4.0.1.tgz | [e70ff771504ba41f](#e70ff771504ba41f) |
 | clsx | 2.1.1 | MIT | https://registry.npmjs.org/clsx/-/clsx-2.1.1.tgz | [9a9edad7baae5262](#9a9edad7baae5262) |
@@ -1104,6 +1105,7 @@ It is platform-independent and includes development and optional dependencies.
 | emoticon | 4.1.0 | MIT | https://registry.npmjs.org/emoticon/-/emoticon-4.1.0.tgz | [9966260ba3ea9d6a](#9966260ba3ea9d6a) |
 | encodeurl | 2.0.0 | MIT | https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.0.tgz | [7585ea7bba616ccb](#7585ea7bba616ccb) |
 | encoding-sniffer | 0.2.1 | MIT | https://registry.npmjs.org/encoding-sniffer/-/encoding-sniffer-0.2.1.tgz | [14ea882b80407e75](#14ea882b80407e75) |
+| endian-type | 0.2.0 | MIT | https://github.com/Lolirofle/endian-type.git | [4fce048abd8b1136](#4fce048abd8b1136) |
 | enhanced-resolve | 5.24.5 | MIT | https://registry.npmjs.org/enhanced-resolve/-/enhanced-resolve-5.24.5.tgz | [9068a8782d2fb4c6](#9068a8782d2fb4c6) |
 | entities | 2.2.0 | BSD-2-Clause | https://registry.npmjs.org/entities/-/entities-2.2.0.tgz | [cb992345949ccd6e](#cb992345949ccd6e) |
 | entities | 4.5.0 | BSD-2-Clause | https://registry.npmjs.org/entities/-/entities-4.5.0.tgz | [cb992345949ccd6e](#cb992345949ccd6e) |
@@ -1114,6 +1116,7 @@ It is platform-independent and includes development and optional dependencies.
 | env_logger | 0.11.11 | MIT OR Apache-2.0 | https://github.com/rust-cli/env_logger | [b40930bbcf80744c](#b40930bbcf80744c), [6efb0476a1cc0850](#6efb0476a1cc0850) |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent | [a60eea8175145316](#a60eea8175145316), [7365cc8878a1d7ce](#7365cc8878a1d7ce) |
 | errno | 0.3.14 | MIT OR Apache-2.0 | https://github.com/lambda-fairy/rust-errno | [a60eea8175145316](#a60eea8175145316), [8764a597675778dd](#8764a597675778dd) |
+| error-code | 3.4.0 | BSL-1.0 | https://github.com/DoumanAsh/error-code | [c9bff75738922193](#c9bff75738922193) |
 | error-ex | 1.3.4 | MIT | https://registry.npmjs.org/error-ex/-/error-ex-1.3.4.tgz | [92b07a2e5b0e051d](#92b07a2e5b0e051d) |
 | es-define-property | 1.0.1 | MIT | https://registry.npmjs.org/es-define-property/-/es-define-property-1.0.1.tgz | [5e325595b4ea8cfe](#5e325595b4ea8cfe) |
 | es-define-property | 1.0.1 | MIT | https://registry.npmjs.org/es-define-property/-/es-define-property-1.0.1.tgz | [5e325595b4ea8cfe](#5e325595b4ea8cfe) |
@@ -1760,7 +1763,9 @@ It is platform-independent and includes development and optional dependencies.
 | negotiator | 0.6.4 | MIT | https://registry.npmjs.org/negotiator/-/negotiator-0.6.4.tgz | [553d4d20029a24e3](#553d4d20029a24e3) |
 | neo-async | 2.6.2 | MIT | https://registry.npmjs.org/neo-async/-/neo-async-2.6.2.tgz | [811238ba7d85f6fe](#811238ba7d85f6fe) |
 | neotraverse | 0.6.15 | MIT | https://registry.npmjs.org/neotraverse/-/neotraverse-0.6.15.tgz | [50810ca34b3c662b](#50810ca34b3c662b) |
+| nibble_vec | 0.1.0 | MIT | https://github.com/michaelsproul/rust_nibble_vec | [e4e06f4bee6b18fb](#e4e06f4bee6b18fb) |
 | nix | 0.30.1 | MIT | https://github.com/nix-rust/nix | [66e3ee1fa7f909ad](#66e3ee1fa7f909ad) |
+| nix | 0.31.3 | MIT | https://github.com/nix-rust/nix | [66e3ee1fa7f909ad](#66e3ee1fa7f909ad) |
 | nkeys | 0.4.5 | Apache-2.0 | https://github.com/wasmcloud/nkeys | [c71d239df91726fc](#c71d239df91726fc) |
 | no-case | 3.0.4 | MIT | https://registry.npmjs.org/no-case/-/no-case-3.0.4.tgz | [4eeb3271453a891d](#4eeb3271453a891d) |
 | node-addon-api | 7.1.1 | MIT | https://registry.npmjs.org/node-addon-api/-/node-addon-api-7.1.1.tgz | [89024017b88a9f2b](#89024017b88a9f2b) |
@@ -2040,6 +2045,7 @@ It is platform-independent and includes development and optional dependencies.
 | quote | 1.0.47 | MIT OR Apache-2.0 | https://github.com/dtolnay/quote | [62c7a1e35f564068](#62c7a1e35f564068), [23f18e03dc49df91](#23f18e03dc49df91) |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https://github.com/r-efi/r-efi | [cfc7749b96f63bd3](#cfc7749b96f63bd3), [5749785c8bdefafc](#5749785c8bdefafc), [b05785f9f18e6716](#b05785f9f18e6716), [6fdd060dac72a8b0](#6fdd060dac72a8b0) |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https://github.com/r-efi/r-efi | [cfc7749b96f63bd3](#cfc7749b96f63bd3), [5749785c8bdefafc](#5749785c8bdefafc), [b05785f9f18e6716](#b05785f9f18e6716), [5045a4db9733ce79](#5045a4db9733ce79) |
+| radix_trie | 0.3.0 | MIT | https://github.com/michaelsproul/rust_radix_trie | [e4e06f4bee6b18fb](#e4e06f4bee6b18fb) |
 | rand | 0.10.2 | MIT OR Apache-2.0 | https://github.com/rust-random/rand | [90eb64f0279b0d94](#90eb64f0279b0d94), [35242e7a83f69875](#35242e7a83f69875), [209fbbe0ad52d923](#209fbbe0ad52d923) |
 | rand | 0.8.7 | MIT OR Apache-2.0 | https://github.com/rust-random/rand | [90eb64f0279b0d94](#90eb64f0279b0d94), [35242e7a83f69875](#35242e7a83f69875), [209fbbe0ad52d923](#209fbbe0ad52d923) |
 | rand_chacha | 0.3.1 | MIT OR Apache-2.0 | https://github.com/rust-random/rand | [90eb64f0279b0d94](#90eb64f0279b0d94), [aaff376532ea30a0](#aaff376532ea30a0), [209fbbe0ad52d923](#209fbbe0ad52d923) |
@@ -2175,6 +2181,7 @@ It is platform-independent and includes development and optional dependencies.
 | rustls-platform-verifier-android | 0.1.1 | MIT OR Apache-2.0 | https://github.com/rustls/rustls-platform-verifier | [cfc7749b96f63bd3](#cfc7749b96f63bd3), [b05785f9f18e6716](#b05785f9f18e6716), [2d8359a5234f93c6](#2d8359a5234f93c6) |
 | rustls-webpki | 0.103.13 | ISC | https://github.com/rustls/webpki | [5b698ca13897be3a](#5b698ca13897be3a) |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 | https://github.com/dtolnay/rustversion | [62c7a1e35f564068](#62c7a1e35f564068), [23f18e03dc49df91](#23f18e03dc49df91) |
+| rustyline | 18.0.1 | MIT | https://github.com/kkawakam/rustyline | [0081f3f493192b08](#0081f3f493192b08) |
 | rw | 1.3.3 | BSD-3-Clause | https://registry.npmjs.org/rw/-/rw-1.3.3.tgz | [e273680c43c2ab5b](#e273680c43c2ab5b) |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 | https://github.com/dtolnay/ryu | [62c7a1e35f564068](#62c7a1e35f564068), [c9bff75738922193](#c9bff75738922193) |
 | safe-buffer | 5.1.2 | MIT | https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.1.2.tgz | [c7cc929b57080f4b](#c7cc929b57080f4b) |
@@ -2469,6 +2476,8 @@ It is platform-independent and includes development and optional dependencies.
 | unicode-normalization | 0.1.25 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-normalization | [23860c2a7b5d96b2](#23860c2a7b5d96b2), [a60eea8175145316](#a60eea8175145316), [7b63ecd5f1902af1](#7b63ecd5f1902af1) |
 | unicode-properties | 0.1.4 | MIT/Apache-2.0 | https://github.com/unicode-rs/unicode-properties | [23860c2a7b5d96b2](#23860c2a7b5d96b2), [a60eea8175145316](#a60eea8175145316), [7b63ecd5f1902af1](#7b63ecd5f1902af1) |
 | unicode-property-aliases-ecmascript | 2.2.0 | MIT | https://registry.npmjs.org/unicode-property-aliases-ecmascript/-/unicode-property-aliases-ecmascript-2.2.0.tgz | [483acb265f182907](#483acb265f182907) |
+| unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-segmentation | [23860c2a7b5d96b2](#23860c2a7b5d96b2), [a60eea8175145316](#a60eea8175145316), [7b63ecd5f1902af1](#7b63ecd5f1902af1) |
+| unicode-width | 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width | [23860c2a7b5d96b2](#23860c2a7b5d96b2), [a60eea8175145316](#a60eea8175145316), [7b63ecd5f1902af1](#7b63ecd5f1902af1) |
 | unified | 11.0.5 | MIT | https://registry.npmjs.org/unified/-/unified-11.0.5.tgz | [05811400116ed61f](#05811400116ed61f) |
 | unique-string | 3.0.0 | MIT | https://registry.npmjs.org/unique-string/-/unique-string-3.0.0.tgz | [5c932d88256b4ab9](#5c932d88256b4ab9) |
 | unist-util-is | 6.0.1 | MIT | https://registry.npmjs.org/unist-util-is/-/unist-util-is-6.0.1.tgz | [82974dbf2639d13e](#82974dbf2639d13e) |
@@ -2950,6 +2959,33 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+<a id="0081f3f493192b08"></a>
+### 0081f3f493192b08
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Katsu Kawakami & Rustyline authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 <a id="009172299a3a1408"></a>
@@ -18291,6 +18327,33 @@ Declared author/owner metadata: not declared
 The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
+<a id="4fce048abd8b1136"></a>
+### 4fce048abd8b1136
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 <a id="500d6bc35e93b68e"></a>
 ### 500d6bc35e93b68e
 
@@ -22787,6 +22850,19 @@ Fiat Cryptography is licensed under the MIT License <LICENSE-MIT> or
 <LICENSE-APACHE> or <http://www.apache.org/licenses/LICENSE-2.0>, or
 the BSD 1-Clause License <LICENSE-BSD-1> or
 <https://spdx.org/licenses/BSD-1-Clause.html>, at your option.
+```
+
+<a id="6c9b0413130652dd"></a>
+### 6c9b0413130652dd
+
+```text
+Installed-package attribution record
+Component: clipboard-win
+Version: 5.4.1
+Declared license: BSL-1.0
+Upstream source: https://github.com/DoumanAsh/clipboard-win
+Declared author/owner metadata: Douman <douman@gmx.se>
+The locked registry metadata contains no standalone license/notice text. Canonical SPDX terms named by its license declaration are included with this record; the source and owner metadata are retained here for per-component review.
 ```
 
 <a id="6cb0631f71c77497"></a>
@@ -45385,6 +45461,33 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+<a id="e4e06f4bee6b18fb"></a>
+### e4e06f4bee6b18fb
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Michael Sproul
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 <a id="e4faf95c758c68df"></a>

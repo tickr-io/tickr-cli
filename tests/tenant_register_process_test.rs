@@ -373,7 +373,7 @@ async fn protected_tenant_channel(
 }
 
 async fn run_registration(slug: &str, display_name: &str, expires_at: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args([
             "tenant",
             "register",
@@ -390,7 +390,7 @@ async fn run_registration(slug: &str, display_name: &str, expires_at: &str) -> O
 }
 
 async fn run_listing() -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args(["tenant", "list"])
         .output()
         .await
@@ -398,7 +398,7 @@ async fn run_listing() -> Output {
 }
 
 async fn run_show(slug: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args(["tenant", "show", slug])
         .output()
         .await
@@ -406,7 +406,7 @@ async fn run_show(slug: &str) -> Output {
 }
 
 async fn run_issuance(slug: &str, expires_at: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args([
             "tenant",
             "credential",
@@ -421,7 +421,7 @@ async fn run_issuance(slug: &str, expires_at: &str) -> Output {
 }
 
 async fn run_revocation(slug: &str, credential_id: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tickr"))
+    Command::new(env!("CARGO_BIN_EXE_tickr-cli"))
         .args(["tenant", "credential", "revoke", slug, credential_id])
         .output()
         .await

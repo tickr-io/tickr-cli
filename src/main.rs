@@ -1,6 +1,6 @@
 mod examples_cmd;
-mod setup_cmd;
 mod tenant_cmd;
+use tickr::setup_cmd;
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -12,7 +12,6 @@ use tickr_executor::app::{run_executor, run_executor_with_formation_roles};
 use tokio_util::sync::CancellationToken;
 
 use tickr::all_redis_formation::AllRedisProcessAdmission;
-use tickr::lite_supervisor::LiteSupervisor;
 use tickr::migrate_cmd::{self, MigrationFormation};
 use tickr::redis_acl_admission::{
     compose_and_reconstruct_all_redis, DistributedCoordinationBundle,
@@ -48,21 +47,13 @@ enum Commands {
     },
     /// Configure a private Tickr Lite installation.
     Setup(setup_cmd::SetupArgs),
-    /// Run bundled Tickr Lite examples.
+    /// Run bundled Tickr Lite examples in an interactive operational session.
     Examples(examples_cmd::ExamplesArgs),
-    /// Run the admitted single-process Tickr Lite formation.
-    TickrLite,
     /// Apply and verify the selected Data-plane SQL migrations.
     Migrate {
         /// Install or update Tickr Lite formation metadata after SQLite verification.
         #[arg(long, value_enum, default_value_t = MigrationFormation::Distributed)]
         formation: MigrationFormation,
-    },
-    /// Internal per-Task process-group guardian.
-    #[command(name = "__task-guardian", hide = true)]
-    TaskGuardian {
-        #[arg(last = true, required = true)]
-        command: Vec<String>,
     },
 }
 
@@ -363,14 +354,9 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("Rustls crypto provider was already installed"))?;
     let cli = Cli::parse();
-    if let Commands::TaskGuardian { command } = &cli.command {
-        let code = tickr::lite_supervisor::run_task_guardian(command.clone()).await?;
-        std::process::exit(code);
-    }
     let uses_lite_profile = matches!(
         &cli.command,
-        Commands::TickrLite
-            | Commands::Examples(_)
+        Commands::Examples(_)
             | Commands::Migrate {
                 formation: MigrationFormation::TickrLite
             }
@@ -380,7 +366,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    if matches!(&cli.command, Commands::TickrLite | Commands::Examples(_)) {
+    if matches!(&cli.command, Commands::Examples(_)) {
         setup_cmd::change_to_release_home(profile.as_ref())?;
     }
     if !matches!(
@@ -430,9 +416,7 @@ async fn main() -> Result<()> {
         Commands::Tenant { command } => Box::pin(tenant_cmd::run(command)),
         Commands::Setup(args) => Box::pin(setup_cmd::run(args)),
         Commands::Examples(args) => Box::pin(examples_cmd::run(args, shutdown.clone())),
-        Commands::TickrLite => Box::pin(LiteSupervisor::new(shutdown.clone()).run()),
         Commands::Migrate { formation } => Box::pin(migrate_cmd::run(formation)),
-        Commands::TaskGuardian { .. } => unreachable!("Task guardian exits before composition"),
     };
 
     #[cfg(not(madsim))]
@@ -468,7 +452,7 @@ mod tests {
     #[test]
     fn distributed_roots_accept_explicit_all_redis_selection() {
         for component in ["api", "conductor", "executor"] {
-            let cli = Cli::try_parse_from(["tickr", "--formation", "all-redis", component])
+            let cli = Cli::try_parse_from(["tickr-cli", "--formation", "all-redis", component])
                 .expect("all-Redis is a valid distributed formation");
             assert_eq!(cli.distributed_formation, DistributedFormation::AllRedis);
             assert!(matches!(
@@ -480,7 +464,7 @@ mod tests {
 
     #[test]
     fn omitted_distributed_selection_remains_all_nats() {
-        let cli = Cli::try_parse_from(["tickr", "api"]).expect("default API command");
+        let cli = Cli::try_parse_from(["tickr-cli", "api"]).expect("default API command");
         assert_eq!(cli.distributed_formation, DistributedFormation::AllNats);
     }
 }

@@ -56,6 +56,11 @@ def append_examples(members: list[tuple[str, Path, int]]) -> None:
         "runtime-patch/patch.sh",
         "runtime-patch/echo-pause.sh",
         "runtime-patch/summary.sh",
+        "polyglot.ncl",
+        "polyglot/greet.py",
+        "polyglot/greet.js",
+        "polyglot/greet.go",
+        "polyglot/greet.rs",
     ]:
         append_file(members, f"examples/{relative}", examples / relative, 0o644)
 
@@ -63,7 +68,14 @@ def append_examples(members: list[tuple[str, Path, int]]) -> None:
 
 
 def package(
-    binary: Path, ctx_binary: Path, version: str, target: str, output: Path
+    cli_binary: Path,
+    lite_binary: Path,
+    ctx_binary: Path,
+    polyglot_go_binary: Path,
+    polyglot_rust_binary: Path,
+    version: str,
+    target: str,
+    output: Path,
 ) -> tuple[Path, Path]:
     if not VERSION.fullmatch(version):
         raise ValueError(f"invalid release version: {version}")
@@ -81,8 +93,21 @@ def package(
         raise ValueError(f"invalid target name: {target}")
 
     members: list[tuple[str, Path, int]] = []
-    append_file(members, "tickr", binary, 0o755)
+    append_file(members, "tickr-cli", cli_binary, 0o755)
+    append_file(members, "tickr-lite", lite_binary, 0o755)
     append_file(members, "tickr-ctx", ctx_binary, 0o755)
+    append_file(
+        members,
+        "examples/polyglot/bin/tickr-polyglot-go",
+        polyglot_go_binary,
+        0o755,
+    )
+    append_file(
+        members,
+        "examples/polyglot/bin/tickr-polyglot-rust",
+        polyglot_rust_binary,
+        0o755,
+    )
     append_file(members, "INSTALL.md", ROOT / "INSTALL.md", 0o644)
     append_file(members, "LICENSE", ROOT / "LICENSE", 0o644)
     append_file(members, "NOTICE", ROOT / "NOTICE", 0o644)
@@ -129,15 +154,25 @@ def package(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--cli-binary", type=Path, required=True)
+    parser.add_argument("--lite-binary", type=Path, required=True)
     parser.add_argument("--ctx-binary", type=Path, required=True)
+    parser.add_argument("--polyglot-go-binary", type=Path, required=True)
+    parser.add_argument("--polyglot-rust-binary", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     archive, checksum = package(
-        args.binary, args.ctx_binary, args.version, args.target, args.output
+        args.cli_binary,
+        args.lite_binary,
+        args.ctx_binary,
+        args.polyglot_go_binary,
+        args.polyglot_rust_binary,
+        args.version,
+        args.target,
+        args.output,
     )
     print(archive)
     print(checksum)

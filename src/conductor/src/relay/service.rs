@@ -34,8 +34,7 @@ use tickr_proto::signal as sp;
 use tickr_proto::task as tc;
 use tickr_proto::workflow as wf;
 use tickr_proto::TenantId;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, Request, Status, Streaming};
@@ -2309,6 +2308,7 @@ pub async fn run_streaming_lite(
     relay_config: ControlPlaneRelayConfig,
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     roles: Arc<dyn LiteRelayRoles>,
+    readiness: watch::Sender<bool>,
 ) -> Result<()> {
     run_streaming_lite_at(
         shutdown_token,
@@ -2316,6 +2316,7 @@ pub async fn run_streaming_lite(
         definition_repository,
         roles,
         TenantId::from_env().to_string(),
+        readiness,
     )
     .await
 }
@@ -2326,6 +2327,7 @@ async fn run_streaming_lite_at(
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     roles: Arc<dyn LiteRelayRoles>,
     tenant_id: String,
+    readiness: watch::Sender<bool>,
 ) -> Result<()> {
     use std::time::{Duration, Instant};
 
@@ -2334,6 +2336,7 @@ async fn run_streaming_lite_at(
     const STABLE_THRESHOLD: Duration = Duration::from_secs(5);
 
     let mut backoff_ms = INITIAL_BACKOFF_MS;
+    readiness.send_replace(false);
     loop {
         if shutdown_token.is_cancelled() {
             return Ok(());
@@ -2345,6 +2348,7 @@ async fn run_streaming_lite_at(
             Arc::clone(&definition_repository),
             &tenant_id,
             Arc::clone(&roles),
+            readiness.clone(),
         )
         .await
         {
@@ -2371,15 +2375,10 @@ async fn try_run_streaming_lite(
     definition_repository: Arc<tickr_migrations::backend::WriterRepositoryBundle>,
     tenant_id: &str,
     roles: Arc<dyn LiteRelayRoles>,
+    readiness: watch::Sender<bool>,
 ) -> Result<()> {
     let mut client = connect_relay_client(relay_config).await?;
     let (tx, rx) = mpsc::channel::<ConductorRelayMessage>(32);
-    init_relay_tx(tx.clone()).await;
-
-    let cycle = CancellationToken::new();
-    let _cycle_guard = cycle.clone().drop_guard();
-    roles.relay_connected(tx.clone(), cycle.clone()).await;
-
     let outbound = tokio_stream::once(ConductorRelayMessage {
         entity_type: 0,
         payload: Vec::new(),
@@ -2388,7 +2387,13 @@ async fn try_run_streaming_lite(
     .chain(tokio_stream::wrappers::ReceiverStream::new(rx));
     let mut inbound = establish_relay_stream(&mut client, outbound, relay_config).await?;
 
-    tokio::select! {
+    init_relay_tx(tx.clone()).await;
+    let cycle = CancellationToken::new();
+    let _cycle_guard = cycle.clone().drop_guard();
+    roles.relay_connected(tx.clone(), cycle.clone()).await;
+    readiness.send_replace(true);
+
+    let result = tokio::select! {
         result = async {
             while let Some(message) = inbound.next().await {
                 let message = message?;
@@ -2507,10 +2512,12 @@ async fn try_run_streaming_lite(
                 }
             }
             Ok::<(), anyhow::Error>(())
-        } => result?,
-        _ = shutdown_token.cancelled() => {}
-    }
-    Ok(())
+        } => result,
+        _ = shutdown_token.cancelled() => Ok(()),
+    };
+    RELAY_TX.lock().await.take();
+    readiness.send_replace(false);
+    result
 }
 
 #[cfg(all(test, not(madsim)))]
@@ -3583,6 +3590,15 @@ mod lite_relay_tests {
         .await
         .unwrap();
     }
+    async fn await_readiness(readiness: &mut watch::Receiver<bool>, expected: bool) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            readiness.wait_for(|ready| *ready == expected),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn lite_relay_uses_configured_control_plane_relay_url() {
@@ -3605,16 +3621,20 @@ mod lite_relay_tests {
         let relay_config = ControlPlaneRelayConfig::from_env().unwrap();
         let (_directory, repository) = definition_repository().await;
         let shutdown = CancellationToken::new();
+        let (readiness_tx, mut readiness) = watch::channel(false);
         let relay = tokio::spawn(run_streaming_lite(
             shutdown.clone(),
             relay_config,
             repository,
             Arc::new(NoopRoles),
+            readiness_tx,
         ));
 
         await_connections(&connections, 1).await;
+        await_readiness(&mut readiness, true).await;
         shutdown.cancel();
         relay.await.unwrap().unwrap();
+        assert!(!*readiness.borrow());
         server.abort();
     }
 
@@ -3639,16 +3659,20 @@ mod lite_relay_tests {
         let shutdown = CancellationToken::new();
         let relay_config =
             ControlPlaneRelayConfig::new(&relay_url, TEST_BEARER_TOKEN, true).unwrap();
+        let (readiness_tx, mut readiness) = watch::channel(false);
         let relay = tokio::spawn(run_streaming_lite_at(
             shutdown.clone(),
             relay_config,
             repository,
             Arc::new(NoopRoles),
             "test-tenant".to_owned(),
+            readiness_tx,
         ));
 
         await_connections(&connections, 1).await;
+        await_readiness(&mut readiness, true).await;
         first_outage.cancel();
+        await_readiness(&mut readiness, false).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         first_server.abort();
         first_server.await.unwrap_err();
@@ -3663,6 +3687,7 @@ mod lite_relay_tests {
         )
         .await;
         await_connections(&connections, 2).await;
+        await_readiness(&mut readiness, true).await;
         shutdown.cancel();
         relay.await.unwrap().unwrap();
         second_server.abort();
@@ -3719,12 +3744,14 @@ mod lite_relay_tests {
         let relay_config =
             ControlPlaneRelayConfig::new(&format!("http://{address}"), TEST_BEARER_TOKEN, true)
                 .unwrap();
+        let (readiness_tx, _readiness) = watch::channel(false);
         let relay = tokio::spawn(run_streaming_lite_at(
             shutdown.clone(),
             relay_config,
             Arc::clone(&repository),
             Arc::new(NoopRoles),
             "test-tenant".to_owned(),
+            readiness_tx,
         ));
 
         await_connections(&connections, 1).await;

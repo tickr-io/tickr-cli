@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Tickr Team"]
 license = "Apache-2.0"
@@ -81,8 +81,16 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "tickr"
+name = "tickr-cli"
 path = "src/main.rs"
+
+[[bin]]
+name = "tickr-lite"
+path = "src/bin/tickr-lite.rs"
+
+[[bin]]
+name = "tickr-polyglot-rust"
+path = "examples/polyglot/greet.rs"
 
 [lints]
 workspace = true
@@ -113,6 +121,8 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 prost = { workspace = true }
 futures-util = { workspace = true }
+rustyline = { version = "18.0.1", default-features = false, features = ["custom-bindings"] }
+libc = "0.2"
 
 [dev-dependencies]
 testcontainers-modules = { workspace = true }

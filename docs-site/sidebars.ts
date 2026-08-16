@@ -3,14 +3,9 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 const sidebars: SidebarsConfig = {
   docsSidebar: [
     {
-      type: 'category',
+      type: 'doc',
+      id: 'get-started/index',
       label: 'Get started',
-      link: {type: 'doc', id: 'get-started/index'},
-      items: [
-        'get-started/access',
-        'get-started/install-lite',
-        'get-started/first-run',
-      ],
     },
     {
       type: 'category',
