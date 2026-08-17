@@ -70,6 +70,19 @@ release of the site.
 
 <TickrLiteInstall />
 
+:::warning macOS Gatekeeper
+
+If macOS blocks the downloaded binaries, run the following command from inside
+the extracted Tickr Lite directory:
+
+```bash
+xattr -dr com.apple.quarantine .
+```
+
+This removes the quarantine attribute from the verified release.
+
+:::
+
 Keep the extracted directory intact; it contains the executables, Core DSL,
 Console, examples, and notices for the same release.
 

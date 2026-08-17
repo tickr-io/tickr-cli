@@ -71,9 +71,7 @@ html {
 }
 
 body {
-  background:
-    linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), var(--tickr-grid) calc(100% - 1px)) 0 0 / 32px 100%,
-    var(--tickr-paper);
+  background: var(--tickr-paper);
   font-feature-settings: 'ss02' 1, 'cv02' 1;
 }
 
