@@ -23,6 +23,7 @@ EXPECTED_PROTO_PACKAGES = {
     "archive-union.proto": "tickr.archive",
     "conductor-relay.proto": "tickr",
     "instance-snapshot.proto": "tickr.instance",
+    "installation-bootstrap.proto": "tickr.installation",
     "patch.proto": "tickr.patch",
     "runnable-projection.proto": "tickr.runnable",
     "signal.proto": "tickr.signal",

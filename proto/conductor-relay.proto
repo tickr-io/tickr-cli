@@ -9,6 +9,9 @@ message ConductorRelayMessage {
   EntityType entity_type = 1;
   bytes payload = 2;
   optional string tenant_id = 3;
+  // Reserved for the later Tenant-slug handshake assertion. Receivers must
+  // ignore it until admission explicitly consumes the additive field.
+  optional string tenant_slug = 4;
 }
 
 // Stable public relay discriminator. Removed values are reserved permanently;

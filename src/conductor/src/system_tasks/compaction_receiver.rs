@@ -453,5 +453,6 @@ pub fn build_ack(workflow_instance_id: &str, correlation: &str) -> ConductorRela
         // Coordinator stamps the tenant from connection state (handshake), so an
         // individual outbound envelope carries no tenant of its own.
         tenant_id: None,
+        tenant_slug: None,
     }
 }

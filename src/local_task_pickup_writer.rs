@@ -569,6 +569,7 @@ impl LocalTaskPickupWriterClient {
                 entity_type: EntityType::TaskEvent as i32,
                 payload: event.event.clone(),
                 tenant_id: None,
+                tenant_slug: None,
             })
             .await
             .map_err(|error| format!("local TaskEvent relay closed before forward: {error}"))?;
@@ -592,6 +593,7 @@ impl LocalTaskPickupWriterClient {
                 entity_type: EntityType::CancelTaskAck as i32,
                 payload: acknowledgement.acknowledgement.clone(),
                 tenant_id: None,
+                tenant_slug: None,
             })
             .await
             .map_err(|error| {
@@ -2077,6 +2079,7 @@ mod tests {
                 entity_type: EntityType::TaskEvent as i32,
                 payload: terminal.event.clone(),
                 tenant_id: None,
+                tenant_slug: None,
             })
             .await
             .unwrap();
@@ -2187,6 +2190,7 @@ mod tests {
                 entity_type: EntityType::CancelTaskAck as i32,
                 payload: pending.acknowledgement.clone(),
                 tenant_id: None,
+                tenant_slug: None,
             })
             .await
             .unwrap();

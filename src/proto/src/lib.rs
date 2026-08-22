@@ -5,6 +5,14 @@ pub mod tickr {
     tonic::include_proto!("tickr");
 }
 
+// Versioned, formation-neutral Installation bootstrap contract (package
+// `tickr.installation`, from proto/installation-bootstrap.proto). The generated
+// wire family and its fail-closed semantic validator share one public module.
+pub mod installation {
+    tonic::include_proto!("tickr.installation");
+    include!("installation.rs");
+}
+
 // API<->conductor command contract (package `tickr.api`, from
 // proto/tickr-api.proto). Kept in its own module so callers reach the command
 // envelopes via `tickr_proto::tickr_api::*` without colliding with the `tickr`

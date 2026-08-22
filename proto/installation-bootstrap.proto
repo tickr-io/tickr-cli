@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package tickr.installation;
+
+// Formation-neutral, versioned bootstrap returned by every Installation setup
+// mode. Field numbers are permanent; readers ignore unknown additive fields.
+message InstallationBootstrap {
+  uint32 schema_version = 1;
+  string tenant_slug = 2;
+  string tenant_id = 3;
+  TenantTier tenant_tier = 4;
+  ControlPlaneEndpoints control_plane = 5;
+  FormationProfile formation_profile = 6;
+  TickrLiteCompatibility compatibility = 7;
+  AuthenticationMode authentication = 8;
+  optional string bootstrap_expires_at = 9;
+
+  oneof variant {
+    AuthenticatedBootstrap authenticated = 10;
+    GuestBootstrap guest = 11;
+    DisabledBootstrap disabled = 12;
+  }
+}
+
+// Closed Tenant classification carried independently from Tenant identity.
+enum TenantTier {
+  TENANT_TIER_UNSPECIFIED = 0;
+  TENANT_TIER_GUEST = 1;
+  TENANT_TIER_SOLO = 2;
+  TENANT_TIER_ENTERPRISE = 3;
+  TENANT_TIER_DEVELOPMENT = 4;
+}
+
+// Frontend-issued Formation profile. A bootstrap consumer cannot select it.
+enum FormationProfile {
+  FORMATION_PROFILE_UNSPECIFIED = 0;
+  FORMATION_PROFILE_LITE_LOCAL = 1;
+  FORMATION_PROFILE_ALL_NATS = 2;
+  FORMATION_PROFILE_ALL_REDIS = 3;
+}
+
+// Whether Installation requests prove caller ownership with a credential.
+enum AuthenticationMode {
+  AUTHENTICATION_MODE_UNSPECIFIED = 0;
+  AUTHENTICATION_MODE_REQUIRED = 1;
+  AUTHENTICATION_MODE_NONE = 2;
+}
+
+message ControlPlaneEndpoints {
+  string http = 1;
+  string relay = 2;
+}
+
+// An advisory version requirement interpreted by the consuming Tickr Lite
+// release. Compatibility remains advisory unless that consumer opts into strict
+// enforcement.
+message TickrLiteCompatibility {
+  string version_requirement = 1;
+}
+
+message InstallationCredential {
+  string credential_id = 1;
+  string credential = 2;
+  string created_at = 3;
+  string expires_at = 4;
+}
+
+message AuthenticatedBootstrap {
+  InstallationCredential credential = 1;
+}
+
+message GuestBootstrap {
+  InstallationCredential credential = 1;
+  GuestLease lease = 2;
+}
+
+message GuestLease {
+  string lease_id = 1;
+  string created_at = 2;
+  string expires_at = 3;
+}
+
+// Authentication-disabled Development Installations carry no credential or
+// lease by construction.
+message DisabledBootstrap {}

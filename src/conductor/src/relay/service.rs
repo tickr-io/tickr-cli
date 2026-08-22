@@ -220,6 +220,7 @@ pub async fn send_workflow_registration(definition: wf::WorkflowDefinition) -> R
             entity_type: EntityType::SubmitWorkflow as i32,
             payload: workflow_bytes,
             tenant_id: None,
+            tenant_slug: None,
         };
 
         // Send the message through the relay
@@ -248,6 +249,7 @@ pub async fn forward_workflow_registration_bytes(payload: Vec<u8>) -> Result<()>
             entity_type: EntityType::SubmitWorkflow as i32,
             payload,
             tenant_id: None,
+            tenant_slug: None,
         };
         tx.send(msg)
             .await
@@ -286,6 +288,7 @@ pub async fn try_send_signal(signal: &sp::Signal) -> Result<TrySendOutcome> {
         entity_type: EntityType::Signal as i32,
         payload,
         tenant_id: None,
+        tenant_slug: None,
     };
 
     match tx.try_send(msg) {
@@ -308,6 +311,7 @@ pub async fn try_send_gate_outcome(outcome: &sp::GateOutcome) -> Result<TrySendO
         entity_type: EntityType::GateOutcome as i32,
         payload: outcome.encode_to_vec(),
         tenant_id: None,
+        tenant_slug: None,
     };
     match tx.try_send(msg) {
         Ok(()) => Ok(TrySendOutcome::Sent),
@@ -333,6 +337,7 @@ pub async fn send_signal(signal: &sp::Signal) -> Result<()> {
             entity_type: EntityType::Signal as i32,
             payload,
             tenant_id: None,
+            tenant_slug: None,
         };
 
         tx.send(msg)
@@ -363,6 +368,7 @@ pub async fn send_gate_outcome(outcome: &sp::GateOutcome) -> Result<()> {
         entity_type: EntityType::GateOutcome as i32,
         payload,
         tenant_id: None,
+        tenant_slug: None,
     };
     tx.send(msg)
         .await
@@ -389,6 +395,7 @@ pub async fn send_patch_workflow_instance(envelope: &pp::PatchEnvelope) -> Resul
         entity_type: EntityType::PatchWorkflowInstance as i32,
         payload,
         tenant_id: None,
+        tenant_slug: None,
     };
     tx.send(msg)
         .await
@@ -959,6 +966,7 @@ pub async fn drain_cancel_acks(
             entity_type: EntityType::CancelTaskAck as i32,
             payload: msg.payload.to_vec(),
             tenant_id: None,
+            tenant_slug: None,
         };
         match relay_tx.send(conductor_msg).await {
             Ok(()) => {
@@ -1009,6 +1017,7 @@ pub async fn drain_cancellation_ack_source(
             entity_type: EntityType::CancelTaskAck as i32,
             payload: delivery.payload().to_vec(),
             tenant_id: None,
+            tenant_slug: None,
         };
         if let Err(error) = relay_tx.send(conductor_msg).await {
             eprintln!(
@@ -1066,6 +1075,7 @@ pub async fn publish_dispatch_and_deliver(
         entity_type: EntityType::TaskEvent as i32,
         payload: update_payload,
         tenant_id: None,
+        tenant_slug: None,
     };
     relay_tx
         .send(update_msg)
@@ -1156,6 +1166,7 @@ pub async fn drain_task_event_source(
                     entity_type: EntityType::TaskEvent as i32,
                     payload,
                     tenant_id: None,
+                    tenant_slug: None,
                 };
                 match relay_tx.send(conductor_msg).await {
                     Ok(()) => {
@@ -1936,6 +1947,7 @@ async fn try_run_streaming(
             entity_type: 0, // Default value
             payload: Vec::new(),
             tenant_id: Some(TenantId::from_env().to_string()),
+            tenant_slug: None,
         };
         yield initial_message;
 
@@ -2383,6 +2395,7 @@ async fn try_run_streaming_lite(
         entity_type: 0,
         payload: Vec::new(),
         tenant_id: Some(tenant_id.to_owned()),
+        tenant_slug: None,
     })
     .chain(tokio_stream::wrappers::ReceiverStream::new(rx));
     let mut inbound = establish_relay_stream(&mut client, outbound, relay_config).await?;
@@ -2436,6 +2449,7 @@ async fn try_run_streaming_lite(
                             entity_type: EntityType::TaskEvent as i32,
                             payload: delivered.encode_to_vec(),
                             tenant_id: None,
+                            tenant_slug: None,
                         }).await.map_err(|error| anyhow::anyhow!(
                             "send local Delivered event: {error}"
                         ))?;
@@ -3211,6 +3225,7 @@ mod relay_security_tests {
                 entity_type: EntityType::TaskEvent as i32,
                 payload: payload.to_vec(),
                 tenant_id: Some(tenant.to_string()),
+                tenant_slug: None,
             }]);
             establish_relay_stream(&mut client, outbound, &relay_config)
                 .await
@@ -3225,6 +3240,7 @@ mod relay_security_tests {
                 entity_type: EntityType::TaskEvent as i32,
                 payload: b"foreign-relay".to_vec(),
                 tenant_id: Some(foreign_tenant.to_string()),
+                tenant_slug: None,
             }]),
             &relay_config,
         )
@@ -3337,6 +3353,7 @@ mod relay_security_tests {
             entity_type: 0,
             payload: b"relay-handshake".to_vec(),
             tenant_id: Some(Uuid::new_v4().to_string()),
+            tenant_slug: None,
         }]);
         establish_relay_stream(&mut client, outbound, &config)
             .await
@@ -3719,6 +3736,7 @@ mod lite_relay_tests {
             entity_type: EntityType::TaskQueueItem as i32,
             payload: dispatch.encode_to_vec(),
             tenant_id: None,
+            tenant_slug: None,
         };
 
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

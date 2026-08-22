@@ -5,6 +5,7 @@ fn compile() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/tickr-api.proto",
         "../../proto/workflow-definition.proto",
         "../../proto/instance-snapshot.proto",
+        "../../proto/installation-bootstrap.proto",
     ];
 
     tonic_build::configure()
@@ -36,6 +37,18 @@ fn compile() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             "tickr.instance.AppliedPatchView.minted_map",
             "#[serde(default, skip_serializing_if = \"std::collections::HashMap::is_empty\")]",
+        )
+        .field_attribute(
+            "tickr.installation.InstallationBootstrap.tenant_tier",
+            "#[serde(with = \"crate::installation::serde_tenant_tier\")]",
+        )
+        .field_attribute(
+            "tickr.installation.InstallationBootstrap.formation_profile",
+            "#[serde(with = \"crate::installation::serde_formation_profile\")]",
+        )
+        .field_attribute(
+            "tickr.installation.InstallationBootstrap.authentication",
+            "#[serde(with = \"crate::installation::serde_authentication_mode\")]",
         )
         .compile_protos(&proto_files, &["../../proto"])?;
 
@@ -87,6 +100,7 @@ fn compile() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&["../../proto/signal.proto"], &["../../proto"])?;
 
     println!("cargo:rerun-if-changed=../../proto/conductor-relay.proto");
+    println!("cargo:rerun-if-changed=../../proto/installation-bootstrap.proto");
     println!("cargo:rerun-if-changed=../../proto/tickr-api.proto");
     println!("cargo:rerun-if-changed=../../proto/workflow-definition.proto");
     println!("cargo:rerun-if-changed=../../proto/instance-snapshot.proto");
